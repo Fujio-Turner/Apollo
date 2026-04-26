@@ -21,23 +21,48 @@ import os
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from graph_search.graph.query import GraphQuery
+from apollo.graph.query import GraphQuery
 
 STATIC_DIR = Path(__file__).parent / "static"
 EXCLUDE_TYPES_WORDCLOUD = {"directory", "file", "import"}
 
-SETTINGS_PATH = Path(".graph_search/settings.json")
+SETTINGS_PATH = Path("data/settings.json")
+ENV_PATH = Path(".env")
+
+
+def _upsert_env_var(name: str, value: str) -> None:
+    """Insert or update a `NAME=value` line in the project's .env file."""
+    line = f"{name}={value}\n"
+    if ENV_PATH.exists():
+        lines = ENV_PATH.read_text().splitlines(keepends=True)
+        prefix = f"{name}="
+        for i, existing in enumerate(lines):
+            if existing.lstrip().startswith(prefix):
+                lines[i] = line
+                break
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = lines[-1] + "\n"
+            lines.append(line)
+        ENV_PATH.write_text("".join(lines))
+    else:
+        ENV_PATH.write_text(line)
 
 # ── Indexing progress tracker ─────────────────────────────────────
 _indexing_status: dict = {"active": False}
 
 DEFAULT_SETTINGS = {
-    "api_keys": {
-        "xai_api_key": "",
-        "openai_api_key": "",
-    },
+    # API keys live in .env (one env var per provider) — settings.json only
+    # keeps the active provider id and the per-provider model selection.
     "chat": {
-        "default_model": "grok-4-1-fast-non-reasoning",
+        "active_provider": "xai",
+        "providers": {
+            "xai":       {"model": "grok-4-1-fast-non-reasoning"},
+            "openai":    {"model": "gpt-4o-mini"},
+            "gemini":    {"model": "gemini-2.5-flash"},
+            "anthropic": {"model": "claude-3-5-sonnet-latest"},
+            "llama":     {"model": "llama-3.3-70b-versatile"},
+        },
     },
 }
 
@@ -136,16 +161,16 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     # Set up search backend
     if backend == "cblite":
         try:
-            from graph_search.embeddings.embedder import Embedder
-            from graph_search.search.cblite_semantic import CouchbaseLiteSemanticSearch
+            from apollo.embeddings.embedder import Embedder
+            from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
             embedder = Embedder()
             search = CouchbaseLiteSemanticSearch(store, embedder)
         except Exception:
             search = None
     else:
         try:
-            from graph_search.embeddings.embedder import Embedder
-            from graph_search.search.semantic import SemanticSearch
+            from apollo.embeddings.embedder import Embedder
+            from apollo.search.semantic import SemanticSearch
             embedder = Embedder()
             search = SemanticSearch(graph, embedder)
         except Exception:
@@ -153,34 +178,43 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     chat_service = None
     try:
-        from graph_search.chat.service import ChatService
-        chat_service = ChatService(graph, search=search, embedder=embedder, root_dir=root_dir)
+        from apollo.chat.service import ChatService
+        chat_service = ChatService(
+            graph, search=search, embedder=embedder, root_dir=root_dir,
+            settings_provider=_load_settings,
+        )
     except Exception:
         chat_service = None
 
-    # Load settings and apply API keys on startup
+    # Migrate legacy settings (api_keys block, default_model) on startup so
+    # users upgrading from the Grok-only era don't lose their selection.
     try:
         startup_settings = _load_settings()
-        startup_keys = startup_settings.get("api_keys", {})
-        if startup_keys.get("xai_api_key") and not os.environ.get("XAI_API_KEY"):
-            os.environ["XAI_API_KEY"] = startup_keys["xai_api_key"]
-            # Re-init chat service with new key available
-            if chat_service is None:
-                try:
-                    from graph_search.chat.service import ChatService
-                    chat_service = ChatService(graph, search=search, embedder=embedder, root_dir=root_dir)
-                except Exception:
-                    pass
+        legacy_keys = startup_settings.get("api_keys", {}) or {}
+        # Move any saved legacy api keys into the .env so the new provider
+        # registry can find them via os.environ.
+        legacy_to_env = {
+            "xai_api_key": "XAI_API_KEY",
+            "openai_api_key": "OPENAI_API_KEY",
+            "gemini_api_key": "GEMINI_API_KEY",
+            "anthropic_api_key": "ANTHROPIC_API_KEY",
+            "groq_api_key": "GROQ_API_KEY",
+        }
+        for legacy_name, env_name in legacy_to_env.items():
+            v = legacy_keys.get(legacy_name)
+            if v and not os.environ.get(env_name):
+                os.environ[env_name] = v
+                _upsert_env_var(env_name, v)
     except Exception:
         pass
 
     # Set up chat history persistence
     chat_history = None
     try:
-        from graph_search.chat.history import ChatHistory
+        from apollo.chat.history import ChatHistory
         chat_history = ChatHistory(cbl_store=store if backend == "cblite" else None)
     except Exception:
-        from graph_search.chat.history import ChatHistory
+        from apollo.chat.history import ChatHistory
         chat_history = ChatHistory()
 
     ws_manager = ConnectionManager()
@@ -285,8 +319,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             global _indexing_status
             import time
 
-            from graph_search.graph import GraphBuilder
-            from graph_search.parser import PythonParser, TextFileParser
+            from apollo.graph import GraphBuilder
+            from apollo.parser import PythonParser, TextFileParser
 
             print(f"\n{'='*60}")
             print(f"📂 Indexing: {target}")
@@ -297,7 +331,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             else:
                 build_parsers = [PythonParser(), TextFileParser()]
                 try:
-                    from graph_search.parser import TreeSitterParser
+                    from apollo.parser import TreeSitterParser
                     build_parsers.insert(0, TreeSitterParser())
                 except Exception:
                     pass
@@ -317,7 +351,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t1 = time.time()
             print(f"⏳ [2/4] Generating embeddings for {n_nodes} nodes...")
             try:
-                from graph_search.embeddings import Embedder
+                from apollo.embeddings import Embedder
                 emb = Embedder()
                 emb.embed_graph(graph)
                 print(f"   ✅ Embeddings done ({time.time() - t1:.2f}s)")
@@ -340,12 +374,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             print("⏳ [4/4] Rebuilding search index...")
             try:
                 if backend == "cblite":
-                    from graph_search.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                    from graph_search.embeddings.embedder import Embedder as Emb
+                    from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
+                    from apollo.embeddings.embedder import Embedder as Emb
                     search = CouchbaseLiteSemanticSearch(store, Emb())
                 else:
-                    from graph_search.search.semantic import SemanticSearch
-                    from graph_search.embeddings.embedder import Embedder as Emb
+                    from apollo.search.semantic import SemanticSearch
+                    from apollo.embeddings.embedder import Embedder as Emb
                     search = SemanticSearch(graph, Emb())
                 print(f"   ✅ Search ready ({time.time() - t3:.2f}s)")
             except Exception:
@@ -380,7 +414,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         search = None
         if chat_service is not None:
             try:
-                from graph_search.chat.service import ChatService
+                from apollo.chat.service import ChatService
                 chat_service = ChatService(graph, search=None, embedder=embedder, root_dir=root_dir)
             except Exception:
                 chat_service = None
@@ -616,7 +650,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     # ── File inspection (Phase 12.3a) — read-only ──────────────────────
     def _file_inspect_call(fn, *a, **kw):
-        from graph_search import file_inspect
+        from apollo import file_inspect
         try:
             return fn(*a, **kw)
         except file_inspect.FileChangedError as e:
@@ -628,7 +662,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.get("/api/file/stats")
     def api_file_stats(path: str = Query(...)):
-        from graph_search import file_inspect
+        from apollo import file_inspect
         return _file_inspect_call(file_inspect.file_stats, graph, root_dir, path)
 
     @app.get("/api/file/section")
@@ -637,8 +671,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         start: int = Query(..., ge=1),
         end: int = Query(..., ge=1),
         md5: Optional[str] = Query(None),
-    ):
-        from graph_search import file_inspect
+        ):
+        from apollo import file_inspect
         return _file_inspect_call(
             file_inspect.get_file_section, graph, root_dir, path, start, end,
             expected_md5=md5,
@@ -649,8 +683,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         path: str = Query(...),
         name: str = Query(...),
         md5: Optional[str] = Query(None),
-    ):
-        from graph_search import file_inspect
+        ):
+        from apollo import file_inspect
         return _file_inspect_call(
             file_inspect.get_function_source, graph, root_dir, path, name,
             expected_md5=md5,
@@ -658,7 +692,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.post("/api/file/search")
     async def api_file_search(request: Request):
-        from graph_search import file_inspect
+        from apollo import file_inspect
         body = await request.json()
         if "path" not in body or "pattern" not in body:
             raise HTTPException(status_code=400, detail="`path` and `pattern` are required")
@@ -672,7 +706,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.post("/api/project/search")
     async def api_project_search(request: Request):
-        from graph_search import file_inspect
+        from apollo import file_inspect
         body = await request.json()
         if "pattern" not in body:
             raise HTTPException(status_code=400, detail="`pattern` is required")
@@ -756,41 +790,57 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.get("/api/settings")
     def get_settings():
+        from apollo.chat.providers import PROVIDERS, public_registry
         settings = _load_settings()
-        # Return masked keys for display
-        masked = dict(settings)
-        masked["api_keys"] = {
-            k: _mask_key(v) for k, v in settings.get("api_keys", {}).items()
+        # API keys live exclusively in env vars (.env). Surface them masked
+        # so the UI can show "set" vs "empty" without leaking secrets.
+        api_keys = {
+            pid: _mask_key(os.environ.get(p["env"], "") or "")
+            for pid, p in PROVIDERS.items()
         }
-        return masked
+        return {
+            "providers": public_registry(),
+            "api_keys": api_keys,
+            "chat": settings.get("chat", {}),
+        }
 
     @app.put("/api/settings")
     async def update_settings(request: Request):
+        from apollo.chat.providers import PROVIDERS
+
         body = await request.json()
         current = _load_settings()
 
-        # Update API keys (only update non-empty values, preserve existing if masked/empty)
+        # Update API keys per-provider. Body shape: {api_keys: {<provider_id>: "..."}}.
+        # Empty or masked (contains •) values are ignored. Persisted to .env only.
         if "api_keys" in body:
-            for key, value in body["api_keys"].items():
-                # Don't overwrite with masked values or empty strings
-                if value and "•" not in value:
-                    current.setdefault("api_keys", {})[key] = value
+            for pid, value in (body["api_keys"] or {}).items():
+                if not value or "•" in value or pid not in PROVIDERS:
+                    continue
+                env_name = PROVIDERS[pid]["env"]
+                _upsert_env_var(env_name, value)
+                os.environ[env_name] = value
 
-        # Update chat settings
+        # Update chat settings (active_provider + per-provider model selection).
         if "chat" in body:
-            current.setdefault("chat", {}).update(body["chat"])
+            chat_in = body["chat"] or {}
+            chat_cur = current.setdefault("chat", {})
+            if "active_provider" in chat_in and chat_in["active_provider"] in PROVIDERS:
+                chat_cur["active_provider"] = chat_in["active_provider"]
+            if "providers" in chat_in and isinstance(chat_in["providers"], dict):
+                providers_cur = chat_cur.setdefault("providers", {})
+                for pid, cfg in chat_in["providers"].items():
+                    if pid in PROVIDERS and isinstance(cfg, dict):
+                        providers_cur.setdefault(pid, {}).update(
+                            {k: v for k, v in cfg.items() if k in ("model",)}
+                        )
 
         _save_settings(current)
 
-        # Update environment variables for immediate effect
-        api_keys = current.get("api_keys", {})
-        if api_keys.get("xai_api_key"):
-            os.environ["XAI_API_KEY"] = api_keys["xai_api_key"]
-
-        # Reset chat client so it picks up new key
+        # Reset chat client so it picks up any new key / provider switch
         nonlocal chat_service
         if chat_service:
-            chat_service._client = None
+            chat_service.reset_client()
 
         return {"status": "saved"}
 
@@ -798,17 +848,28 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.get("/api/chat/status")
     def chat_status():
+        from apollo.chat.providers import get_provider
+        if chat_service is None:
+            return {"available": False, "provider": None, "model": None}
+        pid = chat_service.active_provider
         return {
-            "available": chat_service is not None and chat_service.available,
-            "model": chat_service.model if chat_service else None,
+            "available": chat_service.available,
+            "provider": pid,
+            "provider_label": get_provider(pid)["label"],
+            "model": chat_service.active_model,
         }
 
     @app.post("/api/chat")
     async def chat(request: Request):
+        from apollo.chat.providers import get_provider, env_key
         if chat_service is None or not chat_service.available:
+            pid = chat_service.active_provider if chat_service else "xai"
             raise HTTPException(
                 status_code=503,
-                detail="Chat not available. Set the XAI_API_KEY environment variable.",
+                detail=(
+                    f"Chat not available. Set the {env_key(pid)} environment variable "
+                    f"for the active provider ({get_provider(pid)['label']})."
+                ),
             )
         body = await request.json()
         message = body.get("message", "")
@@ -870,6 +931,16 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             raise HTTPException(status_code=404, detail="Thread not found")
         return thread
 
+    @app.put("/api/chat/threads/{thread_id}/messages/last")
+    async def replace_last_chat_message(thread_id: str, request: Request):
+        body = await request.json()
+        role = body.get("role", "assistant")
+        content = body.get("content", "")
+        thread = chat_history.replace_last_message(thread_id, role, content)
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread or matching last message not found")
+        return thread
+
     @app.post("/api/image/generate")
     async def generate_image(request: Request):
         if chat_service is None or not chat_service.available:
@@ -921,12 +992,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         # Set up embedder for live re-embedding
         live_embedder = None
         try:
-            from graph_search.embeddings.embedder import Embedder
+            from apollo.embeddings.embedder import Embedder
             live_embedder = Embedder()
         except Exception:
             pass
 
-        from graph_search.watcher import FileWatcher
+        from apollo.watcher import FileWatcher
         watcher = FileWatcher(
             root_dir=watch_dir,
             graph=graph,

@@ -21,9 +21,9 @@ from pathlib import Path
 
 import networkx as nx
 
-from graph_search.parser import PythonParser
-from graph_search.parser.base import BaseParser
-from graph_search.parser.text_parser import TEXT_EXTENSIONS
+from apollo.parser import PythonParser
+from apollo.parser.base import BaseParser
+from apollo.parser.text_parser import TEXT_EXTENSIONS
 
 # Markdown extensions handled by MarkdownParser (not in TEXT_EXTENSIONS).
 _MARKDOWN_EXTENSIONS = {".md", ".markdown"}

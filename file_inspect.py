@@ -350,7 +350,7 @@ def file_search(
 
 
 def _iter_files(root: Path, globs: list[str]) -> Iterable[Path]:
-    skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".graph_search", "target", "dist", "build"}
+    skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".apollo", "target", "dist", "build"}
     for cur, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
         for fname in files:

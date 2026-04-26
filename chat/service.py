@@ -16,7 +16,7 @@ from typing import Iterator, Optional
 import networkx as nx
 
 
-SYSTEM_PROMPT = """You are a code and file exploration assistant embedded in Graph Search,
+SYSTEM_PROMPT = """You are a code and file exploration assistant embedded in Apollo,
 an app that indexes local codebases into a knowledge graph.
 
 You have tools to query the user's indexed graph. Use them when the question is about their
@@ -285,41 +285,115 @@ _MAX_TOOL_ROUNDS = 5
 
 
 class ChatService:
-    """Manages the chat pipeline: user question → Grok (with tools) → response."""
+    """Manages the chat pipeline: user question → LLM (with tools) → response.
+
+    The active LLM provider (xAI / OpenAI / Gemini / Anthropic / Llama-via-Groq)
+    and its model are resolved at request time from the settings file via the
+    `settings_provider` callback so that changes in the Settings page take
+    effect without restarting the server.
+    """
 
     def __init__(
         self,
         graph: nx.DiGraph,
         search=None,
         embedder=None,
-        model: str = "grok-4-1-fast-non-reasoning",
+        model: str | None = None,
         root_dir: str | None = None,
+        settings_provider=None,
     ):
+        from apollo.chat.providers import get_provider, DEFAULT_PROVIDER
+
         self.graph = graph
         self.search = search
         self.embedder = embedder
-        self.model = model
         self.root_dir = root_dir
+        # `settings_provider` is a zero-arg callable returning the parsed
+        # settings dict. Injected by web.server.create_app so the service
+        # always sees the latest active_provider / model selection.
+        self._settings_provider = settings_provider
+        # Cached client keyed by (provider_id, api_key) — invalidated whenever
+        # the active provider or its key changes.
         self._client = None
+        self._client_key: tuple[str, str] | None = None
         self._query = None  # lazy GraphQuery
+
+        # Back-compat: callers that pass an explicit `model=` still work.
+        # Otherwise use the active provider's default.
+        if model:
+            self.model = model
+        else:
+            self.model = get_provider(DEFAULT_PROVIDER)["default_model"]
+
+    # ── Active provider resolution ─────────────────────────────────
+
+    def _active(self) -> tuple[str, str]:
+        """Return (provider_id, model) from settings, with sensible fallbacks."""
+        from apollo.chat.providers import (
+            DEFAULT_PROVIDER,
+            PROVIDERS,
+            get_provider,
+        )
+
+        settings = {}
+        if self._settings_provider:
+            try:
+                settings = self._settings_provider() or {}
+            except Exception:
+                settings = {}
+
+        chat_cfg = settings.get("chat", {}) or {}
+        pid = chat_cfg.get("active_provider") or DEFAULT_PROVIDER
+        if pid not in PROVIDERS:
+            pid = DEFAULT_PROVIDER
+
+        providers_cfg = chat_cfg.get("providers", {}) or {}
+        model = (providers_cfg.get(pid, {}) or {}).get("model")
+        if not model:
+            # Legacy single-model setting
+            model = chat_cfg.get("default_model") or get_provider(pid)["default_model"]
+        return pid, model
+
+    @property
+    def active_provider(self) -> str:
+        return self._active()[0]
+
+    @property
+    def active_model(self) -> str:
+        return self._active()[1]
 
     @property
     def available(self) -> bool:
-        return bool(os.environ.get("XAI_API_KEY"))
+        from apollo.chat.providers import env_key
+        pid, _ = self._active()
+        return bool(os.environ.get(env_key(pid)))
+
+    def reset_client(self) -> None:
+        """Force the next call to rebuild the OpenAI client (new key/provider)."""
+        self._client = None
+        self._client_key = None
 
     def _get_client(self):
-        if self._client is None:
-            from openai import OpenAI
+        from apollo.chat.providers import get_provider, env_key
 
-            api_key = os.environ.get("XAI_API_KEY")
-            if not api_key:
-                raise RuntimeError("XAI_API_KEY environment variable is not set")
-            self._client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+        pid, _ = self._active()
+        api_key = os.environ.get(env_key(pid))
+        if not api_key:
+            raise RuntimeError(
+                f"{env_key(pid)} environment variable is not set "
+                f"(active provider: {pid})"
+            )
+
+        cache_key = (pid, api_key)
+        if self._client is None or self._client_key != cache_key:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=api_key, base_url=get_provider(pid)["base_url"])
+            self._client_key = cache_key
         return self._client
 
     def _get_query(self):
         if self._query is None:
-            from graph_search.graph.query import GraphQuery
+            from apollo.graph.query import GraphQuery
             self._query = GraphQuery(self.graph)
         return self._query
 
@@ -441,7 +515,7 @@ class ChatService:
             return json.dumps({"node_id": node_id, "neighbors": trimmed}, default=str)
 
         elif name in ("file_stats", "get_file_section", "get_function_source", "file_search", "project_search"):
-            from graph_search import file_inspect
+            from apollo import file_inspect
             try:
                 if name == "file_stats":
                     return json.dumps(file_inspect.file_stats(self.graph, self.root_dir, args["path"]), default=str)
@@ -551,7 +625,7 @@ class ChatService:
         """Send a chat message and return the full response (non-streaming)."""
         messages = self._build_messages(message, history, context_node_id)
         client = self._get_client()
-        use_model = model or self.model
+        use_model = model or self.active_model
 
         for _ in range(_MAX_TOOL_ROUNDS):
             response = client.chat.completions.create(
@@ -597,7 +671,7 @@ class ChatService:
         """
         messages = self._build_messages(message, history, context_node_id)
         client = self._get_client()
-        use_model = model or self.model
+        use_model = model or self.active_model
 
         # Tool-calling loop (non-streamed so we can process tool calls)
         for _ in range(_MAX_TOOL_ROUNDS):

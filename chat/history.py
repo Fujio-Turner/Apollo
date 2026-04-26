@@ -2,7 +2,7 @@
 Chat history persistence — stores conversation threads.
 
 Uses Couchbase Lite when available (collection: "chat_threads"),
-falls back to a JSON file at .graph_search/chat_history.json.
+falls back to a JSON file at .apollo/chat_history.json.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 
-HISTORY_PATH = Path(".graph_search/chat_history.json")
+HISTORY_PATH = Path(".apollo/chat_history.json")
 
 
 class ChatHistory:
@@ -58,6 +58,24 @@ class ChatHistory:
         # Auto-title from first user message
         if thread["title"] == "New Chat" and role == "user":
             thread["title"] = content[:60] + ("..." if len(content) > 60 else "")
+        self._save_thread(thread)
+        return thread
+
+    def replace_last_message(self, thread_id: str, role: str, content: str) -> dict | None:
+        """Replace the last message of a thread (used for regenerate).
+
+        Only replaces if the last message has the given role; otherwise no-op.
+        Returns the updated thread, or None if not found.
+        """
+        thread = self.get_thread(thread_id)
+        if not thread or not thread.get("messages"):
+            return None
+        last = thread["messages"][-1]
+        if last.get("role") != role:
+            return None
+        last["content"] = content
+        last["timestamp"] = self._now()
+        thread["updated_at"] = self._now()
         self._save_thread(thread)
         return thread
 

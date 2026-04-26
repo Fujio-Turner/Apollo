@@ -1,20 +1,20 @@
-# Graph Search — Implementation Plan
+# Apollo — Implementation Plan
 
 ## Completed Steps
 
 ### Step 1 — Python AST Parser ✅
-Built `graph_search/parser/` — extracts functions, classes, imports, variables, and call sites from Python files using the `ast` module.
+Built `apollo/parser/` — extracts functions, classes, imports, variables, and call sites from Python files using the `ast` module.
 
 ### Step 2 — Graph Builder ✅
-Built `graph_search/graph/builder.py` — walks a directory tree, creates nodes (`dir`, `file`, `func`, `class`, `method`, `import`, `var`) and edges (`contains`, `defines`, `calls`, `imports`, `inherits`). Includes cross-file symbol resolution via a global symbol table.
+Built `apollo/graph/builder.py` — walks a directory tree, creates nodes (`dir`, `file`, `func`, `class`, `method`, `import`, `var`) and edges (`contains`, `defines`, `calls`, `imports`, `inherits`). Includes cross-file symbol resolution via a global symbol table.
 
 ### Step 3 — Storage Backends ✅
-Built `graph_search/storage/` — `GraphStore` protocol with two backends:
+Built `apollo/storage/` — `GraphStore` protocol with two backends:
 - `json_store.py` — JSON file persistence
 - `cblite/` — Couchbase Lite backend with SQL++ queries
 
 ### Step 4 — Embedding & Semantic Search ✅
-Built `graph_search/embeddings/` and `graph_search/search/` — generates embeddings for node source text, supports cosine-similarity semantic search and CBL-native vector search.
+Built `apollo/embeddings/` and `apollo/search/` — generates embeddings for node source text, supports cosine-similarity semantic search and CBL-native vector search.
 
 ### Step 5 — Couchbase Lite Backend ✅
 Set up `libcblite` Python bindings, migrated graph + vector storage to Couchbase Lite, SQL++ queries for combined structural + semantic search.
@@ -22,7 +22,7 @@ Set up `libcblite` Python bindings, migrated graph + vector storage to Couchbase
 ---
 
 ### Step 6 — Spatial Coordinates (3DJSON Integration) ✅
-Built `graph_search/spatial.py` — `SpatialMapper` class computes (x, y, z) coordinates and face assignments for all graph nodes. X-axis uses PCA/UMAP dimensionality reduction on embeddings (conceptual domain), Y-axis uses BFS depth from entry points (structural depth), Z-axis uses PageRank/degree centrality (importance). Built `graph_search/search/spatial.py` — `SpatialSearch` class with range queries, face queries, near-node search, spatial walk (concentric ring expansion), and combined spatial+structural queries. CLI commands: `spatial` (--near, --at, --face) and `spatial-walk`. Integrated into indexing pipeline.
+Built `apollo/spatial.py` — `SpatialMapper` class computes (x, y, z) coordinates and face assignments for all graph nodes. X-axis uses PCA/UMAP dimensionality reduction on embeddings (conceptual domain), Y-axis uses BFS depth from entry points (structural depth), Z-axis uses PageRank/degree centrality (importance). Built `apollo/search/spatial.py` — `SpatialSearch` class with range queries, face queries, near-node search, spatial walk (concentric ring expansion), and combined spatial+structural queries. CLI commands: `spatial` (--near, --at, --face) and `spatial-walk`. Integrated into indexing pipeline.
 
 ---
 

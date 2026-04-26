@@ -1,8 +1,8 @@
 """Unit tests for GraphBuilder."""
 import pytest
 
-from graph_search.graph import GraphBuilder
-from graph_search.parser import PythonParser, MarkdownParser, TextFileParser
+from apollo.graph import GraphBuilder
+from apollo.parser import PythonParser, MarkdownParser, TextFileParser
 
 
 class TestGraphBuilder:

@@ -1,5 +1,5 @@
 services:
-  graph_search:
+  apollo:
     build: .
     ports:
       - "8080:8080"
@@ -7,13 +7,13 @@ services:
       - XAI_API_KEY=${XAI_API_KEY:-}
     volumes:
       - ./target:/data/target:ro
-      - ./data:/app/.graph_search
+      - ./data:/app/.apollo
     entrypoint: ["sh", "-c"]
     command:
       - |
-        echo "=== Graph Search ==="
-        python main.py index /data/target -o .graph_search/index.json
-        python main.py status --index .graph_search/index.json
+        echo "=== Apollo ==="
+        python main.py index /data/target -o .apollo/index.json
+        python main.py status --index .apollo/index.json
         echo ""
         echo "Starting web UI..."
-        python main.py serve --port 8080 --index .graph_search/index.json
+        python main.py serve --port 8080 --index .apollo/index.json

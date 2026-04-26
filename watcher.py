@@ -13,8 +13,8 @@ from typing import Callable
 
 import networkx as nx
 
-from graph_search.graph.builder import GraphBuilder, _SOURCE_EXTENSIONS
-from graph_search.parser.base import BaseParser
+from apollo.graph.builder import GraphBuilder, _SOURCE_EXTENSIONS
+from apollo.parser.base import BaseParser
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +248,7 @@ class FileWatcher:
         # Recompute spatial coordinates for affected nodes
         if updated_nodes:
             try:
-                from graph_search.spatial import SpatialMapper
+                from apollo.spatial import SpatialMapper
                 mapper = SpatialMapper()
                 mapper.compute_all(self.graph)
             except Exception as e:

@@ -4,7 +4,7 @@ This directory contains comprehensive unit tests for the graph_search project.
 
 ## Overview
 
-- **Total Tests**: 105 tests
+- **Total Tests**: 131 tests
 - **Pass Rate**: 100% ✅
 - **Code Coverage**: 25% (core modules: 70-100%)
 
@@ -48,6 +48,32 @@ This directory contains comprehensive unit tests for the graph_search project.
    - Tests for `SpatialMapper` class
    - Covers spatial coordinate computation (verifies dict with numeric x/y/z)
    - Tests consistency, cyclic graphs, and large graphs
+
+8. **test_chat_providers.py** (26 tests)
+   - Tests for the multi-provider AI chat configuration
+     (xAI, OpenAI, Gemini, Anthropic, Llama-via-Groq).
+   - `chat.providers` registry: required fields, env-var uniqueness,
+     `get_provider`/`env_key`/`has_api_key`/`public_registry` helpers.
+   - `chat.service.ChatService`:
+     - active provider/model resolution from `settings_provider`
+     - graceful fallback when settings_provider raises or returns junk
+     - legacy `default_model` setting compatibility
+     - `available` flag tied to the active provider's env var
+     - `_get_client` builds the OpenAI client with the correct
+       `base_url`/`api_key`, caches it, and invalidates on provider
+       switch, key rotation, and `reset_client()` calls
+     - `RuntimeError` when the active provider's API key is missing
+   - `web.server` HTTP endpoints (FastAPI `TestClient`):
+     - `GET /api/settings` returns provider registry + masked keys
+     - `PUT /api/settings` persists `active_provider` + per-provider
+       `model`, writes API keys to `.env` only (never to `settings.json`),
+       ignores masked/unknown providers, rejects invalid `active_provider`
+     - `GET /api/chat/status` reflects the active provider, model,
+       label, and `available` based on env-var presence
+
+   *Note*: these tests use `unittest.mock.patch.dict(os.environ, ...)`
+   to isolate API-key state and a temp `.env`/`settings.json` so the
+   real project files are never touched.
 
 ### Test Fixtures (conftest.py)
 

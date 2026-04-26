@@ -1,6 +1,6 @@
 # Schema Design Guide
 
-This project uses [JSON Schema (2020-12)](https://json-schema.org/) to formally define every JSON document structure in Graph Search. All schema files live in the **`schema/`** directory at the project root.
+This project uses [JSON Schema (2020-12)](https://json-schema.org/) to formally define every JSON document structure in Apollo. All schema files live in the **`schema/`** directory at the project root.
 
 ---
 
@@ -48,7 +48,7 @@ Every schema must include:
 
 ### `$id`
 
-Each schema has a canonical `$id` under `https://graph-search.local/schema/`. This is a logical identifier, not a real URL. It allows schemas to reference each other with `$ref`:
+Each schema has a canonical `$id` under `https://apollo.local/schema/`. This is a logical identifier, not a real URL. It allows schemas to reference each other with `$ref`:
 
 ```json
 { "$ref": "spatial.schema.json" }
@@ -177,8 +177,8 @@ from jsonschema import validate
 with open("schema/graph.schema.json") as f:
     schema = json.load(f)
 
-with open(".graph_search/graph.json") as f:
-    data = json.load(f)
+with open(".apollo/graph.json") as f:
+     data = json.load(f)
 
 validate(instance=data, schema=schema)
 ```
@@ -186,5 +186,5 @@ validate(instance=data, schema=schema)
 Or from the command line:
 
 ```bash
-python -m jsonschema -i .graph_search/graph.json schema/graph.schema.json
+python -m jsonschema -i .apollo/graph.json schema/graph.schema.json
 ```

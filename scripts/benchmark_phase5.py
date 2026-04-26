@@ -19,8 +19,8 @@ import time
 # Ensure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from graph_search.graph import GraphBuilder, GraphQuery
-from graph_search.storage import open_store
+from apollo.graph import GraphBuilder, GraphQuery
+from apollo.storage import open_store
 
 
 ITERATIONS = 3
@@ -69,8 +69,8 @@ def bench_load(backend: str, location: str) -> float:
 def bench_search(backend: str, location: str, query: str) -> float | None:
     """Run a semantic search, return elapsed seconds or None if unavailable."""
     try:
-        from graph_search.embeddings import Embedder
-        from graph_search.search import SemanticSearch
+        from apollo.embeddings import Embedder
+        from apollo.search import SemanticSearch
     except ImportError:
         return None
 
@@ -96,12 +96,12 @@ def median_of(fn, *args, n: int = ITERATIONS) -> float:
 
 
 def main() -> None:
-    default_dir = os.path.join(os.path.dirname(__file__), "..", "graph_search")
+    default_dir = os.path.join(os.path.dirname(__file__), "..", "apollo")
     parser = argparse.ArgumentParser(description="Benchmark JSON vs CBL backends")
     parser.add_argument(
         "--directory",
         default=os.path.abspath(default_dir),
-        help="Directory to index (default: the graph_search package)",
+        help="Directory to index (default: the apollo package)",
     )
     args = parser.parse_args()
 
@@ -116,7 +116,7 @@ def main() -> None:
     graph = builder.build(directory)
 
     try:
-        from graph_search.embeddings import Embedder
+        from apollo.embeddings import Embedder
         print("Generating embeddings...")
         embedder = Embedder()
         embedder.embed_graph(graph)

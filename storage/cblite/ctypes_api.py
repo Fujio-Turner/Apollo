@@ -357,7 +357,7 @@ class CBL:
     def __init__(self, db_path: str) -> None:
         """Open (or create) a database.
 
-        *db_path* should look like ``'.graph_search/graph.cblite2'``.
+        *db_path* should look like ``'.apollo/graph.cblite2'``.
         The ``.cblite2`` suffix (if present) is stripped to derive the
         database name; the parent directory is used as the storage
         directory.
