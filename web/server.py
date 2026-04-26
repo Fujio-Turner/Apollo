@@ -551,22 +551,179 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             ]
         }
 
+    # ── Path resolution shared by /api/node and /api/node/.../connections ──
+    # Resolve a graph-stored relative path against (in order):
+    #   1) the file/dir node's own `abs_path` attribute,
+    #   2) `root_dir` if the server was launched with one,
+    #   3) the indexed project root recorded on the `dir::.` node,
+    #   4) the path as-is (which may resolve against CWD).
+    def _resolve_indexed_path(p: str) -> Path | None:
+        if not p:
+            return None
+        raw = Path(p).expanduser()
+        if raw.is_absolute():
+            return raw
+        for nid_prefix in (f"file::{p}", f"dir::{p}"):
+            n = graph.nodes.get(nid_prefix)
+            if n and n.get("abs_path"):
+                return Path(n["abs_path"])
+        root = graph.nodes.get("dir::.") or {}
+        base = root_dir or root.get("abs_path")
+        if base:
+            return Path(base).expanduser() / raw
+        return raw
+
+    def _edge_meta(node_id: str, other_id: str, direction: str, edata: dict, self_path) -> dict:
+        """Lightweight per-edge metadata (no source code reads)."""
+        n = graph.nodes.get(other_id, {})
+        p = n.get("path")
+        ls = n.get("line_start")
+        le = n.get("line_end")
+        prefix = "source" if direction == "in" else "target"
+        out = {
+            "source": node_id if direction == "out" else other_id,
+            "target": other_id if direction == "out" else node_id,
+            f"{prefix}_id": other_id,
+            f"{prefix}_name": n.get("name"),
+            f"{prefix}_type": n.get("type"),
+            f"{prefix}_path": p,
+            f"{prefix}_line_start": ls,
+            f"{prefix}_line_end": le,
+            f"{prefix}_lang": n.get("lang"),
+            "same_file": bool(self_path) and p == self_path,
+        }
+        out.update(edata)
+        return out
+
+    @app.get("/api/node/{node_id:path}/connections")
+    def get_node_connections(node_id: str):
+        """Heavy variant of /api/node/{id} that also reads the source file for
+        each connected node and includes a small preview snippet. Called
+        on-demand when the user opens the Connections tab."""
+        # FastAPI's `:path` converter strips trailing /connections off node_id
+        # so we receive the bare id here.
+        if node_id not in graph:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+
+        import logging
+        log = logging.getLogger("apollo.connections")
+
+        node_data = graph.nodes[node_id]
+        self_path = node_data.get("path")
+        # Cache stores (lines, error) per requested path. `lines` is None on
+        # any failure; `error` is a short, user-facing reason string or None.
+        _file_cache: dict[str, tuple[list[str] | None, str | None]] = {}
+
+        def _read_lines(p: str) -> tuple[list[str] | None, str | None]:
+            if not p:
+                return None, "no path"
+            if p in _file_cache:
+                return _file_cache[p]
+            try:
+                fp = _resolve_indexed_path(p)
+                if fp is None:
+                    result = (None, "could not resolve path")
+                elif not fp.exists():
+                    result = (None, "file not found")
+                elif not fp.is_file():
+                    result = (None, "not a regular file")
+                else:
+                    try:
+                        text = fp.read_text(encoding="utf-8", errors="replace")
+                    except PermissionError:
+                        result = (None, "permission denied")
+                    except OSError as ex:
+                        result = (None, f"read error: {ex.strerror or ex}")
+                    else:
+                        result = (text.splitlines(), None)
+            except Exception as ex:
+                log.warning("read_lines unexpected failure for %s: %s", p, ex)
+                result = (None, "unexpected error")
+            _file_cache[p] = result
+            return result
+
+        def _site_snippet(p, line, context: int = 1):
+            """Return a snippet dict on success, or an error stub when the file
+            can't be read / the line is out of range. Never raises."""
+            if not p:
+                return {"error": "no path"}
+            if line is None:
+                return None
+            lines, err = _read_lines(p)
+            if lines is None:
+                return {"error": err or "unavailable"}
+            try:
+                line = int(line)
+            except (TypeError, ValueError):
+                return {"error": "invalid line number"}
+            if line < 1 or line > len(lines):
+                return {"error": f"line {line} out of range (file has {len(lines)} lines — may have changed)"}
+            start = max(1, line - context)
+            end = min(len(lines), line + context)
+            return {
+                "start": start, "end": end,
+                "lines": lines[start - 1:end],
+                "highlight": line, "truncated": False,
+            }
+
+        def _build(other_id: str, direction: str, edata: dict) -> dict:
+            try:
+                meta = _edge_meta(node_id, other_id, direction, edata, self_path)
+                n = graph.nodes.get(other_id, {})
+                call_line = edata.get("call_line")
+                if call_line is not None:
+                    snip = _site_snippet(
+                        self_path if direction == "out" else n.get("path"),
+                        call_line,
+                    )
+                else:
+                    snip = _site_snippet(n.get("path"), n.get("line_start"))
+                prefix = "source" if direction == "in" else "target"
+                meta[f"{prefix}_snippet"] = snip
+                return meta
+            except Exception as ex:
+                # One broken edge shouldn't kill the whole connections payload.
+                log.exception("connections: failed to build edge %s↔%s", node_id, other_id)
+                prefix = "source" if direction == "in" else "target"
+                return {
+                    "source": node_id if direction == "out" else other_id,
+                    "target": other_id if direction == "out" else node_id,
+                    f"{prefix}_id": other_id,
+                    f"{prefix}_name": graph.nodes.get(other_id, {}).get("name") or other_id,
+                    f"{prefix}_snippet": {"error": f"failed to build connection: {ex}"},
+                    "rel": edata.get("type") or "related",
+                    "error": str(ex),
+                }
+
+        edges_in = [
+            _build(pred, "in", dict(graph.edges[pred, node_id]))
+            for pred in graph.predecessors(node_id)
+        ]
+        edges_out = [
+            _build(succ, "out", dict(graph.edges[node_id, succ]))
+            for succ in graph.successors(node_id)
+        ]
+        return {"id": node_id, "edges_in": edges_in, "edges_out": edges_out}
+
     @app.get("/api/node/{node_id:path}")
     def get_node(node_id: str):
+        """Lightweight node detail. Edges contain metadata only — no source
+        snippets. Snippets are loaded on demand from
+        `/api/node/{id}/connections`."""
         if node_id not in graph:
             raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
 
         data = {k: v for k, v in graph.nodes[node_id].items() if k != "embedding"}
+        self_path = data.get("path")
 
-        edges_in = []
-        for pred in graph.predecessors(node_id):
-            edata = graph.edges[pred, node_id]
-            edges_in.append({"source": pred, "target": node_id, **dict(edata)})
-
-        edges_out = []
-        for succ in graph.successors(node_id):
-            edata = graph.edges[node_id, succ]
-            edges_out.append({"source": node_id, "target": succ, **dict(edata)})
+        edges_in = [
+            _edge_meta(node_id, pred, "in", dict(graph.edges[pred, node_id]), self_path)
+            for pred in graph.predecessors(node_id)
+        ]
+        edges_out = [
+            _edge_meta(node_id, succ, "out", dict(graph.edges[node_id, succ]), self_path)
+            for succ in graph.successors(node_id)
+        ]
 
         return {"id": node_id, **data, "edges_in": edges_in, "edges_out": edges_out}
 

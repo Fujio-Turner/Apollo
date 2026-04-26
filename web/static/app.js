@@ -708,6 +708,10 @@ async function showFileContent(data) {
 }
 
 /* Full select: detail panel + ring + adjacency focus */
+/* Cache of full connection payloads (with snippets) keyed by node id, so
+   re-opening the Connections tab for the same node doesn't refetch. */
+const connectionsCache = new Map();
+
 async function selectNode(nodeId) {
   selectedNode = nodeId;
   try {
@@ -719,6 +723,53 @@ async function selectNode(nodeId) {
     }
     applyPersistentFocus(nodeId);
   } catch (e) { console.error(e); }
+}
+
+/* Fetch the heavy connections payload (with snippets) and re-render the
+   Connections tab in place. Uses a per-node cache. */
+async function loadConnectionSnippets(nodeId) {
+  const target = document.getElementById('detail-tab-connections');
+  if (!target) return;
+  if (target.dataset.loaded === '1') return;
+  // Guard against the panel being for a different node by the time the
+  // async fetch resolves (user clicked away).
+  const requestedNodeId = nodeId;
+  let payload = connectionsCache.get(nodeId);
+  if (!payload) {
+    target.innerHTML = '<div class="text-xs opacity-60 py-4 text-center">Loading connections…</div>';
+    try {
+      payload = await apiFetch(`/api/node/${encodeURIComponent(nodeId)}/connections`);
+      if (!payload || typeof payload !== 'object') throw new Error('empty response');
+      connectionsCache.set(nodeId, payload);
+    } catch (e) {
+      console.error('Failed to load connections for', nodeId, e);
+      // Only update the DOM if the user is still looking at this node.
+      const stillCurrent = document.getElementById('detail-tab-connections');
+      if (stillCurrent && stillCurrent.dataset.nodeId === requestedNodeId) {
+        const msg = (e && e.message) ? escapeHtml(e.message) : 'unknown error';
+        stillCurrent.innerHTML = `<div class="alert alert-error text-xs py-2 my-2">
+          <span>Failed to load connections: ${msg}</span>
+          <button class="btn btn-xs btn-ghost" onclick="document.getElementById('detail-tab-connections').dataset.loaded='';loadConnectionSnippets('${requestedNodeId.replace(/'/g, "\\'")}')">Retry</button>
+        </div>`;
+      }
+      return;
+    }
+  }
+  const stillCurrent = document.getElementById('detail-tab-connections');
+  if (!stillCurrent || stillCurrent.dataset.nodeId !== requestedNodeId) return;
+
+  let html;
+  try {
+    const graphNodeIds = new Set((currentGraph?.nodes || []).map(n => n.id));
+    const visibleIn  = (payload.edges_in  || []).filter(e => graphNodeIds.has(e.source_id || e.source));
+    const visibleOut = (payload.edges_out || []).filter(e => graphNodeIds.has(e.target_id || e.target));
+    html = buildConnectionRows(visibleIn, visibleOut);
+  } catch (e) {
+    console.error('Failed to render connections for', nodeId, e);
+    html = `<div class="alert alert-error text-xs py-2 my-2"><span>Could not render connections: ${escapeHtml(e.message || 'unknown error')}</span></div>`;
+  }
+  stillCurrent.innerHTML = html;
+  stillCurrent.dataset.loaded = '1';
 }
 
 /* Just the ring highlight, no dimming */
@@ -902,7 +953,7 @@ async function showDetail(data) {
     <div id="detail-tab-content">
       ${sourceSectionHtml}
     </div>
-    <div id="detail-tab-connections" class="hidden">
+    <div id="detail-tab-connections" class="hidden" data-node-id="${escapeHtml(data.id || '')}">
       ${connectionRows}
     </div>
   `;
@@ -962,6 +1013,13 @@ function switchDetailTab(tabEl) {
   const targetId = tabEl.dataset.tab;
   const container = parent.parentElement;
   container.querySelectorAll('[id^="detail-tab-"]').forEach(p => p.classList.toggle('hidden', p.id !== targetId));
+  // Lazy-load the snippet-rich connections payload the first time the
+  // Connections tab is opened for this node.
+  if (targetId === 'detail-tab-connections') {
+    const panel = document.getElementById('detail-tab-connections');
+    const nodeId = panel?.dataset.nodeId;
+    if (nodeId) loadConnectionSnippets(nodeId);
+  }
 }
 
 function buildConnectionRows(edgesIn, edgesOut) {
@@ -972,43 +1030,93 @@ function buildConnectionRows(edgesIn, edgesOut) {
     return '<div class="text-xs opacity-60 py-4 text-center">No connections</div>';
   }
 
+  const fileIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3 h-3 inline-block flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" /></svg>';
+  const lineIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3 h-3 inline-block flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M5.25 8.25h15m-16.5 7.5h15m-1.8-13.5l-3.9 19.5m-2.1-19.5l-3.9 19.5" /></svg>';
+  const arrowInIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5 opacity-60 flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" /></svg>';
+  const arrowOutIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5 opacity-60 flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M15 15l6-6m0 0l-6-6m6 6H9a6 6 0 000 12h3" /></svg>';
+  const replaceIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" /></svg>';
+
+  function renderCard(e, dir) {
+    const isIn = dir === 'in';
+    const nodeId  = isIn ? (e.source_id || e.source) : (e.target_id || e.target);
+    const name    = (isIn ? e.source_name : e.target_name) || e.name || nodeId || '?';
+    const nType   = (isIn ? e.source_type : e.target_type) || e.type || '';
+    const path    = (isIn ? e.source_path : e.target_path) || '';
+    const lstart  = isIn ? e.source_line_start : e.target_line_start;
+    const lend    = isIn ? e.source_line_end   : e.target_line_end;
+    const lang    = (isIn ? e.source_lang : e.target_lang) || '';
+    const snippet = isIn ? e.source_snippet : e.target_snippet;
+    const rel     = e.rel || e.type || 'related';
+    const sameFile = !!e.same_file;
+    const color   = NODE_COLORS[nType] || '#888';
+    const escId   = (nodeId || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    const arrow   = isIn ? arrowInIcon : arrowOutIcon;
+    const lineStr = lstart != null ? `L${lstart}${lend && lend !== lstart ? '-'+lend : ''}` : '';
+    const relPath = path ? (typeof relativePath === 'function' ? relativePath(path) : path) : '';
+
+    let snippetHtml = '';
+    if (snippet && snippet.error) {
+      // Backend reported a problem reading the file (deleted, moved,
+      // permissions, lines out of range after edit, etc.).
+      snippetHtml = `<div class="alert alert-warning py-1 px-2 mt-1.5 text-[10px] gap-1 rounded">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5 flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.732 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" /></svg>
+        <span>preview unavailable — ${escapeHtml(snippet.error)}</span>
+      </div>`;
+    } else if (snippet && Array.isArray(snippet.lines) && snippet.lines.length) {
+      const joined = snippet.lines.join('\n');
+      let highlighted;
+      try {
+        highlighted = (lang && window.hljs && hljs.getLanguage(lang))
+          ? hljs.highlight(joined, { language: lang, ignoreIllegals: true }).value
+          : (window.hljs ? hljs.highlightAuto(joined).value : escapeHtml(joined));
+      } catch (_) {
+        highlighted = escapeHtml(joined);
+      }
+      const hlLines = highlighted.split('\n');
+      const startLn = snippet.start || 1;
+      const hlNum   = snippet.highlight;
+      const rows = hlLines.map((ln, i) => {
+        const num = startLn + i;
+        const cls = ['code-line'];
+        if (hlNum != null && num === hlNum) cls.push('hl', 'hl-start', 'hl-end');
+        return `<div class="${cls.join(' ')}" data-line="${num}"><span class="ln">${num}</span><span class="lc">${ln || ' '}</span></div>`;
+      }).join('');
+      const truncatedNote = snippet.truncated
+        ? '<div class="text-[10px] opacity-50 italic px-1 pt-0.5">… truncated</div>'
+        : '';
+      snippetHtml = `<pre class="detail-code-block lined connection-snippet mt-1.5 mb-0"><code class="hljs">${rows}</code></pre>${truncatedNote}`;
+    }
+
+    return `<div class="connection-card border border-base-300 rounded p-2 mb-2 hover:bg-base-200 transition-colors">
+      <div class="flex items-center gap-2 mb-1">
+        ${arrow}
+        <span class="badge badge-xs font-semibold flex-shrink-0" style="background:${color};color:#000">${escapeHtml(nType || '?')}</span>
+        <span class="text-xs font-semibold flex-1 truncate" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+        ${sameFile ? '<span class="badge badge-xs badge-warning flex-shrink-0" title="Defined in the same file">same file</span>' : ''}
+        <span class="badge badge-xs badge-outline flex-shrink-0">${escapeHtml(rel)}</span>
+        <button class="btn btn-xs btn-ghost btn-square" title="Open this connection in the detail view" onclick="event.stopPropagation();connectionClick('${escId}')">${replaceIcon}</button>
+      </div>
+      ${path ? `<div class="flex items-center gap-1 text-[11px] opacity-70 font-mono truncate" title="${escapeHtml(path)}">
+        ${fileIcon}<span class="truncate">${escapeHtml(relPath)}</span>
+        ${lineStr ? `<span class="opacity-60">·</span>${lineIcon}<span>${lineStr}</span>` : ''}
+      </div>` : ''}
+      ${snippetHtml}
+    </div>`;
+  }
+
   let html = '';
 
   if (inArr.length) {
-    html += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Incoming</div>';
-    html += '<div class="space-y-1 mb-3">';
-    inArr.forEach(e => {
-      const name = e.name || e.source;
-      const rel = e.rel || e.type || 'related';
-      const nodeType = e.source_type || e.type || '';
-      const color = NODE_COLORS[nodeType] || '#888';
-      const escapedId = (e.source_id || e.source || '').replace(/'/g, "\\'");
-      html += `<div class="flex items-center gap-2 p-1.5 rounded hover:bg-base-300 cursor-pointer connection-row" onclick="connectionClick('${escapedId}')">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5 opacity-50 flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" /></svg>
-        <span class="badge badge-xs font-semibold flex-shrink-0" style="background:${color};color:#000">${nodeType || '?'}</span>
-        <span class="text-xs font-medium flex-1 truncate">${name}</span>
-        <span class="badge badge-xs badge-outline flex-shrink-0">${rel}</span>
-      </div>`;
-    });
+    html += `<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Incoming <span class="opacity-50">(${inArr.length})</span></div>`;
+    html += '<div class="mb-3">';
+    inArr.forEach(e => { html += renderCard(e, 'in'); });
     html += '</div>';
   }
 
   if (outArr.length) {
-    html += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Outgoing</div>';
-    html += '<div class="space-y-1 mb-3">';
-    outArr.forEach(e => {
-      const name = e.name || e.target;
-      const rel = e.rel || e.type || 'related';
-      const nodeType = e.target_type || e.type || '';
-      const color = NODE_COLORS[nodeType] || '#888';
-      const escapedId = (e.target_id || e.target || '').replace(/'/g, "\\'");
-      html += `<div class="flex items-center gap-2 p-1.5 rounded hover:bg-base-300 cursor-pointer connection-row" onclick="connectionClick('${escapedId}')">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3.5 h-3.5 opacity-50 flex-shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M15 15l6-6m0 0l-6-6m6 6H9a6 6 0 000 12h3" /></svg>
-        <span class="badge badge-xs font-semibold flex-shrink-0" style="background:${color};color:#000">${nodeType || '?'}</span>
-        <span class="text-xs font-medium flex-1 truncate">${name}</span>
-        <span class="badge badge-xs badge-outline flex-shrink-0">${rel}</span>
-      </div>`;
-    });
+    html += `<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Outgoing <span class="opacity-50">(${outArr.length})</span></div>`;
+    html += '<div class="mb-3">';
+    outArr.forEach(e => { html += renderCard(e, 'out'); });
     html += '</div>';
   }
 

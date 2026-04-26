@@ -28,7 +28,9 @@ from apollo.parser.text_parser import TEXT_EXTENSIONS
 # Markdown extensions handled by MarkdownParser (not in TEXT_EXTENSIONS).
 _MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 
-# File extensions the builder will consider for parsing
+# Extensions the parsers know how to extract symbols from. Other files are
+# still indexed as plain `file` nodes (so they show up in the tree and can
+# be inspected) but no functions/classes/imports are extracted from them.
 _SOURCE_EXTENSIONS = (
     {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs"}
     | TEXT_EXTENSIONS
@@ -70,8 +72,23 @@ def _is_venv_dir(dirpath: str) -> bool:
 
 
 def _parse_one(item: tuple) -> dict | None:
-    """Parse a single file — top-level function for ProcessPoolExecutor."""
+    """Parse a single file — top-level function for ProcessPoolExecutor.
+
+    If `parser` is None the file has no language parser; return a minimal
+    parsed dict so the file is still added as a plain `file` node.
+    """
     parser, src_file, rel_path, source_text = item
+    if parser is None:
+        return {
+            "rel_path": rel_path,
+            "functions": [],
+            "classes": [],
+            "imports": [],
+            "calls": [],
+            "variables": [],
+            "module_docstring": None,
+            "patterns": [],
+        }
     if source_text is not None:
         parsed = parser.parse_source(source_text, str(src_file))
     else:
@@ -223,17 +240,14 @@ class GraphBuilder:
             for fname in sorted(filenames):
                 if fname.startswith("."):
                     continue
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in _SOURCE_EXTENSIONS:
-                    continue
 
                 src_file = Path(dirpath) / fname
                 rel_path = str(src_file.relative_to(root))
 
+                # Every file becomes a node. A parser is optional — files
+                # without one are still indexed as plain `file` nodes so
+                # they appear in the tree / can be inspected.
                 parser = self._find_parser(str(src_file))
-                if parser is None:
-                    continue
-
                 files.append((parser, src_file, rel_path, None))
 
                 # Collect all ancestor directories
