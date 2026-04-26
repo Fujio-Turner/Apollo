@@ -1,0 +1,19 @@
+services:
+  graph_search:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - XAI_API_KEY=${XAI_API_KEY:-}
+    volumes:
+      - ./target:/data/target:ro
+      - ./data:/app/.graph_search
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "=== Graph Search ==="
+        python main.py index /data/target -o .graph_search/index.json
+        python main.py status --index .graph_search/index.json
+        echo ""
+        echo "Starting web UI..."
+        python main.py serve --port 8080 --index .graph_search/index.json

@@ -1,0 +1,400 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/parser-output.schema.json",
+  "title": "Parser Output",
+  "description": "The structured output returned by a language parser (AST or Tree-sitter) after parsing a single source file.",
+  "type": "object",
+  "required": ["file", "functions", "classes", "imports", "variables"],
+  "properties": {
+    "file": {
+      "type": "string",
+      "description": "Absolute path to the parsed source file."
+    },
+    "functions": {
+      "type": "array",
+      "description": "Top-level and nested function definitions extracted from the file.",
+      "items": {
+        "type": "object",
+        "required": ["name", "line_start", "line_end", "source", "calls", "args"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Function name."
+          },
+          "line_start": {
+            "type": "integer",
+            "description": "Starting line number (1-indexed)."
+          },
+          "line_end": {
+            "type": "integer",
+            "description": "Ending line number (1-indexed)."
+          },
+          "source": {
+            "type": "string",
+            "description": "Full source text of the function."
+          },
+          "calls": {
+            "type": "array",
+            "description": "Function calls made within this function.",
+            "items": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "object",
+                  "required": ["name"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "args": {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    },
+                    "line": { "type": "integer" }
+                  }
+                }
+              ]
+            }
+          },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Simple list of argument names."
+          },
+          "params": {
+            "type": "array",
+            "description": "Rich parameter descriptors.",
+            "items": { "$ref": "node.schema.json#/$defs/param" }
+          },
+          "return_annotation": {
+            "type": ["string", "null"],
+            "description": "Return type annotation string."
+          },
+          "decorators": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of decorator names."
+          },
+          "docstring": {
+            "type": ["string", "null"],
+            "description": "Docstring extracted from the function."
+          },
+          "is_async": {
+            "type": "boolean",
+            "description": "Whether this is an async function."
+          },
+          "is_nested": {
+            "type": "boolean",
+            "description": "Whether this function is nested inside another function."
+          },
+          "is_test": {
+            "type": "boolean",
+            "description": "Whether this is a test function (name starts with test_)."
+          },
+          "signature_hash": {
+            "type": "string",
+            "description": "MD5 hash of the normalized function signature."
+          },
+          "complexity": {
+            "type": "integer",
+            "description": "Cyclomatic complexity score."
+          },
+          "loc": {
+            "type": "integer",
+            "description": "Lines of code (line_end - line_start + 1)."
+          },
+          "context_managers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Context manager expressions from with statements."
+          },
+          "exceptions": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Exception types caught in try/except blocks."
+          }
+        }
+      }
+    },
+    "classes": {
+      "type": "array",
+      "description": "Class definitions extracted from the file.",
+      "items": {
+        "type": "object",
+        "required": ["name", "line_start", "line_end", "source", "bases", "methods"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Class name."
+          },
+          "line_start": {
+            "type": "integer"
+          },
+          "line_end": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string",
+            "description": "Full source text of the class."
+          },
+          "bases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Base class names."
+          },
+          "methods": {
+            "type": "array",
+            "description": "Methods defined within the class.",
+            "items": {
+              "type": "object",
+              "required": ["name", "line_start", "line_end", "calls", "args"],
+              "properties": {
+                "name": { "type": "string" },
+                "line_start": { "type": "integer" },
+                "line_end": { "type": "integer" },
+                "calls": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      { "type": "string" },
+                      {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                          "name": { "type": "string" },
+                          "args": { "type": "array", "items": { "type": "string" } },
+                          "line": { "type": "integer" }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "args": { "type": "array", "items": { "type": "string" } },
+                "params": {
+                  "type": "array",
+                  "items": { "$ref": "node.schema.json#/$defs/param" }
+                },
+                "return_annotation": { "type": ["string", "null"] },
+                "decorators": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "List of decorator names."
+                },
+                "docstring": {
+                  "type": ["string", "null"],
+                  "description": "Docstring extracted from the method."
+                },
+                "signature_hash": {
+                  "type": "string",
+                  "description": "MD5 hash of the normalized method signature."
+                },
+                "complexity": {
+                  "type": "integer",
+                  "description": "Cyclomatic complexity score."
+                },
+                "loc": {
+                  "type": "integer",
+                  "description": "Lines of code (line_end - line_start + 1)."
+                },
+                "context_managers": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Context manager expressions from with statements."
+                },
+                "exceptions": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Exception types caught in try/except blocks."
+                }
+              }
+            }
+          },
+          "decorators": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "docstring": {
+            "type": ["string", "null"],
+            "description": "Docstring extracted from the class."
+          },
+          "class_vars": {
+            "type": "array",
+            "items": { "$ref": "node.schema.json#/$defs/class_var" },
+            "description": "Class-level variable assignments."
+          },
+          "is_dataclass": {
+            "type": "boolean",
+            "description": "Whether this class has a @dataclass decorator."
+          },
+          "is_namedtuple": {
+            "type": "boolean",
+            "description": "Whether this class inherits from NamedTuple."
+          }
+        }
+      }
+    },
+    "imports": {
+      "type": "array",
+      "description": "Import statements extracted from the file.",
+      "items": {
+        "type": "object",
+        "required": ["module", "names", "line"],
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Imported module path."
+          },
+          "names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Specific names imported (empty for plain import)."
+          },
+          "alias": {
+            "type": ["string", "null"],
+            "description": "Import alias."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the import statement."
+          },
+          "level": {
+            "type": "integer",
+            "description": "Import level (0=absolute, 1=., 2=.., etc.)."
+          }
+        }
+      }
+    },
+    "variables": {
+      "type": "array",
+      "description": "Module-level variable assignments.",
+      "items": {
+        "type": "object",
+        "required": ["name", "line"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Variable name."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the assignment."
+          },
+          "value": {
+            "type": ["string", "null"],
+            "description": "Variable value as a string."
+          }
+        }
+      }
+    },
+    "documents": {
+      "type": "array",
+      "description": "Non-code document entries (Markdown, JSON, YAML, etc.). Optional — only present for non-code files.",
+      "items": {
+        "type": "object",
+        "required": ["name", "doc_type", "line_start", "line_end", "content"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Document name (typically the filename)."
+          },
+          "doc_type": {
+            "type": "string",
+            "description": "Document format: markdown, json, yaml, csv, text, etc."
+          },
+          "line_start": {
+            "type": "integer"
+          },
+          "line_end": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "string",
+            "description": "Full text content of the document."
+          }
+        }
+      }
+    },
+    "module_docstring": {
+      "type": ["string", "null"],
+      "description": "Module-level docstring."
+    },
+    "comments": {
+      "type": "array",
+      "description": "Tagged comments extracted from the file.",
+      "items": {
+        "type": "object",
+        "required": ["tag", "text", "line"],
+        "properties": {
+          "tag": {
+            "type": "string",
+            "description": "Comment tag (TODO, FIXME, NOTE, HACK, XXX)."
+          },
+          "text": {
+            "type": "string",
+            "description": "Comment text content."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the comment."
+          }
+        }
+      }
+    },
+    "type_checking_imports": {
+      "type": "array",
+      "description": "Import statements inside TYPE_CHECKING blocks.",
+      "items": {
+        "type": "object",
+        "required": ["module", "names", "line"],
+        "properties": {
+          "module": {
+            "type": "string",
+            "description": "Imported module path."
+          },
+          "names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Specific names imported (empty for plain import)."
+          },
+          "alias": {
+            "type": ["string", "null"],
+            "description": "Import alias."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the import statement."
+          },
+          "level": {
+            "type": "integer",
+            "description": "Import level (0=absolute, 1=., 2=.., etc.)."
+          }
+        }
+      }
+    },
+    "strings": {
+      "type": "array",
+      "description": "Notable string literals extracted from the file.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "value", "line"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "String kind (sql, url, regex)."
+          },
+          "value": {
+            "type": "string",
+            "description": "String value."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the string."
+          }
+        }
+      }
+    },
+    "patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Detected framework/library patterns (e.g. 'fastapi', 'django')."
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/search-result.schema.json",
+  "title": "Search Result",
+  "description": "Response from the /api/search endpoint. Contains a ranked list of matching nodes.",
+  "type": "object",
+  "required": ["results"],
+  "properties": {
+    "results": {
+      "type": "array",
+      "description": "Matching nodes ordered by relevance.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "type"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Node ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Node display name."
+          },
+          "type": {
+            "type": "string",
+            "description": "Node type."
+          },
+          "path": {
+            "type": ["string", "null"],
+            "description": "File path of the node."
+          },
+          "line_start": {
+            "type": ["integer", "null"],
+            "description": "Starting line number."
+          },
+          "score": {
+            "type": ["number", "null"],
+            "description": "Similarity score (0–1). Present for semantic search results, null for structural matches."
+          }
+        }
+      }
+    }
+  }
+}

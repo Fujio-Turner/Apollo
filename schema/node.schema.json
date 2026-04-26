@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/node.schema.json",
+  "title": "Graph Node",
+  "description": "A node in the Graph Search knowledge graph. Represents a code entity (file, function, class, etc.) or a document.",
+  "type": "object",
+  "required": ["id", "type", "name"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique node identifier. Format depends on type: dir::path, file::path, func::path::name, class::path::name, method::path::class::name, var::path::name, import::path::module::Lline, doc::path.",
+      "examples": [
+        "dir::src/utils",
+        "file::src/mailer.py",
+        "func::src/mailer.py::emails",
+        "class::src/mailer.py::MailService",
+        "method::src/mailer.py::MailService::send",
+        "var::src/config.py::SMTP_HOST",
+        "import::src/app.py::mailer::L3",
+        "doc::README.md",
+        "section::docs/API.md::L10",
+        "codeblock::docs/API.md::L25",
+        "link::docs/API.md::L5",
+        "table::docs/API.md::L40",
+        "task::docs/TODO.md::L3"
+      ]
+    },
+    "type": {
+      "type": "string",
+      "enum": ["directory", "file", "function", "class", "method", "variable", "import", "document", "section", "code_block", "link", "table", "task_item", "comment", "string"],
+      "description": "The kind of entity this node represents."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable name of the entity (e.g. function name, file basename, directory name)."
+    },
+    "path": {
+      "type": "string",
+      "description": "Relative file or directory path from the indexed root."
+    },
+    "line_start": {
+      "type": "integer",
+      "description": "Starting line number in the source file (1-indexed). Present on function, class, method, and document nodes."
+    },
+    "line_end": {
+      "type": "integer",
+      "description": "Ending line number in the source file (1-indexed). Present on function, class, method, and document nodes."
+    },
+    "source": {
+      "type": "string",
+      "description": "Raw source text of the entity. Present on function, class, and document nodes."
+    },
+    "source_md5": {
+      "type": "string",
+      "description": "MD5 hash of the source text. Used for change detection on function nodes."
+    },
+    "file_md5": {
+      "type": "string",
+      "description": "MD5 hash of the entire file contents. Present on file nodes for incremental re-indexing."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Simple list of parameter names. Present on function and method nodes."
+    },
+    "params": {
+      "type": "array",
+      "description": "Rich parameter info including defaults and type annotations. Present on function and method nodes.",
+      "items": { "$ref": "#/$defs/param" }
+    },
+    "return_annotation": {
+      "type": ["string", "null"],
+      "description": "Return type annotation as a string. Present on function and method nodes."
+    },
+    "decorators": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of decorator names. Present on function and class nodes."
+    },
+    "bases": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of base class names. Present on class nodes."
+    },
+    "parent_class": {
+      "type": "string",
+      "description": "Name of the parent class. Present on method nodes."
+    },
+    "module": {
+      "type": "string",
+      "description": "Imported module path. Present on import nodes."
+    },
+    "names": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Specific names imported (from-import). Present on import nodes."
+    },
+    "line": {
+      "type": "integer",
+      "description": "Line number of the statement. Present on import and variable nodes."
+    },
+    "alias": {
+      "type": ["string", "null"],
+      "description": "Import alias (import x as alias). Present on import nodes."
+    },
+    "doc_type": {
+      "type": "string",
+      "description": "Document format (e.g. markdown, json, yaml, csv, text). Present on document nodes."
+    },
+    "frontmatter": {
+      "type": ["object", "null"],
+      "description": "YAML frontmatter metadata extracted from Markdown files. Present on document nodes."
+    },
+    "title": {
+      "type": ["string", "null"],
+      "description": "Document title from frontmatter or first h1. Present on document nodes."
+    },
+    "level": {
+      "type": "integer",
+      "description": "Heading level (1-6). Present on section nodes."
+    },
+    "parent_section": {
+      "type": ["string", "null"],
+      "description": "Name of the parent heading in the section hierarchy. Present on section nodes."
+    },
+    "language": {
+      "type": ["string", "null"],
+      "description": "Programming language of a fenced code block. Present on code_block nodes."
+    },
+    "url": {
+      "type": "string",
+      "description": "Link URL. Present on link nodes."
+    },
+    "link_type": {
+      "type": "string",
+      "enum": ["internal", "external", "anchor"],
+      "description": "Link classification. Present on link nodes."
+    },
+    "is_image": {
+      "type": "boolean",
+      "description": "Whether this link is an image reference. Present on link nodes."
+    },
+    "headers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Table column headers. Present on table nodes."
+    },
+    "rows": {
+      "type": "array",
+      "items": { "type": "array", "items": { "type": "string" } },
+      "description": "Table data rows. Present on table nodes."
+    },
+    "checked": {
+      "type": "boolean",
+      "description": "Whether a task item is checked. Present on task_item nodes."
+    },
+    "embedding": {
+      "type": "array",
+      "items": { "type": "number" },
+      "description": "Vector embedding of the node's source text. Generated by sentence-transformers."
+    },
+    "docstring": {
+      "type": ["string", "null"],
+      "description": "Docstring extracted from the entity. Present on function, class, method, and document nodes."
+    },
+    "is_async": {
+      "type": "boolean",
+      "description": "Whether this is an async function/method. Present on function and method nodes."
+    },
+    "is_nested": {
+      "type": "boolean",
+      "description": "Whether this function is nested inside another function. Present on function nodes."
+    },
+    "is_test": {
+      "type": "boolean",
+      "description": "Whether this is a test function (name starts with test_). Present on function nodes."
+    },
+    "signature_hash": {
+      "type": "string",
+      "description": "MD5 hash of the normalized function signature (name + param names). For finding similar signatures. Present on function and method nodes."
+    },
+    "complexity": {
+      "type": "integer",
+      "description": "Cyclomatic complexity score. Present on function and method nodes."
+    },
+    "loc": {
+      "type": "integer",
+      "description": "Lines of code (line_end - line_start + 1). Present on function and method nodes."
+    },
+    "context_managers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Context manager expressions from with statements. Present on function and method nodes."
+    },
+    "exceptions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Exception types caught in try/except blocks. Present on function and method nodes."
+    },
+    "class_vars": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/class_var" },
+      "description": "Class-level variable assignments. Present on class nodes."
+    },
+    "is_dataclass": {
+      "type": "boolean",
+      "description": "Whether this class has a @dataclass decorator. Present on class nodes."
+    },
+    "is_namedtuple": {
+      "type": "boolean",
+      "description": "Whether this class inherits from NamedTuple. Present on class nodes."
+    },
+    "module_docstring": {
+      "type": ["string", "null"],
+      "description": "Module-level docstring. Present on file nodes."
+    },
+    "patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Detected framework/library patterns (e.g. 'fastapi', 'django'). Present on file nodes."
+    },
+    "tag": {
+      "type": "string",
+      "description": "Comment tag (TODO, FIXME, NOTE, HACK, XXX). Present on comment nodes."
+    },
+    "text": {
+      "type": "string",
+      "description": "Comment text content. Present on comment nodes."
+    },
+    "kind": {
+      "type": "string",
+      "description": "String kind (sql, url, regex). Present on string nodes."
+    },
+    "value": {
+      "type": ["string", "null"],
+      "description": "String or variable value. Present on string and variable nodes."
+    },
+    "type_checking": {
+      "type": "boolean",
+      "description": "Whether this import is inside a TYPE_CHECKING block. Present on import nodes."
+    },
+    "annotation": {
+      "type": ["string", "null"],
+      "description": "Type annotation for a variable. Present on variable nodes."
+    },
+    "level": {
+      "type": "integer",
+      "description": "Import level (0=absolute, 1=., 2=.., etc.). Present on import nodes."
+    },
+    "spatial": {
+      "$ref": "spatial.schema.json",
+      "description": "Computed spatial coordinates for 3D positioning."
+    }
+  },
+  "$defs": {
+    "param": {
+      "type": "object",
+      "description": "Rich parameter descriptor for a function or method argument.",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Parameter name."
+        },
+        "default": {
+          "type": ["string", "null"],
+          "description": "Default value as a string, or null if no default."
+        },
+        "annotation": {
+          "type": ["string", "null"],
+          "description": "Type annotation as a string, or null if not annotated."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["arg", "vararg", "kwonly", "kwarg"],
+          "description": "Parameter kind: regular arg, *args (vararg), keyword-only (kwonly), or **kwargs (kwarg)."
+        }
+      }
+    },
+    "class_var": {
+      "type": "object",
+      "description": "Class-level variable assignment.",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "line": { "type": "integer" },
+        "annotation": { "type": ["string", "null"] },
+        "value": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

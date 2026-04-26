@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/spatial.schema.json",
+  "title": "Spatial Coordinates",
+  "description": "Computed 3D spatial coordinates for a graph node, encoding conceptual domain, structural depth, and importance.",
+  "type": "object",
+  "required": ["x", "y", "z", "face"],
+  "properties": {
+    "x": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 360,
+      "description": "Conceptual domain axis (0–360°). Derived from UMAP dimensionality reduction on node embeddings."
+    },
+    "y": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 360,
+      "description": "Structural depth axis (0–360°). BFS distance from entry-point nodes."
+    },
+    "z": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Importance axis (0–1.0). Derived from PageRank centrality."
+    },
+    "face": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 6,
+      "description": "Architectural face assignment (1–6): 1=entry points, 2=business logic, 3=data access, 4=utilities, 5=config, 6=tests."
+    }
+  }
+}

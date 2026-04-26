@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install tools needed to fetch libcblite
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends wget tar && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download and install Couchbase Lite C (community edition)
+ARG CBLITE_VERSION=4.0.3
+RUN wget -q "https://packages.couchbase.com/releases/couchbase-lite-c/${CBLITE_VERSION}/couchbase-lite-c-community-${CBLITE_VERSION}-linux-x86_64.tar.gz" \
+        -O /tmp/cblite.tar.gz && \
+    mkdir -p /opt/cblite && \
+    tar -xzf /tmp/cblite.tar.gz -C /tmp && \
+    cp -r /tmp/libcblite-${CBLITE_VERSION}/lib /opt/cblite/lib && \
+    cp -r /tmp/libcblite-${CBLITE_VERSION}/include /opt/cblite/include && \
+    rm -rf /tmp/cblite.tar.gz /tmp/libcblite-${CBLITE_VERSION}
+
+ENV CBLITE_LIB_PATH=/opt/cblite/lib/libcblite.so
+ENV LD_LIBRARY_PATH=/opt/cblite/lib:${LD_LIBRARY_PATH}
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "main.py"]
+CMD ["serve", "--port", "8080", "--backend", "cblite"]

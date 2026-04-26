@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/chat-thread.schema.json",
+  "title": "Chat Thread",
+  "description": "A saved AI chat conversation thread stored in Couchbase Lite.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "description": "Unique thread ID (UUID)" },
+    "title": { "type": "string", "description": "Thread title (auto-generated from first user message or user-set)" },
+    "created_at": { "type": "string", "format": "date-time", "description": "ISO 8601 creation timestamp" },
+    "updated_at": { "type": "string", "format": "date-time", "description": "ISO 8601 last message timestamp" },
+    "model": { "type": "string", "description": "Grok model used for this thread" },
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "assistant"] },
+          "content": { "type": "string" },
+          "timestamp": { "type": "string", "format": "date-time" }
+        },
+        "required": ["role", "content", "timestamp"]
+      }
+    }
+  },
+  "required": ["id", "title", "created_at", "updated_at", "messages"]
+}

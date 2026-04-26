@@ -1,0 +1,1476 @@
+openapi: 3.1.0
+info:
+  title: Graph Search API
+  version: 1.0.0
+  description: >
+    A FastAPI-powered code knowledge graph browser. Index source code
+    repositories into a navigable graph of symbols and relationships,
+    explore the graph visually, run searches, and chat with an
+    AI assistant that understands your codebase.
+
+servers:
+  - url: /
+
+tags:
+  - name: System
+  - name: Filesystem
+  - name: Indexing
+  - name: Graph
+  - name: Search
+  - name: Files
+    description: Read-only file inspection (Phase 12.3a)
+  - name: Settings
+  - name: Chat
+  - name: Images
+  - name: Watch
+
+paths:
+  # ── System ──────────────────────────────────────────────────────────
+  /api/env:
+    get:
+      operationId: getEnv
+      tags: [System]
+      summary: Return runtime environment flags
+      responses:
+        "200":
+          description: Environment info
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [native_picker]
+                properties:
+                  native_picker:
+                    type: boolean
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ── Filesystem ──────────────────────────────────────────────────────
+  /api/browse-folder:
+    post:
+      operationId: browseFolder
+      tags: [Filesystem]
+      summary: Open the native OS folder picker
+      description: Opens a native folder-picker dialog and returns the selected path. Returns 501 when running inside Docker.
+      responses:
+        "200":
+          description: Selected folder path
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path]
+                properties:
+                  path:
+                    type: string
+        "501":
+          $ref: "#/components/responses/UnsupportedOperation"
+
+  /api/browse-dir:
+    get:
+      operationId: browseDir
+      tags: [Filesystem]
+      summary: List immediate subdirectories of a path
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+            default: /
+      responses:
+        "200":
+          description: Directory listing
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, dirs]
+                properties:
+                  path:
+                    type: string
+                  dirs:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/tree:
+    get:
+      operationId: getTree
+      tags: [Filesystem]
+      summary: Recursive file tree of the indexed directory
+      responses:
+        "200":
+          description: Recursive tree
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TreeNode"
+
+  # ── Indexing ────────────────────────────────────────────────────────
+  /api/indexing-status:
+    get:
+      operationId: getIndexingStatus
+      tags: [Indexing]
+      summary: Current indexing progress
+      responses:
+        "200":
+          description: Indexing status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexingStatus"
+
+  /api/index:
+    post:
+      operationId: indexDirectory
+      tags: [Indexing]
+      summary: Index a source directory into the knowledge graph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [directory]
+              properties:
+                directory:
+                  type: string
+      responses:
+        "200":
+          description: Index statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphStats"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    delete:
+      operationId: deleteIndex
+      tags: [Indexing]
+      summary: Delete the current index
+      responses:
+        "200":
+          description: Index deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, total_nodes, total_edges]
+                properties:
+                  status:
+                    type: string
+                    enum: [deleted]
+                  total_nodes:
+                    type: integer
+                    enum: [0]
+                  total_edges:
+                    type: integer
+                    enum: [0]
+
+  # ── Graph ───────────────────────────────────────────────────────────
+  /api/graph:
+    get:
+      operationId: getGraph
+      tags: [Graph]
+      summary: Fetch graph nodes and edges with optional filters
+      parameters:
+        - name: path
+          in: query
+          schema:
+            type: string
+        - name: types
+          in: query
+          schema:
+            type: string
+        - name: edges
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 2000
+        - name: max_edges
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Graph payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphResponse"
+
+  /api/node/{node_id}:
+    get:
+      operationId: getNode
+      tags: [Graph]
+      summary: Get full details of a single node
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Node details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/wordcloud:
+    get:
+      operationId: getWordcloud
+      tags: [Graph]
+      summary: Word-cloud data for the indexed symbols
+      parameters:
+        - name: path
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Word-cloud entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WordcloudEntry"
+
+  /api/stats:
+    get:
+      operationId: getStats
+      tags: [Graph]
+      summary: Aggregate graph statistics
+      responses:
+        "200":
+          description: Statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphStats"
+
+  # ── Search ──────────────────────────────────────────────────────────
+  /api/search:
+    get:
+      operationId: search
+      tags: [Search]
+      summary: Full-text search over indexed symbols
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: top
+          in: query
+          schema:
+            type: integer
+            default: 10
+        - name: type
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SearchResult"
+
+  /api/search/multi:
+    post:
+      operationId: searchMulti
+      tags: [Search]
+      summary: Run multiple graph searches in parallel and merge results
+      description: >
+        Mirrors the AI's `search_graph_multi` tool. Runs each query against the
+        index, dedupes hits by node ID, merges scores (max), and tracks which
+        queries matched which node. Useful for casting a wide net with synonyms
+        in a single round-trip.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [queries]
+              properties:
+                queries:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                  description: One or more search strings to run in parallel.
+                top:
+                  type: integer
+                  default: 10
+                  description: Max results per sub-query.
+                type:
+                  type: string
+                  description: Optional node-type filter applied to every sub-query.
+      responses:
+        "200":
+          description: Merged, deduped search results ordered by score
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queries, results]
+                properties:
+                  queries:
+                    type: array
+                    items:
+                      type: string
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MultiSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/neighbors/{node_id}:
+    get:
+      operationId: getNeighbors
+      tags: [Graph]
+      summary: BFS-walk the graph from a node
+      description: >
+        Mirrors the AI's `get_neighbors` tool. Walks the graph from `node_id`
+        breadth-first, optionally restricted to specific edge types and a
+        direction. Returns each visited node with its BFS depth.
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+            default: 1
+          description: BFS depth.
+        - name: edge_types
+          in: query
+          schema:
+            type: string
+          description: Comma-separated edge types (e.g. `calls,imports,defines`).
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [in, out, both]
+            default: both
+          description: Walk predecessors (`in`), successors (`out`), or both.
+      responses:
+        "200":
+          description: Visited neighbors with BFS depth
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NeighborsResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ── Files (Phase 12.3a, read-only) ──────────────────────────────────
+  /api/file/stats:
+    get:
+      operationId: getFileStats
+      tags: [Files]
+      summary: Cheap structural summary of a file
+      description: Returns size, line count, md5, language, function/class counts, and top-level imports. Read-only.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileStats"
+        "403":
+          description: Path outside the indexed sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/file/section:
+    get:
+      operationId: getFileSection
+      tags: [Files]
+      summary: Return an inclusive 1-indexed line range from a file
+      description: Hard cap of 800 lines per call. Read-only.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: end
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: md5
+          in: query
+          schema:
+            type: string
+          description: Optional version check; 409 on mismatch.
+      responses:
+        "200":
+          description: Lines from the file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileSection"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: MD5 mismatch (file changed)
+
+  /api/file/function:
+    get:
+      operationId: getFileFunction
+      tags: [Files]
+      summary: AST-extract a function, method, or class by name
+      description: >
+        `name` may be a bare identifier (`foo`), a qualified method
+        (`MyClass.foo`), or a class name (`MyClass`). Includes decorators
+        and docstring.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: md5
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Source of the named symbol
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileFunctionSource"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: MD5 mismatch
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/file/search:
+    post:
+      operationId: fileSearch
+      tags: [Files]
+      summary: Grep within a single file
+      description: Returns matches with N lines of context before and after. Cap 200 matches.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, pattern]
+              properties:
+                path:
+                  type: string
+                pattern:
+                  type: string
+                context:
+                  type: integer
+                  default: 5
+                regex:
+                  type: boolean
+                  default: true
+                expected_md5:
+                  type: string
+      responses:
+        "200":
+          description: Matches with context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: MD5 mismatch
+
+  /api/project/search:
+    post:
+      operationId: projectSearch
+      tags: [Files]
+      summary: Grep across the indexed project
+      description: >
+        Returns matches with file/line/context. Caps at 500 matches or 200 KB
+        of snippet bytes (whichever first). Use this when the user is unsure
+        which file contains the issue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pattern]
+              properties:
+                pattern:
+                  type: string
+                root:
+                  type: string
+                  description: Sub-directory to scope the search; defaults to the indexed root.
+                context:
+                  type: integer
+                  default: 5
+                file_glob:
+                  type: string
+                  default: "*.py"
+                  description: Comma-separated globs (e.g. `*.py,*.md`).
+                regex:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Matches grouped per file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Settings ────────────────────────────────────────────────────────
+  /api/settings:
+    get:
+      operationId: getSettings
+      tags: [Settings]
+      summary: Retrieve current application settings
+      responses:
+        "200":
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Settings"
+    put:
+      operationId: updateSettings
+      tags: [Settings]
+      summary: Update application settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                api_keys:
+                  $ref: "#/components/schemas/ApiKeys"
+                chat:
+                  $ref: "#/components/schemas/ChatSettings"
+      responses:
+        "200":
+          description: Settings saved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [saved]
+
+  # ── Chat ────────────────────────────────────────────────────────────
+  /api/chat/status:
+    get:
+      operationId: getChatStatus
+      tags: [Chat]
+      summary: Check whether the chat service is available
+      responses:
+        "200":
+          description: Chat availability
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available, model]
+                properties:
+                  available:
+                    type: boolean
+                  model:
+                    type:
+                      - string
+                      - "null"
+
+  /api/chat:
+    post:
+      operationId: chat
+      tags: [Chat]
+      summary: Send a chat message and receive a streaming response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/chat/threads:
+    get:
+      operationId: listThreads
+      tags: [Chat]
+      summary: List all chat threads
+      responses:
+        "200":
+          description: Thread summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ThreadSummary"
+    post:
+      operationId: createThread
+      tags: [Chat]
+      summary: Create a new chat thread
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                model:
+                  type: string
+      responses:
+        "200":
+          description: Created thread
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Thread"
+
+  /api/chat/threads/{thread_id}:
+    get:
+      operationId: getThread
+      tags: [Chat]
+      summary: Get a thread with its messages
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread with messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Thread"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteThread
+      tags: [Chat]
+      summary: Delete a chat thread
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [deleted]
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/chat/threads/{thread_id}/messages:
+    post:
+      operationId: addMessage
+      tags: [Chat]
+      summary: Append a message to a thread
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                role:
+                  type: string
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Updated thread
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Thread"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ── Images ──────────────────────────────────────────────────────────
+  /api/image/generate:
+    post:
+      operationId: generateImage
+      tags: [Images]
+      summary: Generate images from a text prompt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+                model:
+                  type: string
+      responses:
+        "200":
+          description: Generated images
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [images, model]
+                properties:
+                  images:
+                    type: array
+                    items:
+                      type: string
+                  model:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Watch ───────────────────────────────────────────────────────────
+  /api/watch/status:
+    get:
+      operationId: getWatchStatus
+      tags: [Watch]
+      summary: File-watcher status
+      responses:
+        "200":
+          description: Watcher status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active, root_dir, connections]
+                properties:
+                  active:
+                    type: boolean
+                  root_dir:
+                    type:
+                      - string
+                      - "null"
+                  connections:
+                    type: integer
+
+  /api/watch/start:
+    post:
+      operationId: startWatch
+      tags: [Watch]
+      summary: Start the file watcher
+      responses:
+        "200":
+          description: Watcher started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [started, already_running]
+                  root_dir:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/watch/stop:
+    post:
+      operationId: stopWatch
+      tags: [Watch]
+      summary: Stop the file watcher
+      responses:
+        "200":
+          description: Watcher stopped
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [stopped, not_running]
+
+# ════════════════════════════════════════════════════════════════════════
+components:
+  schemas:
+    # ── Shared ────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required: [status_code, error, detail]
+      properties:
+        status_code:
+          type: integer
+        error:
+          type: string
+        detail:
+          oneOf:
+            - type: string
+            - type: object
+            - type: array
+
+    # ── Filesystem ────────────────────────────────────────────────────
+    TreeNode:
+      type: object
+      required: [name, path, type]
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+        type:
+          type: string
+          enum: [file, directory]
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/TreeNode"
+
+    # ── Indexing ──────────────────────────────────────────────────────
+    IndexingStatus:
+      type: object
+      required: [active]
+      properties:
+        active:
+          type: boolean
+        directory:
+          type: string
+        step:
+          type: integer
+        step_label:
+          type: string
+        total_steps:
+          type: integer
+        detail:
+          type: string
+
+    GraphStats:
+      type: object
+      required: [total_nodes, total_edges, node_types, edge_types]
+      properties:
+        total_nodes:
+          type: integer
+        total_edges:
+          type: integer
+        node_types:
+          type: object
+          additionalProperties:
+            type: integer
+        edge_types:
+          type: object
+          additionalProperties:
+            type: integer
+
+    # ── Graph ─────────────────────────────────────────────────────────
+    GraphNode:
+      type: object
+      required: [id, name, category, value, symbolSize, attributes]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        category:
+          type: integer
+        value:
+          type: number
+        symbolSize:
+          type: number
+        attributes:
+          type: object
+
+    GraphEdge:
+      type: object
+      required: [source, target, type]
+      properties:
+        source:
+          type: string
+        target:
+          type: string
+        type:
+          type: string
+
+    GraphCategory:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    GraphResponse:
+      type: object
+      required:
+        - nodes
+        - edges
+        - categories
+        - total_nodes
+        - total_edges
+        - truncated
+        - edges_truncated
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdge"
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphCategory"
+        total_nodes:
+          type: integer
+        total_edges:
+          type: integer
+        truncated:
+          type: boolean
+        edges_truncated:
+          type: boolean
+
+    NodeEdge:
+      type: object
+      required: [source, target, type]
+      properties:
+        source:
+          type: string
+        target:
+          type: string
+        type:
+          type: string
+
+    NodeDetail:
+      type: object
+      required: [id, type, name, path, edges_in, edges_out]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        line_end:
+          type: integer
+        source:
+          type: string
+        edges_in:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeEdge"
+        edges_out:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeEdge"
+      additionalProperties: true
+
+    WordcloudEntry:
+      type: object
+      required: [name, value]
+      properties:
+        name:
+          type: string
+        value:
+          type: integer
+
+    # ── Search ────────────────────────────────────────────────────────
+    SearchResult:
+      type: object
+      required: [id, name, type, path, line_start, score]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        score:
+          type: number
+
+    MultiSearchResult:
+      type: object
+      required: [id, name, type, path, line_start, matched_queries]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        matched_queries:
+          type: array
+          items:
+            type: string
+          description: Sub-queries from the request that returned this node.
+
+    NeighborsResponse:
+      type: object
+      required: [node_id, depth, direction, edge_types, neighbors]
+      properties:
+        node_id:
+          type: string
+        depth:
+          type: integer
+        direction:
+          type: string
+          enum: [in, out, both]
+        edge_types:
+          type: array
+          nullable: true
+          items:
+            type: string
+        neighbors:
+          type: array
+          items:
+            $ref: "#/components/schemas/NeighborEntry"
+
+    NeighborEntry:
+      type: object
+      required: [id, name, type, path, line_start, depth]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        depth:
+          type: integer
+          description: BFS depth from the starting node (1 = direct neighbor).
+
+    # ── Files (Phase 12.3a) ───────────────────────────────────────────
+    FileStats:
+      type: object
+      required: [path, size_bytes, line_count, md5, language, function_count, class_count, top_level_imports]
+      properties:
+        path:
+          type: string
+        size_bytes:
+          type: integer
+        line_count:
+          type: integer
+        md5:
+          type: string
+        language:
+          type: string
+        function_count:
+          type: integer
+        class_count:
+          type: integer
+        top_level_imports:
+          type: array
+          items:
+            type: string
+        ast_error:
+          type: string
+          description: Present only if the file failed to parse.
+
+    FileLine:
+      type: object
+      required: [n, text]
+      properties:
+        n:
+          type: integer
+        text:
+          type: string
+
+    FileSection:
+      type: object
+      required: [path, start_line, end_line, md5, lines, truncated]
+      properties:
+        path:
+          type: string
+        start_line:
+          type: integer
+        end_line:
+          type: integer
+        md5:
+          type: string
+        lines:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileLine"
+        truncated:
+          type: boolean
+
+    FileFunctionSource:
+      type: object
+      required: [path, name, kind, start_line, end_line, md5, source]
+      properties:
+        path:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+          description: AST node type (FunctionDef, AsyncFunctionDef, ClassDef).
+        start_line:
+          type: integer
+        end_line:
+          type: integer
+        md5:
+          type: string
+        source:
+          type: string
+
+    FileSearchMatch:
+      type: object
+      required: [line_no, text, context_before, context_after]
+      properties:
+        line_no:
+          type: integer
+        text:
+          type: string
+        context_before:
+          type: array
+          items:
+            type: string
+        context_after:
+          type: array
+          items:
+            type: string
+
+    FileSearchResult:
+      type: object
+      required: [path, pattern, regex, context, md5, match_count, truncated, matches]
+      properties:
+        path:
+          type: string
+        pattern:
+          type: string
+        regex:
+          type: boolean
+        context:
+          type: integer
+        md5:
+          type: string
+        match_count:
+          type: integer
+        truncated:
+          type: boolean
+        matches:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileSearchMatch"
+
+    ProjectSearchMatch:
+      type: object
+      required: [path, line_no, text, context_before, context_after]
+      properties:
+        path:
+          type: string
+        line_no:
+          type: integer
+        text:
+          type: string
+        context_before:
+          type: array
+          items:
+            type: string
+        context_after:
+          type: array
+          items:
+            type: string
+
+    ProjectSearchResult:
+      type: object
+      required: [root, pattern, regex, context, file_glob, match_count, truncated, matches]
+      properties:
+        root:
+          type: string
+        pattern:
+          type: string
+        regex:
+          type: boolean
+        context:
+          type: integer
+        file_glob:
+          type: string
+        match_count:
+          type: integer
+        truncated:
+          type: boolean
+        matches:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProjectSearchMatch"
+
+    # ── Settings ──────────────────────────────────────────────────────
+    ApiKeys:
+      type: object
+      properties:
+        xai_api_key:
+          type: string
+        openai_api_key:
+          type: string
+
+    ChatSettings:
+      type: object
+      properties:
+        default_model:
+          type: string
+
+    Settings:
+      type: object
+      required: [api_keys, chat]
+      properties:
+        api_keys:
+          $ref: "#/components/schemas/ApiKeys"
+        chat:
+          $ref: "#/components/schemas/ChatSettings"
+
+    # ── Chat ──────────────────────────────────────────────────────────
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+        content:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        context_node:
+          type: string
+        model:
+          type: string
+
+    ThreadSummary:
+      type: object
+      required: [id, title, created_at, updated_at, model, message_count]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        model:
+          type: string
+        message_count:
+          type: integer
+
+    Thread:
+      type: object
+      required: [id, title, created_at, updated_at, model, messages]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 400
+            error: Bad Request
+            detail: The provided path is not a directory.
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 404
+            error: Not Found
+            detail: The requested resource was not found.
+
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 422
+            error: Validation Error
+            detail:
+              - loc: [body, directory]
+                msg: field required
+                type: value_error.missing
+
+    ServiceUnavailable:
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 503
+            error: Service Unavailable
+            detail: No AI provider is configured. Add an API key in Settings.
+
+    UnsupportedOperation:
+      description: Operation not supported in the current environment
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 501
+            error: Not Implemented
+            detail: Native folder picker is not available in Docker.
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            status_code: 500
+            error: Internal Server Error
+            detail: An unexpected error occurred.

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/graph.schema.json",
+  "title": "Graph Document",
+  "description": "The top-level JSON document persisted by the JSON storage backend. Contains the full knowledge graph.",
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "description": "All nodes in the knowledge graph.",
+      "items": { "$ref": "node.schema.json" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "All directed edges in the knowledge graph.",
+      "items": { "$ref": "edge.schema.json" }
+    }
+  }
+}

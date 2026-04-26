@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/edge.schema.json",
+  "title": "Graph Edge",
+  "description": "A directed edge in the Graph Search knowledge graph. Represents a relationship between two nodes.",
+  "type": "object",
+  "required": ["source", "target", "type"],
+  "properties": {
+    "source": {
+      "type": "string",
+      "description": "Node ID of the edge origin."
+    },
+    "target": {
+      "type": "string",
+      "description": "Node ID of the edge destination."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["contains", "defines", "calls", "imports", "inherits", "references", "tests"],
+      "description": "The kind of relationship this edge represents."
+    },
+    "call_args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Actual arguments passed at the call site. Present on 'calls' edges."
+    },
+    "call_line": {
+      "type": ["integer", "null"],
+      "description": "Line number of the call site. Present on 'calls' edges."
+    }
+  }
+}

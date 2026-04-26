@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://graph-search.local/schema/node-detail.schema.json",
+  "title": "Node Detail",
+  "description": "Response from the /api/node/{node_id} endpoint. Full node data with incoming and outgoing edges.",
+  "type": "object",
+  "required": ["id", "type", "name", "edges_in", "edges_out"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Node ID."
+    },
+    "type": {
+      "type": "string",
+      "description": "Node type."
+    },
+    "name": {
+      "type": "string",
+      "description": "Node display name."
+    },
+    "path": {
+      "type": "string",
+      "description": "Relative file path."
+    },
+    "line_start": {
+      "type": "integer"
+    },
+    "line_end": {
+      "type": "integer"
+    },
+    "source": {
+      "type": "string",
+      "description": "Raw source text (embedding field is excluded)."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "params": {
+      "type": "array",
+      "items": { "$ref": "node.schema.json#/$defs/param" }
+    },
+    "return_annotation": {
+      "type": ["string", "null"]
+    },
+    "bases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "parent_class": {
+      "type": "string"
+    },
+    "spatial": {
+      "$ref": "spatial.schema.json"
+    },
+    "edges_in": {
+      "type": "array",
+      "description": "Edges pointing to this node.",
+      "items": { "$ref": "edge.schema.json" }
+    },
+    "edges_out": {
+      "type": "array",
+      "description": "Edges originating from this node.",
+      "items": { "$ref": "edge.schema.json" }
+    }
+  }
+}

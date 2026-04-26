@@ -1,0 +1,424 @@
+"""
+Read-only file & source inspection (Phase 12.3a).
+
+Single source of truth for the file inspection operations exposed both as AI
+tools (chat/service.py) and as HTTP endpoints (web/server.py).
+
+Strictly read-only: no file is ever written, renamed, or deleted by this module.
+
+Every function takes the live `nx.DiGraph` so it can validate paths against
+file/directory nodes already in the index. The optional `root_dir` extends the
+allowlist to anything under the originally-indexed directory.
+"""
+from __future__ import annotations
+
+import ast
+import fnmatch
+import hashlib
+import os
+import re
+from pathlib import Path
+from typing import Iterable
+
+import networkx as nx
+
+
+# ── Limits (keep responses bounded so the AI's context doesn't explode) ──
+MAX_SECTION_LINES = 800
+MAX_FILE_SEARCH_MATCHES = 200
+MAX_PROJECT_SEARCH_MATCHES = 500
+MAX_PROJECT_SNIPPET_BYTES = 200_000
+
+
+class FileAccessError(Exception):
+    """Raised when a path is outside the allowed sandbox or the file is missing."""
+
+    def __init__(self, message: str, status_code: int = 403):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class FileChangedError(Exception):
+    """Raised when an `expected_md5` check fails."""
+
+    def __init__(self, expected: str, actual: str):
+        super().__init__(f"File changed: expected md5 {expected}, got {actual}")
+        self.expected = expected
+        self.actual = actual
+        self.status_code = 409
+
+
+# ── Path safety ────────────────────────────────────────────────────────────
+
+def _allowed_paths(graph: nx.DiGraph) -> set[str]:
+    """Set of every file/directory path the index already knows about (resolved)."""
+    out: set[str] = set()
+    for _, data in graph.nodes(data=True):
+        if data.get("type") in ("file", "directory"):
+            p = data.get("path") or ""
+            if p:
+                try:
+                    out.add(str(Path(p).resolve()))
+                except OSError:
+                    pass
+    return out
+
+
+def safe_path(path: str, graph: nx.DiGraph, root_dir: str | None) -> Path:
+    """Resolve `path` and ensure it lies inside the indexed sandbox.
+
+    A path is allowed if either:
+      - it (or any parent) appears as a `file`/`directory` node in the graph, or
+      - it lies under `root_dir`.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as e:
+        raise FileAccessError(f"Cannot resolve path: {path} ({e})")
+
+    s = str(resolved)
+    allowed = _allowed_paths(graph)
+
+    # Direct hit, or under any allowed directory.
+    if s in allowed:
+        return resolved
+    for a in allowed:
+        if s.startswith(a.rstrip("/") + "/"):
+            return resolved
+
+    # Fall back to root_dir.
+    if root_dir:
+        try:
+            root = Path(root_dir).expanduser().resolve(strict=False)
+            if s == str(root) or s.startswith(str(root).rstrip("/") + "/"):
+                return resolved
+        except (OSError, RuntimeError):
+            pass
+
+    raise FileAccessError(f"Path not in indexed sandbox: {path}")
+
+
+def _check_md5(path: Path, expected: str | None) -> str:
+    """Return the file's current md5; raise if `expected` is provided and differs."""
+    actual = file_md5(path)
+    if expected and actual != expected:
+        raise FileChangedError(expected, actual)
+    return actual
+
+
+def file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ── Tools ──────────────────────────────────────────────────────────────────
+
+def file_stats(graph: nx.DiGraph, root_dir: str | None, path: str) -> dict:
+    """Cheap structural summary of a file (no source returned)."""
+    p = safe_path(path, graph, root_dir)
+    if not p.is_file():
+        raise FileAccessError(f"Not a file: {p}", status_code=404)
+
+    size = p.stat().st_size
+    md5 = file_md5(p)
+    suffix = p.suffix.lower()
+    language = {
+        ".py": "python", ".md": "markdown", ".json": "json",
+        ".yaml": "yaml", ".yml": "yaml", ".txt": "text",
+        ".js": "javascript", ".ts": "typescript", ".html": "html",
+        ".css": "css",
+    }.get(suffix, "unknown")
+
+    line_count = 0
+    with open(p, "rb") as f:
+        for _ in f:
+            line_count += 1
+
+    fn_count = 0
+    cls_count = 0
+    imports: list[str] = []
+    if language == "python":
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                tree = ast.parse(f.read(), filename=str(p))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    fn_count += 1
+                elif isinstance(node, ast.ClassDef):
+                    cls_count += 1
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.append(f"import {alias.name}" + (f" as {alias.asname}" if alias.asname else ""))
+                elif isinstance(node, ast.ImportFrom):
+                    mod = ("." * (node.level or 0)) + (node.module or "")
+                    names = ", ".join(
+                        a.name + (f" as {a.asname}" if a.asname else "")
+                        for a in node.names
+                    )
+                    imports.append(f"from {mod} import {names}")
+        except SyntaxError as e:
+            return {
+                "path": str(p),
+                "size_bytes": size,
+                "line_count": line_count,
+                "md5": md5,
+                "language": language,
+                "function_count": 0,
+                "class_count": 0,
+                "top_level_imports": [],
+                "ast_error": f"{type(e).__name__}: {e}",
+            }
+
+    return {
+        "path": str(p),
+        "size_bytes": size,
+        "line_count": line_count,
+        "md5": md5,
+        "language": language,
+        "function_count": fn_count,
+        "class_count": cls_count,
+        "top_level_imports": imports[:50],
+    }
+
+
+def get_file_section(
+    graph: nx.DiGraph,
+    root_dir: str | None,
+    path: str,
+    start_line: int,
+    end_line: int,
+    expected_md5: str | None = None,
+) -> dict:
+    """Return inclusive 1-indexed `[start_line, end_line]` lines from `path`."""
+    p = safe_path(path, graph, root_dir)
+    if not p.is_file():
+        raise FileAccessError(f"Not a file: {p}", status_code=404)
+    if start_line < 1 or end_line < start_line:
+        raise FileAccessError(
+            f"Invalid range: start_line={start_line}, end_line={end_line}", status_code=400
+        )
+    if end_line - start_line + 1 > MAX_SECTION_LINES:
+        end_line = start_line + MAX_SECTION_LINES - 1
+
+    md5 = _check_md5(p, expected_md5)
+
+    out: list[dict] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            if i < start_line:
+                continue
+            if i > end_line:
+                break
+            out.append({"n": i, "text": line.rstrip("\n")})
+
+    return {
+        "path": str(p),
+        "start_line": start_line,
+        "end_line": min(end_line, out[-1]["n"] if out else end_line),
+        "md5": md5,
+        "lines": out,
+        "truncated": (end_line - start_line + 1) >= MAX_SECTION_LINES,
+    }
+
+
+def get_function_source(
+    graph: nx.DiGraph,
+    root_dir: str | None,
+    path: str,
+    name: str,
+    expected_md5: str | None = None,
+) -> dict:
+    """AST-extract the full source of a function/method by name.
+
+    `name` may be a bare function name (`foo`), a qualified method name
+    (`MyClass.foo`), or `MyClass` to fetch the whole class body.
+    """
+    p = safe_path(path, graph, root_dir)
+    if not p.is_file():
+        raise FileAccessError(f"Not a file: {p}", status_code=404)
+    md5 = _check_md5(p, expected_md5)
+
+    with open(p, encoding="utf-8", errors="replace") as f:
+        source = f.read()
+    try:
+        tree = ast.parse(source, filename=str(p))
+    except SyntaxError as e:
+        raise FileAccessError(f"Cannot parse {p}: {e}", status_code=422)
+
+    target_class, _, target_func = name.partition(".") if "." in name else ("", "", name)
+    if not target_func and target_class:
+        target_func = target_class
+        target_class = ""
+
+    found = None
+    for node in ast.walk(tree):
+        if target_class and not target_func:
+            # Whole class
+            if isinstance(node, ast.ClassDef) and node.name == target_class:
+                found = node
+                break
+        elif target_class:
+            if isinstance(node, ast.ClassDef) and node.name == target_class:
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == target_func:
+                        found = sub
+                        break
+                if found:
+                    break
+        else:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+                found = node
+                break
+
+    if found is None:
+        raise FileAccessError(f"Symbol not found in {p}: {name}", status_code=404)
+
+    # Include decorators (their lineno is earlier than the def line)
+    start = found.lineno
+    if getattr(found, "decorator_list", None):
+        start = min(d.lineno for d in found.decorator_list)
+    end = getattr(found, "end_lineno", None) or start
+
+    lines = source.splitlines()
+    extracted = "\n".join(lines[start - 1:end])
+
+    return {
+        "path": str(p),
+        "name": name,
+        "kind": type(found).__name__,
+        "start_line": start,
+        "end_line": end,
+        "md5": md5,
+        "source": extracted,
+    }
+
+
+def _compile_pattern(pattern: str, regex: bool) -> re.Pattern:
+    if not regex:
+        pattern = re.escape(pattern)
+    try:
+        return re.compile(pattern)
+    except re.error as e:
+        raise FileAccessError(f"Invalid regex: {e}", status_code=400)
+
+
+def file_search(
+    graph: nx.DiGraph,
+    root_dir: str | None,
+    path: str,
+    pattern: str,
+    context: int = 5,
+    regex: bool = True,
+    expected_md5: str | None = None,
+) -> dict:
+    """Grep within a single file. Returns matches with N lines of context."""
+    p = safe_path(path, graph, root_dir)
+    if not p.is_file():
+        raise FileAccessError(f"Not a file: {p}", status_code=404)
+    md5 = _check_md5(p, expected_md5)
+    rx = _compile_pattern(pattern, regex)
+
+    with open(p, encoding="utf-8", errors="replace") as f:
+        lines = [ln.rstrip("\n") for ln in f]
+
+    matches: list[dict] = []
+    for i, line in enumerate(lines):
+        if rx.search(line):
+            matches.append({
+                "line_no": i + 1,
+                "text": line,
+                "context_before": lines[max(0, i - context):i],
+                "context_after": lines[i + 1:i + 1 + context],
+            })
+            if len(matches) >= MAX_FILE_SEARCH_MATCHES:
+                break
+
+    return {
+        "path": str(p),
+        "pattern": pattern,
+        "regex": regex,
+        "context": context,
+        "md5": md5,
+        "match_count": len(matches),
+        "truncated": len(matches) >= MAX_FILE_SEARCH_MATCHES,
+        "matches": matches,
+    }
+
+
+def _iter_files(root: Path, globs: list[str]) -> Iterable[Path]:
+    skip_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".graph_search", "target", "dist", "build"}
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+        for fname in files:
+            if any(fnmatch.fnmatch(fname, g) for g in globs):
+                yield Path(cur) / fname
+
+
+def project_search(
+    graph: nx.DiGraph,
+    root_dir: str | None,
+    pattern: str,
+    root: str | None = None,
+    context: int = 5,
+    file_glob: str = "*.py",
+    regex: bool = True,
+) -> dict:
+    """Grep across the indexed project. `file_glob` may be comma-separated."""
+    if root is None:
+        if not root_dir:
+            raise FileAccessError("No root configured; pass `root` explicitly.", status_code=400)
+        search_root = Path(root_dir).expanduser().resolve()
+    else:
+        search_root = safe_path(root, graph, root_dir)
+    if not search_root.is_dir():
+        raise FileAccessError(f"Not a directory: {search_root}", status_code=404)
+
+    globs = [g.strip() for g in file_glob.split(",") if g.strip()] or ["*.py"]
+    rx = _compile_pattern(pattern, regex)
+
+    matches: list[dict] = []
+    snippet_bytes = 0
+    truncated = False
+
+    for path in _iter_files(search_root, globs):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [ln.rstrip("\n") for ln in f]
+        except OSError:
+            continue
+
+        for i, line in enumerate(lines):
+            if not rx.search(line):
+                continue
+            entry = {
+                "path": str(path),
+                "line_no": i + 1,
+                "text": line,
+                "context_before": lines[max(0, i - context):i],
+                "context_after": lines[i + 1:i + 1 + context],
+            }
+            entry_size = sum(len(s) for s in entry["context_before"]) + len(entry["text"]) + sum(
+                len(s) for s in entry["context_after"]
+            )
+            snippet_bytes += entry_size
+            matches.append(entry)
+            if len(matches) >= MAX_PROJECT_SEARCH_MATCHES or snippet_bytes >= MAX_PROJECT_SNIPPET_BYTES:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    return {
+        "root": str(search_root),
+        "pattern": pattern,
+        "regex": regex,
+        "context": context,
+        "file_glob": file_glob,
+        "match_count": len(matches),
+        "truncated": truncated,
+        "matches": matches,
+    }

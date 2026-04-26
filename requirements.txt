@@ -1,0 +1,16 @@
+networkx>=3.0
+mistune>=3.0
+python-frontmatter>=1.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+numpy
+sentence-transformers
+openai>=1.0.0
+watchdog>=3.0.0
+# Tree-sitter multi-language parser (optional — Step 7)
+tree-sitter>=0.23.0,<0.24
+tree-sitter-python>=0.23
+tree-sitter-javascript>=0.23
+tree-sitter-typescript>=0.23
+tree-sitter-go>=0.23
+tree-sitter-rust>=0.23,<0.24

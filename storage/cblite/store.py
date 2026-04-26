@@ -1,0 +1,166 @@
+"""
+Couchbase Lite storage backend — persists the graph in a CBL database.
+
+Schema:
+    Collection "nodes": one document per graph node
+        doc ID = node_id (e.g. "func::src/utils/mailer.py::emails")
+        body   = { type, name, path, line_start, ... , embedding? }
+
+    Collection "edges": one document per graph edge
+        doc ID = "{source}--{type}-->{target}" (deterministic)
+        body   = { source, target, type }
+"""
+from __future__ import annotations
+
+import json
+import math
+import shutil
+from pathlib import Path
+
+import networkx as nx
+
+from .ctypes_api import CBL
+
+
+class CouchbaseLiteStore:
+    """Persist a NetworkX graph to a Couchbase Lite database."""
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._cbl: CBL | None = None
+
+    def _open(self) -> CBL:
+        if self._cbl is None:
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._cbl = CBL(self._db_path)
+        return self._cbl
+
+    def save(self, graph: nx.DiGraph) -> None:
+        """Persist the full graph (full rebuild, not incremental)."""
+        cbl = self._open()
+        nodes_col = cbl.get_or_create_collection("nodes")
+        edges_col = cbl.get_or_create_collection("edges")
+
+        # Clear existing data
+        self._purge_all(cbl, nodes_col, "nodes")
+        self._purge_all(cbl, edges_col, "edges")
+
+        # Bulk insert nodes
+        embedding_dim = 0
+        cbl.begin_transaction()
+        try:
+            for node_id, attrs in graph.nodes(data=True):
+                doc = dict(attrs)
+                emb = doc.get("embedding")
+                if emb and not embedding_dim:
+                    embedding_dim = len(emb)
+                cbl.save_document_json(nodes_col, node_id, json.dumps(doc, default=str))
+
+            # Bulk insert edges
+            for src, dst, attrs in graph.edges(data=True):
+                etype = attrs.get("type", "")
+                edge_id = f"{src}--{etype}-->{dst}"
+                doc = {"source": src, "target": dst, **attrs}
+                cbl.save_document_json(edges_col, edge_id, json.dumps(doc, default=str))
+
+            cbl.end_transaction(commit=True)
+        except Exception:
+            cbl.end_transaction(commit=False)
+            raise
+
+        # Create indexes
+        self._create_indexes(cbl, nodes_col, edges_col, embedding_dim)
+
+    def load(self, *, include_embeddings: bool = True) -> nx.DiGraph:
+        """Load the graph from CBL into a NetworkX DiGraph."""
+        cbl = self._open()
+        graph = nx.DiGraph()
+
+        # Load nodes
+        rows = cbl.execute_query("SELECT META().id AS _id, * FROM nodes")
+        for row in rows:
+            node_id = row.get("_id")
+            if not node_id:
+                continue
+            attrs = row.get("nodes", row)
+            if isinstance(attrs, str):
+                attrs = json.loads(attrs)
+            attrs = dict(attrs)
+            attrs.pop("_id", None)
+            if not include_embeddings:
+                attrs.pop("embedding", None)
+            graph.add_node(node_id, **attrs)
+
+        # Load edges
+        rows = cbl.execute_query("SELECT META().id AS _id, * FROM edges")
+        for row in rows:
+            edge_data = row.get("edges", row)
+            if isinstance(edge_data, str):
+                edge_data = json.loads(edge_data)
+            edge_data = dict(edge_data)
+            src = edge_data.pop("source", None)
+            dst = edge_data.pop("target", None)
+            if src and dst:
+                graph.add_edge(src, dst, **edge_data)
+
+        return graph
+
+    def close(self) -> None:
+        if self._cbl is not None:
+            self._cbl.close()
+            self._cbl = None
+
+    def delete(self) -> None:
+        """Close the database and remove the database directory."""
+        self.close()
+        db_dir = Path(self._db_path)
+        if db_dir.exists():
+            shutil.rmtree(db_dir)
+
+    # -- Internal helpers ---
+
+    def _purge_all(self, cbl: CBL, collection, collection_name: str) -> None:
+        """Remove all documents from a collection."""
+        rows = cbl.execute_query(f"SELECT META().id AS _id FROM {collection_name}")
+        if not rows:
+            return
+        cbl.begin_transaction()
+        try:
+            for row in rows:
+                doc_id = row.get("_id")
+                if doc_id:
+                    cbl.purge_document(collection, doc_id)
+            cbl.end_transaction(commit=True)
+        except Exception:
+            cbl.end_transaction(commit=False)
+            raise
+
+    def _create_indexes(
+        self, cbl: CBL, nodes_col, edges_col, embedding_dim: int
+    ) -> None:
+        """Create value indexes (and vector index if EE available)."""
+        cbl.create_value_index(nodes_col, "idx_type", "type")
+        cbl.create_value_index(nodes_col, "idx_name", "name")
+        cbl.create_value_index(nodes_col, "idx_path", "path")
+
+        cbl.create_value_index(edges_col, "idx_source", "source")
+        cbl.create_value_index(edges_col, "idx_target", "target")
+        cbl.create_value_index(edges_col, "idx_edge_type", "type")
+
+        if embedding_dim > 0:
+            centroids = max(1, int(math.sqrt(cbl.collection_count(nodes_col))))
+            created = cbl.create_vector_index(
+                nodes_col,
+                "idx_embedding",
+                "embedding",
+                dimensions=embedding_dim,
+                centroids=centroids,
+            )
+            if not created:
+                pass  # Community Edition — vector search via brute-force SQL++
+
+    # -- Expose CBL for search backends ---
+
+    @property
+    def cbl(self) -> CBL:
+        return self._open()
