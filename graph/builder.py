@@ -248,7 +248,7 @@ class GraphBuilder:
         """Create directory nodes only for directories that contain indexed files."""
         # Create root node
         root_id = "dir::."
-        self.graph.add_node(root_id, type="directory", name=root.name, path="")
+        self.graph.add_node(root_id, type="directory", name=root.name, path="", abs_path=str(root))
 
         for rel in sorted(dir_set):
             if not rel:

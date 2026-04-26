@@ -354,6 +354,24 @@ function _startIndexingPoll() {
 }
 
 /* ── Folder Tree (Sidebar) ─────────────────────────────────────── */
+// Indexed root path, captured from /api/tree so we can show relative paths
+// (e.g. "graph/query.py" instead of the full absolute path) elsewhere in the UI.
+let indexedRootPath = '';
+
+function relativePath(p) {
+  if (!p) return '';
+  // The graph stores file/directory paths as relative-to-the-indexed-root in
+  // some configurations and absolute in others. If it's already relative,
+  // use it as-is.
+  if (!p.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(p)) return p;
+  const root = (indexedRootPath || '').replace(/\/+$/, '');
+  if (root && (p === root || p.startsWith(root + '/'))) {
+    const rel = p.slice(root.length).replace(/^\/+/, '');
+    return rel || p.split('/').pop() || p;
+  }
+  return p;
+}
+
 async function loadFolderTree() {
   const treeEl = document.getElementById('folder-tree');
   const titleEl = document.getElementById('folder-tree-title');
@@ -363,8 +381,10 @@ async function loadFolderTree() {
     if (!root || (!root.children || !root.children.length)) {
       treeEl.innerHTML = '<div class="folder-tree-empty">No folder indexed.</div>';
       titleEl.textContent = 'FOLDER';
+      indexedRootPath = '';
       return;
     }
+    indexedRootPath = root.path || '';
     titleEl.textContent = (root.name || 'FOLDER').toUpperCase();
     treeEl.innerHTML = '';
     const children = root.type === 'directory' && root.children ? root.children : [root];
@@ -610,9 +630,81 @@ async function softSelectNode(nodeId) {
   selectedNode = nodeId;
   try {
     const data = await apiFetch(`/api/node/${encodeURIComponent(nodeId)}`);
-    showDetail(data);
+    if (data.type === 'file' && data.path) {
+      await showFileContent(data);
+    } else {
+      showDetail(data);
+    }
     applyRingOnly(nodeId);
   } catch (e) { console.error(e); }
+}
+
+/* Render the full content of a file node in the detail pane.
+   - .md → marked
+   - .html/.htm → sandboxed iframe preview + raw toggle
+   - everything else → highlight.js */
+async function showFileContent(data) {
+  const el = document.getElementById('left-detail-content');
+  document.querySelector('#left-content h3').textContent = data.name || data.path || 'File';
+
+  // Brief loading state.
+  el.innerHTML = '<div class="text-xs opacity-60 py-4">Loading file…</div>';
+
+  let file;
+  try {
+    file = await apiFetch(`/api/file/content?path=${encodeURIComponent(data.path)}`);
+  } catch (e) {
+    el.innerHTML = `<div class="text-xs text-error py-4">Failed to load file: ${escapeHtml(e.message || String(e))}</div>`;
+    return;
+  }
+
+  const ext = (file.extension || '').toLowerCase();
+  const lang = file.language || '';
+  const typeColor = NODE_COLORS.file || '#888';
+  const sizeKb = (file.size_bytes / 1024).toFixed(1);
+
+  const header = `
+    <div class="flex items-center gap-2 flex-wrap mb-3">
+      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">file</span>
+      ${lang ? `<span class="badge badge-sm badge-outline font-mono">${escapeHtml(lang)}</span>` : ''}
+      <span class="badge badge-sm badge-ghost font-mono" title="${escapeHtml(file.path)}">${escapeHtml(relativePath(data.path) || file.relative_path || relativePath(file.path))}</span>
+      <span class="badge badge-sm badge-ghost font-mono">${sizeKb} KB</span>
+      ${file.truncated ? '<span class="badge badge-sm badge-warning">truncated</span>' : ''}
+      ${file.is_binary ? '<span class="badge badge-sm badge-warning">binary</span>' : ''}
+    </div>`;
+
+  let body;
+  if (file.is_binary) {
+    body = '<div class="text-xs opacity-60 py-4 italic">Binary file — preview not available.</div>';
+  } else if (ext === '.md' || ext === '.markdown') {
+    const html = (typeof marked !== 'undefined') ? marked.parse(file.content) : `<pre>${escapeHtml(file.content)}</pre>`;
+    body = `<div class="md-content">${html}</div>`;
+  } else if (ext === '.html' || ext === '.htm') {
+    const safeSrc = file.content.replace(/<\/script>/gi, '<\\/script>');
+    const iframe = `<iframe sandbox="allow-same-origin" style="width:100%;height:480px;border:1px solid var(--fallback-b3,#444);border-radius:6px;background:#fff" srcdoc="${escapeHtml(safeSrc)}"></iframe>`;
+    let highlighted;
+    try { highlighted = hljs.highlight(file.content, { language: 'html', ignoreIllegals: true }).value; }
+    catch(e) { highlighted = escapeHtml(file.content); }
+    body = `
+      <div role="tablist" class="tabs tabs-bordered tabs-sm mb-2">
+        <button role="tab" class="tab tab-active" data-tab="detail-tab-preview" onclick="switchDetailTab(this)">Preview</button>
+        <button role="tab" class="tab" data-tab="detail-tab-source" onclick="switchDetailTab(this)">Source</button>
+      </div>
+      <div id="detail-tab-preview">${iframe}</div>
+      <div id="detail-tab-source" class="hidden"><pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre></div>`;
+  } else {
+    let highlighted;
+    try {
+      highlighted = lang
+        ? hljs.highlight(file.content, { language: lang, ignoreIllegals: true }).value
+        : hljs.highlightAuto(file.content).value;
+    } catch(e) {
+      highlighted = escapeHtml(file.content);
+    }
+    body = `<pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre>`;
+  }
+
+  el.innerHTML = header + body;
 }
 
 /* Full select: detail panel + ring + adjacency focus */
@@ -620,7 +712,11 @@ async function selectNode(nodeId) {
   selectedNode = nodeId;
   try {
     const data = await apiFetch(`/api/node/${encodeURIComponent(nodeId)}`);
-    showDetail(data);
+    if (data.type === 'file' && data.path) {
+      await showFileContent(data);
+    } else {
+      showDetail(data);
+    }
     applyPersistentFocus(nodeId);
   } catch (e) { console.error(e); }
 }
@@ -724,19 +820,45 @@ function guessLang(type, path) {
   return '';
 }
 
-function showDetail(data) {
+async function showDetail(data) {
   const el = document.getElementById('left-detail-content');
   const typeColor = NODE_COLORS[data.type] || '#888';
   const lang = guessLang(data.type, data.path);
 
-  const source = data.source || '';
+  // Try to load the full file when we have a path + line range, so we can
+  // show the whole file with the relevant region highlighted instead of
+  // just the snippet.
+  let fullSource = '';
+  let useFullFile = false;
+  const startLine = data.line_start || null;
+  const endLine = data.line_end || startLine;
+  if (data.path && startLine && data.type !== 'directory' && data.type !== 'file') {
+    try {
+      const file = await apiFetch(`/api/file/content?path=${encodeURIComponent(data.path)}`);
+      if (file && !file.is_binary && typeof file.content === 'string') {
+        fullSource = file.content;
+        useFullFile = true;
+      }
+    } catch (e) { /* fall back to snippet */ }
+  }
+
+  const source = useFullFile ? fullSource : (data.source || '');
   let codeHtml = '';
   if (source) {
     try {
-      const highlighted = lang ? hljs.highlight(source, { language: lang, ignoreIllegals: true }).value : hljs.highlightAuto(source).value;
-      codeHtml = `<pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre>`;
+      const highlighted = lang
+        ? hljs.highlight(source, { language: lang, ignoreIllegals: true }).value
+        : hljs.highlightAuto(source).value;
+      if (useFullFile) {
+        codeHtml = renderLinedCode(highlighted, startLine, endLine);
+      } else {
+        codeHtml = `<pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre>`;
+      }
     } catch(e) {
-      codeHtml = `<pre class="detail-code-block"><code>${source.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</code></pre>`;
+      const esc = source.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      codeHtml = useFullFile
+        ? renderLinedCode(esc, startLine, endLine)
+        : `<pre class="detail-code-block"><code>${esc}</code></pre>`;
     }
   } else {
     codeHtml = '<div class="text-xs opacity-40 italic py-2">No source available</div>';
@@ -751,31 +873,86 @@ function showDetail(data) {
 
   const connectionRows = buildConnectionRows(visibleIn, visibleOut);
 
+  const isDir = data.type === 'directory';
+
+  const headerHtml = isDir
+    ? `<div class="flex items-center gap-2 flex-wrap mb-3">
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+      </div>`
+    : `<div class="flex items-center gap-2 flex-wrap mb-3">
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        ${lang ? `<span class="badge badge-sm badge-outline font-mono">${lang}</span>` : ''}
+        ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1" title="${escapeHtml(data.path)}">${fileIcon} ${escapeHtml(relativePath(data.path))}</span>` : ''}
+        ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
+      </div>`;
+
+  const sourceSectionHtml = isDir
+    ? ''
+    : `<div class="mb-3">
+        <div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1">Source</div>
+        ${codeHtml}
+      </div>`;
+
   el.innerHTML = `
-    <div class="flex items-center gap-2 flex-wrap mb-2">
-      <span class="text-sm font-bold">${data.name || data.id}</span>
-      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
-      ${lang ? `<span class="badge badge-sm badge-outline font-mono">${lang}</span>` : ''}
-    </div>
-    <div class="flex items-center gap-2 flex-wrap mb-3">
-      ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${fileIcon} ${data.path}</span>` : ''}
-      ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
-    </div>
+    ${headerHtml}
     <div role="tablist" class="tabs tabs-bordered tabs-sm mb-2">
       <button role="tab" class="tab tab-active" data-tab="detail-tab-content" onclick="switchDetailTab(this)">Details</button>
       <button role="tab" class="tab" data-tab="detail-tab-connections" onclick="switchDetailTab(this)">Connections <span class="badge badge-xs badge-primary ml-1">${visibleIn.length + visibleOut.length}</span></button>
     </div>
     <div id="detail-tab-content">
-      <div class="mb-3">
-        <div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1">Source</div>
-        ${codeHtml}
-      </div>
+      ${sourceSectionHtml}
     </div>
     <div id="detail-tab-connections" class="hidden">
       ${connectionRows}
     </div>
   `;
   document.querySelector('#left-content h3').textContent = data.name || 'Node Detail';
+
+  // Auto-scroll the highlighted region into view (if any).
+  if (useFullFile && startLine) {
+    requestAnimationFrame(() => {
+      const target = el.querySelector('.code-line.hl-start');
+      if (target) target.scrollIntoView({ block: 'center' });
+    });
+  }
+}
+
+/* Wrap highlight.js HTML output line-by-line, adding line numbers and
+   marking the [start, end] range as highlighted. Balances open <span>
+   tags across newlines so multi-line tokens render correctly. */
+function renderLinedCode(html, start, end) {
+  const lines = [''];
+  const stack = [];
+  let i = 0;
+  while (i < html.length) {
+    const c = html[i];
+    if (c === '<') {
+      const close = html.indexOf('>', i);
+      if (close === -1) { lines[lines.length - 1] += html.slice(i); break; }
+      const tag = html.slice(i, close + 1);
+      if (tag.startsWith('</')) stack.pop();
+      else if (!tag.endsWith('/>') && !/^<(br|img|hr|input|meta|link)\b/i.test(tag)) stack.push(tag);
+      lines[lines.length - 1] += tag;
+      i = close + 1;
+    } else if (c === '\n') {
+      for (let j = 0; j < stack.length; j++) lines[lines.length - 1] += '</span>';
+      lines.push(stack.join(''));
+      i++;
+    } else {
+      lines[lines.length - 1] += c;
+      i++;
+    }
+  }
+  const out = [];
+  for (let k = 0; k < lines.length; k++) {
+    const ln = k + 1;
+    const cls = ['code-line'];
+    if (start && ln >= start && ln <= (end || start)) cls.push('hl');
+    if (start && ln === start) cls.push('hl-start');
+    if (start && ln === (end || start)) cls.push('hl-end');
+    out.push(`<div class="${cls.join(' ')}" data-line="${ln}"><span class="ln">${ln}</span><span class="lc">${lines[k] || ' '}</span></div>`);
+  }
+  return `<pre class="detail-code-block lined"><code class="hljs">${out.join('')}</code></pre>`;
 }
 
 function switchDetailTab(tabEl) {
@@ -1108,8 +1285,40 @@ function _wireChipHandlers(root) {
   });
 }
 
+// Active AbortController for the in-flight chat request, so the Send/Cancel
+// button can abort it. null when no request is running.
+let chatAbortController = null;
+
+function _setSendBtnSending() {
+  const b = document.getElementById('chat-send');
+  b.classList.remove('btn-primary');
+  b.classList.add('btn-error');
+  b.textContent = 'Cancel';
+  b.disabled = false;
+  b.dataset.mode = 'cancel';
+}
+
+function _setSendBtnIdle() {
+  const b = document.getElementById('chat-send');
+  b.classList.remove('btn-error');
+  b.classList.add('btn-primary');
+  b.textContent = 'Send';
+  b.disabled = false;
+  b.dataset.mode = 'send';
+}
+
+function cancelChatRequest() {
+  if (chatAbortController) {
+    chatAbortController.abort();
+    showToast('Request cancelled', 'warning');
+  }
+}
+
 async function sendChatMessage() {
   if (!chatAvailable) return;
+  // If a request is currently in flight, the button acts as Cancel.
+  if (chatAbortController) { cancelChatRequest(); return; }
+
   const { mode, query } = parseChatMode();
   const msg = query.trim();
   if (!msg) return;
@@ -1120,9 +1329,10 @@ async function sendChatMessage() {
     return;
   }
 
-  const sendBtn = document.getElementById('chat-send');
-  sendBtn.disabled = true;
+  chatAbortController = new AbortController();
+  _setSendBtnSending();
   if (chatTagify) chatTagify.setDisabled(true);
+  showToast('Sending…', 'info');
 
   // Send the raw user message. The backend chat service (Phase 11 tool-calling)
   // exposes search_graph / get_node / get_stats tools and lets Grok decide when
@@ -1148,13 +1358,14 @@ async function sendChatMessage() {
   _persistMessage('user', msg);
   const ad = appendChatMessage('assistant','...');
   try {
-    const full = await _streamAssistantResponse(msg, ad, chatHistory.slice(-10));
+    const full = await _streamAssistantResponse(msg, ad, chatHistory.slice(-10), chatAbortController.signal);
     if (full !== null) {
       chatHistory.push({role:'assistant',content:full});
       _persistMessage('assistant', full);
     }
   } finally {
-    document.getElementById('chat-send').disabled = false;
+    chatAbortController = null;
+    _setSendBtnIdle();
     if (chatTagify) { chatTagify.setDisabled(false); chatTagify.DOM.input.focus(); }
     else { const i = document.getElementById('chat-input'); i.disabled = false; i.focus(); }
   }
@@ -1163,16 +1374,20 @@ async function sendChatMessage() {
 /* Stream a chat response into the given bubble. Returns the full text on
    success, or null on error (the bubble is updated with the error message).
    `historyForCall` is the prior message history sent to /api/chat. */
-async function _streamAssistantResponse(msg, ad, historyForCall) {
+async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
   ad.innerHTML = '...';
+  const isAbort = (e) => signal && signal.aborted ||
+    (e && (e.name === 'AbortError' || /abort/i.test(e.message || '')));
   let res;
   try {
     res = await apiFetch('/api/chat', {
       method: 'POST',
       body: { message: msg, history: historyForCall, context_node: selectedNode },
       raw: true, // need the streaming Response body for SSE
+      signal,
     });
   } catch (e) {
+    if (isAbort(e)) { ad.innerHTML = '<span class="opacity-60 italic">Cancelled</span>'; return null; }
     ad.innerHTML = `<span class="text-error">${formatApiError(e, 'Chat failed')}</span>`;
     // 503 typically means provider key not configured — refresh status badge.
     if (e instanceof ApiError && e.status === 503) checkChatStatus();
@@ -1190,7 +1405,14 @@ async function _streamAssistantResponse(msg, ad, historyForCall) {
     ad.querySelectorAll('pre code:not(.hljs)').forEach(b => hljs.highlightElement(b));
     _wireChipHandlers(ad);
     return full;
-  } catch(e) { ad.innerHTML=`<span class="text-error">Failed: ${e.message}</span>`; return null; }
+  } catch(e) {
+    if (isAbort(e)) {
+      ad.innerHTML = ad.innerHTML + '<div class="text-xs opacity-60 italic mt-1">— cancelled —</div>';
+      return null;
+    }
+    ad.innerHTML=`<span class="text-error">Failed: ${e.message}</span>`;
+    return null;
+  }
 }
 
 /* Regenerate the assistant response in the given wrapper. Finds the user
@@ -1495,7 +1717,13 @@ async function saveSettings() {
 }
 
 function showToast(msg,type) {
-  const t=document.createElement('div'); t.className=`toast-msg ${type==='success'?'bg-success text-success-content':'bg-error text-error-content'}`;
+  const cls = {
+    success: 'bg-success text-success-content',
+    info:    'bg-info text-info-content',
+    warning: 'bg-warning text-warning-content',
+    error:   'bg-error text-error-content',
+  }[type] || 'bg-error text-error-content';
+  const t=document.createElement('div'); t.className=`toast-msg ${cls}`;
   t.textContent=msg; document.body.appendChild(t); requestAnimationFrame(()=>t.classList.add('show'));
   setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},3000);
 }

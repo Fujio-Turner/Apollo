@@ -296,13 +296,17 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     @app.post("/api/index")
     async def post_index(request: Request):
         """Index a new directory and reload the graph."""
-        nonlocal graph, q, search, chat_service
+        nonlocal graph, q, search, chat_service, root_dir
         global _indexing_status
         body = await request.json()
         directory = body.get("directory", "")
         target = os.path.abspath(directory)
         if not os.path.isdir(target):
             raise HTTPException(status_code=400, detail=f"Not a directory: {target}")
+        # Remember the user-chosen root so file-inspection endpoints can
+        # build relative paths (e.g. "graph/query.py" instead of the full
+        # absolute path) regardless of which directory nodes were indexed.
+        root_dir = target
 
         _indexing_status = {
             "active": True,
@@ -664,6 +668,11 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     def api_file_stats(path: str = Query(...)):
         from apollo import file_inspect
         return _file_inspect_call(file_inspect.file_stats, graph, root_dir, path)
+
+    @app.get("/api/file/content")
+    def api_file_content(path: str = Query(...)):
+        from apollo import file_inspect
+        return _file_inspect_call(file_inspect.file_content, graph, root_dir, path)
 
     @app.get("/api/file/section")
     def api_file_section(
