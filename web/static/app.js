@@ -573,10 +573,8 @@ async function loadGraph() {
     document.getElementById('status-text').textContent = 'Connected';
     fetchIndexCount();
     setTimeout(loadWordCloud, 200);
-    if (!selectedNode && data.nodes && data.nodes.length) {
-      const largest = data.nodes.reduce((a, b) => ((b.symbolSize||0) > (a.symbolSize||0) ? b : a), data.nodes[0]);
-      setTimeout(() => softSelectNode(largest.id), 300);
-    }
+    // No longer auto-select the largest node on load — leave the graph
+    // unselected so the Welcome tab remains visible by default.
   } catch (e) { console.error(e); document.getElementById('status-text').textContent = 'Error'; }
   finally { overlay.classList.add('hidden'); }
 }
@@ -623,6 +621,7 @@ function renderGraph(data) {
 
 async function onGraphClick(p) {
   if (p.dataType === 'node') await selectNode(p.data.id);
+  else if (p.dataType === 'edge') openEdgeTab(p.data);
 }
 
 /* Ring-only select: detail panel + ring, all nodes/edges stay visible */
@@ -644,17 +643,24 @@ async function softSelectNode(nodeId) {
    - .html/.htm → sandboxed iframe preview + raw toggle
    - everything else → highlight.js */
 async function showFileContent(data) {
-  const el = document.getElementById('left-detail-content');
-  document.querySelector('#left-content h3').textContent = data.name || data.path || 'File';
+  const tabId = 'file:' + (data.path || data.id);
+  const nodeId = data.id;
+  Tabs.open({
+    id: tabId,
+    title: data.name || data.path || 'File',
+    tooltip: relativePath(data.path) || data.path || data.name || '',
+    closable: true,
+    onActivate: () => { if (nodeId) applyPersistentFocus(nodeId); },
+  });
 
   // Brief loading state.
-  el.innerHTML = '<div class="text-xs opacity-60 py-4">Loading file…</div>';
+  Tabs.setBody(tabId, '<div class="text-xs opacity-60 py-4">Loading file…</div>');
 
   let file;
   try {
     file = await apiFetch(`/api/file/content?path=${encodeURIComponent(data.path)}`);
   } catch (e) {
-    el.innerHTML = `<div class="text-xs text-error py-4">Failed to load file: ${escapeHtml(e.message || String(e))}</div>`;
+    Tabs.setBody(tabId, `<div class="text-xs text-error py-4">Failed to load file: ${escapeHtml(e.message || String(e))}</div>`);
     return;
   }
 
@@ -704,7 +710,7 @@ async function showFileContent(data) {
     body = `<pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre>`;
   }
 
-  el.innerHTML = header + body;
+  Tabs.setBody(tabId, header + body);
 }
 
 /* Full select: detail panel + ring + adjacency focus */
@@ -731,12 +737,30 @@ async function loadConnectionSnippets(nodeId) {
   const target = document.getElementById('detail-tab-connections');
   if (!target) return;
   if (target.dataset.loaded === '1') return;
+  if (target.dataset.loading === '1') return;
   // Guard against the panel being for a different node by the time the
   // async fetch resolves (user clicked away).
   const requestedNodeId = nodeId;
   let payload = connectionsCache.get(nodeId);
   if (!payload) {
-    target.innerHTML = '<div class="text-xs opacity-60 py-4 text-center">Loading connections…</div>';
+    target.dataset.loading = '1';
+    // Show a per-card loading spinner overlay on every existing connection
+    // card so the user sees that snippet content is being fetched.
+    target.querySelectorAll('.connection-card').forEach(card => {
+      if (card.querySelector('.connection-loading')) return;
+      const spinner = document.createElement('div');
+      spinner.className = 'connection-loading flex items-center justify-center gap-2 py-2 mt-1.5 text-[11px] opacity-70';
+      spinner.innerHTML = '<span class="loading loading-spinner loading-xs"></span><span>Loading snippet…</span>';
+      card.appendChild(spinner);
+    });
+    // If there are no cards yet (still rendering / empty), show a top-level
+    // spinner so the user knows something is in flight.
+    if (!target.querySelector('.connection-card')) {
+      target.innerHTML = `<div class="flex items-center justify-center gap-2 py-6 text-xs opacity-70">
+        <span class="loading loading-spinner loading-md"></span>
+        <span>Loading connections…</span>
+      </div>`;
+    }
     try {
       payload = await apiFetch(`/api/node/${encodeURIComponent(nodeId)}/connections`);
       if (!payload || typeof payload !== 'object') throw new Error('empty response');
@@ -746,6 +770,7 @@ async function loadConnectionSnippets(nodeId) {
       // Only update the DOM if the user is still looking at this node.
       const stillCurrent = document.getElementById('detail-tab-connections');
       if (stillCurrent && stillCurrent.dataset.nodeId === requestedNodeId) {
+        stillCurrent.dataset.loading = '';
         const msg = (e && e.message) ? escapeHtml(e.message) : 'unknown error';
         stillCurrent.innerHTML = `<div class="alert alert-error text-xs py-2 my-2">
           <span>Failed to load connections: ${msg}</span>
@@ -770,6 +795,7 @@ async function loadConnectionSnippets(nodeId) {
   }
   stillCurrent.innerHTML = html;
   stillCurrent.dataset.loaded = '1';
+  stillCurrent.dataset.loading = '';
 }
 
 /* Just the ring highlight, no dimming */
@@ -860,6 +886,147 @@ function focusNodeInGraph(id) {
   applyPersistentFocus(id);
 }
 
+/* ── Content Tabs (left pane) ──────────────────────────────────
+   Tab manager for the left detail pane. The "welcome" tab is the
+   permanent base tab (welcome content + index analytics). Clicking
+   a node, edge, or file in the side nav opens an additional tab
+   with an "x" close button. */
+const Tabs = (function () {
+  const list = []; // {id, title, icon, closable, html, onActivate}
+  let activeId = null;
+  const listEl = () => document.getElementById('content-tabs');
+  const bodyEl = () => document.getElementById('left-detail-content');
+  const find = id => list.find(t => t.id === id);
+  const indexOf = id => list.findIndex(t => t.id === id);
+
+  function render() {
+    const el = listEl();
+    if (!el) return;
+    el.innerHTML = '';
+    for (const t of list) {
+      const btn = document.createElement('div');
+      btn.className = 'content-tab' + (t.id === activeId ? ' active' : '');
+      btn.title = t.tooltip || t.title;
+      btn.dataset.tabId = t.id;
+      btn.setAttribute('role', 'tab');
+      btn.innerHTML =
+        (t.icon ? `<span class="content-tab-icon">${t.icon}</span>` : '') +
+        `<span class="content-tab-label">${escapeHtml(t.title)}</span>` +
+        (t.closable ? `<span class="content-tab-close" title="Close tab">×</span>` : '');
+      btn.addEventListener('click', e => {
+        if (e.target && e.target.classList.contains('content-tab-close')) {
+          e.stopPropagation();
+          close(t.id);
+          return;
+        }
+        activate(t.id);
+      });
+      el.appendChild(btn);
+    }
+  }
+
+  function activate(id) {
+    const t = find(id);
+    if (!t) return;
+    // Save the current DOM into the previously-active tab cache so
+    // its state (e.g. expanded sub-tabs) is preserved on switch back.
+    if (activeId && activeId !== id) {
+      const old = find(activeId);
+      if (old) old.html = bodyEl().innerHTML;
+    }
+    activeId = id;
+    bodyEl().innerHTML = t.html || '';
+    render();
+    if (typeof t.onActivate === 'function') {
+      try { t.onActivate(); } catch (e) { console.error(e); }
+    }
+  }
+
+  function open(spec) {
+    let t = find(spec.id);
+    if (!t) {
+      t = {
+        id: spec.id,
+        title: spec.title || spec.id,
+        tooltip: spec.tooltip || '',
+        icon: spec.icon || '',
+        closable: spec.closable !== false,
+        html: '',
+        onActivate: spec.onActivate || null,
+      };
+      list.push(t);
+    } else {
+      if (spec.title) t.title = spec.title;
+      if (spec.tooltip != null) t.tooltip = spec.tooltip;
+      if (spec.icon != null) t.icon = spec.icon;
+      if (spec.onActivate) t.onActivate = spec.onActivate;
+    }
+    activate(spec.id);
+    return t;
+  }
+
+  function close(id) {
+    const i = indexOf(id);
+    if (i < 0) return;
+    const t = list[i];
+    if (!t.closable) return;
+    list.splice(i, 1);
+    if (activeId === id) {
+      activeId = null;
+      const next = list[Math.max(0, i - 1)] || list[0];
+      if (next) activate(next.id);
+      else { bodyEl().innerHTML = ''; render(); }
+    } else {
+      render();
+    }
+  }
+
+  function setBody(id, html) {
+    const t = find(id);
+    if (!t) return;
+    t.html = html;
+    if (activeId === id) bodyEl().innerHTML = html;
+  }
+
+  function active() { return activeId; }
+  function isActive(id) { return activeId === id; }
+
+  return { open, close, activate, setBody, active, isActive, render };
+})();
+
+function openEdgeTab(edgeData) {
+  if (!edgeData) return;
+  const src = edgeData.source, tgt = edgeData.target;
+  const rel = edgeData._rel || edgeData.rel || 'edge';
+  const tabId = `edge:${src}->${tgt}|${rel}`;
+  const nodes = (currentGraph && currentGraph.nodes) || [];
+  const srcNode = nodes.find(n => n.id === src);
+  const tgtNode = nodes.find(n => n.id === tgt);
+  const srcName = (srcNode && srcNode.name) || src;
+  const tgtName = (tgtNode && tgtNode.name) || tgt;
+  Tabs.open({ id: tabId, title: `${srcName} → ${tgtName}`, closable: true });
+  const html = `
+    <div class="flex items-center gap-2 flex-wrap mb-3">
+      <span class="badge badge-sm badge-primary font-semibold">edge</span>
+      <span class="badge badge-sm badge-outline font-mono">${escapeHtml(rel)}</span>
+    </div>
+    <div class="text-xs space-y-2">
+      <div><span class="opacity-60 uppercase tracking-wider mr-1 text-[10px]">From</span>
+        <a href="#" class="link link-primary" onclick="event.preventDefault();selectNode('${String(src).replace(/'/g, "\\'")}')">${escapeHtml(srcName)}</a>
+        <div class="opacity-50 font-mono break-all">${escapeHtml(src)}</div>
+      </div>
+      <div><span class="opacity-60 uppercase tracking-wider mr-1 text-[10px]">To</span>
+        <a href="#" class="link link-primary" onclick="event.preventDefault();selectNode('${String(tgt).replace(/'/g, "\\'")}')">${escapeHtml(tgtName)}</a>
+        <div class="opacity-50 font-mono break-all">${escapeHtml(tgt)}</div>
+      </div>
+      <div><span class="opacity-60 uppercase tracking-wider mr-1 text-[10px]">Relationship</span>
+        <span class="font-mono">${escapeHtml(rel)}</span>
+      </div>
+    </div>
+  `;
+  Tabs.setBody(tabId, html);
+}
+
 /* ── Detail Panel (left pane, rich formatting) ─────────────────── */
 function guessLang(type, path) {
   if (path) {
@@ -872,7 +1039,18 @@ function guessLang(type, path) {
 }
 
 async function showDetail(data) {
-  const el = document.getElementById('left-detail-content');
+  const tabId = 'node:' + data.id;
+  const rel = relativePath(data.path);
+  const tabTooltip = rel
+    ? (data.line_start != null ? `${rel}:${data.line_start}` : rel)
+    : (data.name || '');
+  Tabs.open({
+    id: tabId,
+    title: data.name || 'Node',
+    tooltip: tabTooltip,
+    closable: true,
+    onActivate: () => { if (data.id) applyPersistentFocus(data.id); },
+  });
   const typeColor = NODE_COLORS[data.type] || '#888';
   const lang = guessLang(data.type, data.path);
 
@@ -944,7 +1122,7 @@ async function showDetail(data) {
         ${codeHtml}
       </div>`;
 
-  el.innerHTML = `
+  Tabs.setBody(tabId, `
     ${headerHtml}
     <div role="tablist" class="tabs tabs-bordered tabs-sm mb-2">
       <button role="tab" class="tab tab-active" data-tab="detail-tab-content" onclick="switchDetailTab(this)">Details</button>
@@ -956,13 +1134,13 @@ async function showDetail(data) {
     <div id="detail-tab-connections" class="hidden" data-node-id="${escapeHtml(data.id || '')}">
       ${connectionRows}
     </div>
-  `;
-  document.querySelector('#left-content h3').textContent = data.name || 'Node Detail';
+  `);
 
   // Auto-scroll the highlighted region into view (if any).
-  if (useFullFile && startLine) {
+  if (useFullFile && startLine && Tabs.isActive(tabId)) {
     requestAnimationFrame(() => {
-      const target = el.querySelector('.code-line.hl-start');
+      const body = document.getElementById('left-detail-content');
+      const target = body && body.querySelector('.code-line.hl-start');
       if (target) target.scrollIntoView({ block: 'center' });
     });
   }
@@ -994,16 +1172,39 @@ function renderLinedCode(html, start, end) {
       i++;
     }
   }
+  const COLLAPSE_THRESHOLD = 10;
+  const collapseEnabled = !!start && start > COLLAPSE_THRESHOLD;
+  const collapseId = collapseEnabled ? `src-collapse-${(renderLinedCode._uid = (renderLinedCode._uid || 0) + 1)}` : null;
   const out = [];
+  if (collapseEnabled) {
+    out.push(`<div class="code-collapse-wrap"><div id="${collapseId}" class="code-collapsed-lines hidden">`);
+  }
+  let toggleInserted = false;
   for (let k = 0; k < lines.length; k++) {
     const ln = k + 1;
+    if (collapseEnabled && !toggleInserted && ln === start) {
+      out.push(`</div><button type="button" class="code-show-all-btn" onclick="toggleSourceCollapse(this, '${collapseId}')" data-from="1" data-to="${start - 1}">────── Show lines 1–${start - 1} ──────</button>`);
+      toggleInserted = true;
+    }
     const cls = ['code-line'];
     if (start && ln >= start && ln <= (end || start)) cls.push('hl');
     if (start && ln === start) cls.push('hl-start');
     if (start && ln === (end || start)) cls.push('hl-end');
     out.push(`<div class="${cls.join(' ')}" data-line="${ln}"><span class="ln">${ln}</span><span class="lc">${lines[k] || ' '}</span></div>`);
   }
+  if (collapseEnabled) out.push(`</div>`);
   return `<pre class="detail-code-block lined"><code class="hljs">${out.join('')}</code></pre>`;
+}
+
+function toggleSourceCollapse(btn, id) {
+  const wrap = document.getElementById(id);
+  if (!wrap) return;
+  const hidden = wrap.classList.toggle('hidden');
+  if (hidden) {
+    btn.textContent = `────── Show lines ${btn.dataset.from}–${btn.dataset.to} ──────`;
+  } else {
+    btn.textContent = `────── Hide lines ${btn.dataset.from}–${btn.dataset.to} ──────`;
+  }
 }
 
 function switchDetailTab(tabEl) {
@@ -1262,48 +1463,102 @@ async function loadStats() {
 }
 
 async function showWelcomePanel() {
-  const el = document.getElementById('left-detail-content');
-  document.querySelector('#left-content h3').textContent = 'Apollo';
+  Tabs.open({
+    id: 'welcome',
+    title: 'Welcome',
+    closable: false,
+    onActivate: () => {
+      // Drop any node selection in the graph; do NOT call clearFocus()
+      // since that re-opens the welcome tab and would recurse.
+      if (selectedNode && graphChart && currentGraph) {
+        selectedNode = null;
+        renderGraph(currentGraph);
+      }
+    },
+  });
   const stats = await loadStats();
 
   let statsHtml = '';
   if (stats) {
-    statsHtml += `<div class="stats stats-horizontal shadow bg-base-200 w-full mb-4">
-      <div class="stat py-2 px-4"><div class="stat-title text-[10px]">Nodes</div><div class="stat-value text-base text-primary">${(stats.total_nodes||0).toLocaleString()}</div></div>
-      <div class="stat py-2 px-4"><div class="stat-title text-[10px]">Edges</div><div class="stat-value text-base text-secondary">${(stats.total_edges||0).toLocaleString()}</div></div>
+    statsHtml += `<div class="stats stats-horizontal shadow bg-base-200 w-full mb-3">
+      <div class="stat py-2 px-3"><div class="stat-title text-[10px]">Nodes</div><div class="stat-value text-base text-primary">${(stats.total_nodes||0).toLocaleString()}</div></div>
+      <div class="stat py-2 px-3"><div class="stat-title text-[10px]">Edges</div><div class="stat-value text-base text-secondary">${(stats.total_edges||0).toLocaleString()}</div></div>
     </div>`;
 
-    if (stats.node_types && Object.keys(stats.node_types).length) {
-      statsHtml += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Node Types</div><div class="space-y-1 mb-3">';
-      for (const [t,c] of Object.entries(stats.node_types))
-        statsHtml += `<div class="flex justify-between items-center text-xs"><span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full inline-block flex-shrink-0" style="background:${NODE_COLORS[t]||'#555'}"></span>${t}</span><span class="badge badge-xs badge-primary">${c.toLocaleString()}</span></div>`;
-      statsHtml += '</div>';
-    }
+    const hasNodeTypes = stats.node_types && Object.keys(stats.node_types).length;
+    const hasEdgeTypes = stats.edge_types && Object.keys(stats.edge_types).length;
 
-    if (stats.edge_types && Object.keys(stats.edge_types).length) {
-      statsHtml += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Edge Types</div><div class="space-y-1 mb-3">';
-      for (const [t,c] of Object.entries(stats.edge_types))
-        statsHtml += `<div class="flex justify-between items-center text-xs"><span>${t}</span><span class="badge badge-xs badge-outline">${c.toLocaleString()}</span></div>`;
-      statsHtml += '</div>';
+    if (hasNodeTypes) {
+      statsHtml += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Node Types</div>';
+      statsHtml += '<div id="welcome-node-chart" style="width:100%;height:200px" class="mb-3"></div>';
+    }
+    if (hasEdgeTypes) {
+      statsHtml += '<div class="text-xs font-semibold uppercase tracking-wider opacity-70 mb-1.5">Edge Types</div>';
+      statsHtml += '<div id="welcome-edge-chart" style="width:100%;height:180px" class="mb-3"></div>';
     }
   }
 
-  el.innerHTML = `
-    <div class="md-content">
-      <h2>Welcome</h2>
-      <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
-      <h3>Quick Start</h3>
-      <ul>
-        <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
-        <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
-        <li><strong>Click a node</strong> &mdash; view source and connections</li>
-        <li><strong>Click empty space</strong> &mdash; reset the view</li>
-        <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
-      </ul>
-      ${stats ? '<h3>Index Analytics</h3>' : ''}
+  Tabs.setBody('welcome', `
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="md-content">
+        <h2>Welcome</h2>
+        <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
+        <h3>Quick Start</h3>
+        <ul>
+          <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
+          <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
+          <li><strong>Click a node</strong> &mdash; view source and connections</li>
+          <li><strong>Click empty space</strong> &mdash; reset the view</li>
+          <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
+        </ul>
+      </div>
+      <div>
+        <div class="md-content"><h3>Recent</h3></div>
+        <div class="bg-base-200 rounded-lg p-4 text-xs opacity-70 italic">
+          No recent operations yet. Previously completed indexing, searches, and chats will appear here.
+        </div>
+      </div>
     </div>
+    ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
     ${statsHtml}
-  `;
+  `);
+
+  if (stats) {
+    if (stats.node_types && Object.keys(stats.node_types).length) {
+      const el = document.getElementById('welcome-node-chart');
+      if (el && window.echarts) {
+        const data = Object.entries(stats.node_types).map(([t,c]) => ({
+          name: t, value: c, itemStyle: { color: NODE_COLORS[t] || '#888' }
+        }));
+        echarts.init(el).setOption({
+          tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+          legend: { type: 'scroll', orient: 'vertical', right: 0, top: 'middle', textStyle: { fontSize: 10 } },
+          series: [{
+            type: 'pie', radius: ['45%', '70%'], center: ['35%', '50%'],
+            avoidLabelOverlap: true, label: { show: false }, labelLine: { show: false },
+            data
+          }]
+        });
+      }
+    }
+    if (stats.edge_types && Object.keys(stats.edge_types).length) {
+      const el = document.getElementById('welcome-edge-chart');
+      if (el && window.echarts) {
+        const entries = Object.entries(stats.edge_types);
+        echarts.init(el).setOption({
+          tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+          grid: { left: 80, right: 20, top: 10, bottom: 20 },
+          xAxis: { type: 'value', axisLabel: { fontSize: 10 } },
+          yAxis: { type: 'category', data: entries.map(e => e[0]), axisLabel: { fontSize: 10 } },
+          series: [{
+            type: 'bar', data: entries.map(e => e[1]),
+            itemStyle: { color: '#6366f1' },
+            label: { show: true, position: 'right', fontSize: 10 }
+          }]
+        });
+      }
+    }
+  }
 }
 
 /* ── Chat ──────────────────────────────────────────────────────── */
@@ -1483,7 +1738,21 @@ async function sendChatMessage() {
    success, or null on error (the bubble is updated with the error message).
    `historyForCall` is the prior message history sent to /api/chat. */
 async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
-  ad.innerHTML = '...';
+  // Animated typing indicator (daisyUI loading-dots — wave-style dots)
+  // so the user can see we're actively waiting on the model.
+  ad.innerHTML = '<span class="chat-typing inline-flex items-center gap-1" aria-label="Assistant is thinking">'
+    + '<span class="loading loading-dots loading-sm"></span>'
+    + '</span>';
+  let firstChunk = true;
+  const wrapper = ad.closest('.chat') || ad.parentElement;
+  const scroller = document.getElementById('chat-messages');
+  const scrollAssistantToTop = () => {
+    if (!wrapper || !scroller) return;
+    // Position the assistant bubble's top near the top of the chat viewport
+    // so the user starts reading from the beginning of the reply.
+    const top = wrapper.offsetTop - scroller.offsetTop;
+    scroller.scrollTop = Math.max(0, top - 8);
+  };
   const isAbort = (e) => signal && signal.aborted ||
     (e && (e.name === 'AbortError' || /abort/i.test(e.message || '')));
   let res;
@@ -1508,10 +1777,19 @@ async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
       if(raw==='[DONE]')continue; if(raw.startsWith('[ERROR]')){ad.innerHTML=`<span class="text-error">${raw}</span>`;return null;}
       const d = raw.replace(/\\r/g,'\r').replace(/\\n/g,'\n').replace(/\\\\/g,'\\');
       full+=d; ad.innerHTML='<div class="md-content">'+marked.parse(formatChatContent(full))+'</div>';
-      document.getElementById('chat-messages').scrollTop=document.getElementById('chat-messages').scrollHeight;
+      if (firstChunk) {
+        // First content arrived — anchor the viewport at the TOP of the
+        // assistant bubble so the user can read the response from line 1
+        // instead of being yanked to the bottom as it grows.
+        firstChunk = false;
+        scrollAssistantToTop();
+      }
     }}
     ad.querySelectorAll('pre code:not(.hljs)').forEach(b => hljs.highlightElement(b));
     _wireChipHandlers(ad);
+    // Re-anchor after the final render (heights may have shifted due to
+    // syntax highlighting / markdown layout).
+    requestAnimationFrame(scrollAssistantToTop);
     return full;
   } catch(e) {
     if (isAbort(e)) {
@@ -2055,14 +2333,11 @@ if (IS_DEV_MODE) {
   document.getElementById('dev-toolbar')?.classList.remove('hidden');
 }
 fetchIndexCount(); checkChatStatus(); loadFolderTree();
-if (IS_DEV_MODE) {
-  // Dev mode: keep the original welcome panel and require a manual Load click.
-  showWelcomePanel();
+// Load the graph on startup, but show the Welcome tab by default
+// (no auto-selection of the largest node).
+const _boot = () => { showWelcomePanel(); loadGraph(); };
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _boot);
 } else {
-  // Normal mode: auto-load the graph as soon as the DOM is ready.
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', loadGraph);
-  } else {
-    loadGraph();
-  }
+  _boot();
 }

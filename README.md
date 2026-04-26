@@ -2,6 +2,14 @@
 
 <img src="img/apollo_1.png" alt="Apollo screenshot" width="600">
 
+<img src="img/mascot.png" alt="Apollo mascot" width="220" align="right">
+
+## Who is Apollo?
+
+In Greek mythology, **Apollo** is the god of light, music, poetry, prophecy, and — above all — **wisdom and knowledge**. He illuminates what is hidden and brings clarity to the unseen connections between things.
+
+This project borrows his name because that's exactly what it does for your files. Apollo shines a light on your codebase, notes, and documents, revealing the hidden relationships between them — which functions call which, which notes reference which ideas, which files share concepts — and renders them as an interactive knowledge graph you can **see, explore, and ask questions about**. Whether you're trying to understand a sprawling codebase or rediscover ideas buried in years of notes, Apollo helps you *see and understand* your text and code at a glance.
+
 An **Obsidian-for-your-filesystem** — a browser-based tool that scans any directory, builds a **knowledge graph** of the content and its relationships, and lets you visually explore, search, and ask questions about your files.
 
 Instead of manually linking notes, Apollo **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
