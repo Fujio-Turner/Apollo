@@ -1,7 +1,7 @@
 """Unit tests for spatial module."""
 import pytest
 
-from graph_search.spatial import SpatialMapper
+from apollo.spatial import SpatialMapper
 
 
 class TestSpatialMapper:

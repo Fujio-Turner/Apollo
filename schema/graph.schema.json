@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://graph-search.local/schema/graph.schema.json",
+  "$id": "https://apollo.local/schema/graph.schema.json",
   "title": "Graph Document",
   "description": "The top-level JSON document persisted by the JSON storage backend. Contains the full knowledge graph.",
   "type": "object",

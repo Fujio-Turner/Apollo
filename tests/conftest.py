@@ -1,4 +1,4 @@
-"""Pytest configuration and fixtures for graph_search tests."""
+"""Pytest configuration and fixtures for apollo tests."""
 import json
 import os
 import tempfile
@@ -80,7 +80,7 @@ def sample_json_file(temp_dir):
     """Create a sample JSON file for testing."""
     json_file = temp_dir / "config.json"
     config = {
-        "name": "graph_search",
+        "name": "apollo",
         "version": "1.0.0",
         "debug": True,
         "max_depth": 10,

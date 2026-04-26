@@ -1,7 +1,7 @@
 """Unit tests for GraphQuery."""
 import pytest
 
-from graph_search.graph import GraphQuery
+from apollo.graph import GraphQuery
 
 
 class TestGraphQuery:
@@ -132,8 +132,8 @@ class TestGraphQueryIntegration:
     
     def test_query_on_built_graph(self, multi_file_project):
         """Test querying a graph built from multiple files."""
-        from graph_search.graph import GraphBuilder
-        from graph_search.parser import PythonParser
+        from apollo.graph import GraphBuilder
+        from apollo.parser import PythonParser
         
         builder = GraphBuilder(parsers=[PythonParser()])
         graph = builder.build(str(multi_file_project))
@@ -146,8 +146,8 @@ class TestGraphQueryIntegration:
     
     def test_find_and_traverse_calls(self, multi_file_project):
         """Test finding a function and traversing its calls."""
-        from graph_search.graph import GraphBuilder
-        from graph_search.parser import PythonParser
+        from apollo.graph import GraphBuilder
+        from apollo.parser import PythonParser
         
         builder = GraphBuilder(parsers=[PythonParser()])
         graph = builder.build(str(multi_file_project))

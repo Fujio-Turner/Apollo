@@ -10,9 +10,9 @@ The sidebar folder tree shows a small colored badge next to each file (e.g. yell
 
 | Concern | File | Symbol |
 |---------|------|--------|
-| Map of extension → label/color | `graph_search/web/static/app.js` | `FILE_TYPE_BADGES` |
-| Lookup helper | `graph_search/web/static/app.js` | `fileBadgeHtml(name)` |
-| Visual styling | `graph_search/web/static/app.css` | `.file-badge` |
+| Map of extension → label/color | `apollo/web/static/app.js` | `FILE_TYPE_BADGES` |
+| Lookup helper | `apollo/web/static/app.js` | `fileBadgeHtml(name)` |
+| Visual styling | `apollo/web/static/app.css` | `.file-badge` |
 
 The badge is rendered by `renderTreeNode()` for every file in the tree. Folders use a Heroicon SVG (`_FOLDER_SVG`) and never go through the badge map.
 
@@ -97,7 +97,7 @@ If you're adding a new family member, **reuse the family color** instead of inve
 
 ## 5. Step-by-Step: Adding a New Type
 
-1. Open `graph_search/web/static/app.js`.
+1. Open `apollo/web/static/app.js`.
 2. Locate the `FILE_TYPE_BADGES` map (just above `fileBadgeHtml`).
 3. Add an entry in alphabetical-ish order within its family:
    ```js

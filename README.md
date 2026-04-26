@@ -1,8 +1,10 @@
-# Graph Search
+# Apollo
+
+<img src="img/apollo_1.png" alt="Apollo screenshot" width="600">
 
 An **Obsidian-for-your-filesystem** — a browser-based tool that scans any directory, builds a **knowledge graph** of the content and its relationships, and lets you visually explore, search, and ask questions about your files.
 
-Instead of manually linking notes, Graph Search **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
+Instead of manually linking notes, Apollo **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green)
@@ -23,9 +25,88 @@ Instead of manually linking notes, Graph Search **automatically discovers** conn
 - **Dual Storage** — JSON file backend (zero dependencies) or Couchbase Lite with SQL++ queries and native vector search.
 - **Indexing Progress UI** — DaisyUI stepper modal polls `/api/indexing-status`, terminal shows 4-step progress with timings.
 
+## Picking a Folder to Explore ("My Files")
+
+Once Apollo is running you don't have to re-launch the server every time you
+want to look at a different project. The left nav has a **My Files** button
+that lets you point Apollo at any folder on your machine and rebuild the graph
+for *that* folder on demand.
+
+1. Click **My Files** in the left nav.
+2. The native OS folder picker opens (macOS Finder / Windows Explorer / Linux
+   file dialog). Choose the directory you want insights for — a code repo, a
+   notes vault, a docs tree, anything with text/code files.
+3. Confirm with **Explore this folder**. Apollo scans the directory, parses
+   each file, computes embeddings + spatial coordinates, and writes a fresh
+   `data/index.json`. The indexing modal shows live progress.
+4. When indexing finishes the graph view auto-loads with that folder's nodes
+   and edges. The chat panel and search are now scoped to that folder's
+   content.
+
+> Folder picking uses the host OS dialog, so it works in the local
+> virtualenv setup. When running inside Docker the container can't open a
+> native picker — index by mounting the folder into `./target/` instead
+> (see [Quick Start](#quick-start)).
+
 ## Quick Start
 
-### Docker (recommended)
+### Local with virtual environment (recommended)
+
+Requires Python 3.9+.
+
+1. **Clone and enter the repo**
+    ```bash
+    git clone https://github.com/Fujio-Turner/Apollo.git
+    cd Apollo
+    ```
+
+2. **Create and activate a virtual environment**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate          # Windows: venv\Scripts\activate
+   ```
+
+3. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Configure your Grok API key (optional, enables AI chat)**
+
+   Either:
+   - Create a `.env` file in the project root:
+     ```bash
+     echo "XAI_API_KEY=your_key_here" > .env
+     ```
+   - **Or** skip this step and add the key later from the web UI's
+     **Settings** panel (see [Updating the Grok API key](#updating-the-grok-api-key)).
+
+   In both cases the key ends up in `.env` (gitignored) and is loaded
+   automatically on startup.
+
+5. **Put the directory you want to index in `./target/`** (or use any path)
+   ```bash
+   cp -r /path/to/your/project ./target
+   ```
+
+6. **Index it**
+   ```bash
+   python3 main.py index ./target
+   ```
+   This writes `data/index.json`.
+
+7. **Launch the web UI**
+   ```bash
+   python3 main.py serve
+   ```
+
+8. Open **http://localhost:8080**
+
+When you're done, deactivate the virtualenv with `deactivate`.
+
+### Docker (optional)
+
+If you'd rather not manage a Python environment:
 
 1. Put the directory you want to index in `./target/`:
    ```bash
@@ -43,21 +124,6 @@ To enable AI chat, set your Grok API key:
 ```bash
 XAI_API_KEY=your_key_here docker compose up --build
 ```
-
-### Local
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Index a directory
-python main.py index /path/to/your/project
-
-# Launch the web UI
-python main.py serve
-```
-
-Open **http://localhost:8080**
 
 ## CLI Reference
 
@@ -224,6 +290,25 @@ The top-bar search and chat box are merged into a single Tagify-powered input wi
 |---------------------|-------------|
 | `XAI_API_KEY` | Grok API key for AI chat (optional) |
 
+### Updating the Grok API key
+
+You can manage `XAI_API_KEY` in two equivalent ways — both end up in the
+project-root `.env` file (which is gitignored):
+
+1. **Edit `.env` directly**
+   ```bash
+   echo "XAI_API_KEY=your_key_here" > .env
+   ```
+   Restart `python3 main.py serve` so the new value is picked up.
+
+2. **Use the web Settings panel**
+   - Open the running app at **http://localhost:8080**
+   - Open the **Settings** panel
+   - Paste your key into the **XAI API Key** field and click **Save Settings**
+
+   The server upserts the value into `.env`, updates the in-process
+   environment, and resets the chat client — no restart required.
+
 | CLI Flag | Description |
 |----------|-------------|
 | `--backend json\|cblite` | Storage backend (default: json) |
@@ -247,7 +332,7 @@ The top-bar search and chat box are merged into a single Tagify-powered input wi
 ## Project Structure
 
 ```
-graph_search/
+apollo/
 ├── parser/              # Language parsers (AST, Tree-sitter, Markdown, TextFile)
 ├── graph/               # Graph builder and query engine
 ├── storage/             # JSON and Couchbase Lite backends

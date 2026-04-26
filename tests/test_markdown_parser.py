@@ -1,7 +1,7 @@
 """Unit tests for MarkdownParser."""
 import pytest
 
-from graph_search.parser import MarkdownParser
+from apollo.parser import MarkdownParser
 
 
 class TestMarkdownParser:

@@ -1,4 +1,4 @@
-# API & OpenAPI Guide — Graph Search
+# API & OpenAPI Guide — Apollo
 
 > Spec format: [OpenAPI 3.1.0](https://spec.openapis.org/oas/latest.html)
 >
@@ -33,7 +33,7 @@ docs/
 ├── API.md                 # Markdown quick reference
 └── DESIGN.md              # Links to both
 
-graph_search/web/
+apollo/web/
 └── server.py              # FastAPI app — route definitions + error handlers
 ```
 

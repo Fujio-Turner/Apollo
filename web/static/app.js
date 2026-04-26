@@ -82,7 +82,105 @@ function toggleNav() {
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
-async function apiFetch(url) { const r = await fetch(url); if (!r.ok) throw new Error(`API ${r.status}`); return r.json(); }
+/* Single HTTP entry point for all JSON API calls. Handles method, body,
+   status-code categorization (per https://restfulapi.net/http-status-codes/),
+   server-supplied error detail extraction, and 204 No Content.
+
+   Usage:
+     await apiFetch('/api/foo');                              // GET
+     await apiFetch('/api/foo', { method: 'POST', body: {} }); // POST JSON
+     await apiFetch('/api/foo', { method: 'DELETE' });         // DELETE
+
+   For streaming responses (e.g. SSE) pass `{ raw: true }` to receive the
+   raw Response after status validation. */
+class ApiError extends Error {
+  constructor(status, category, detail) {
+    super(`[${status || 'NET'}] ${detail}`);
+    this.name = 'ApiError';
+    this.status = status;
+    this.category = category;
+    this.detail = detail;
+  }
+}
+function _statusCategory(s) {
+  if (!s) return 'network';
+  if (s === 400) return 'badrequest';
+  if (s === 401) return 'unauthorized';
+  if (s === 403) return 'forbidden';
+  if (s === 404) return 'notfound';
+  if (s === 408) return 'timeout';
+  if (s === 409) return 'conflict';
+  if (s === 422) return 'validation';
+  if (s === 429) return 'ratelimit';
+  if (s === 503) return 'unavailable';
+  if (s === 504) return 'gatewaytimeout';
+  if (s >= 500) return 'server';   // 5xx — server fault
+  if (s >= 400) return 'client';   // other 4xx — client fault
+  if (s >= 300) return 'redirect'; // 3xx — should be auto-followed by fetch
+  return 'ok';                     // 2xx
+}
+/* Format an ApiError (or generic Error) for user-facing display.
+   Maps category → human-friendly prefix per restfulapi.net status semantics. */
+function formatApiError(e, fallback = 'Request failed') {
+  if (!e) return fallback;
+  if (!(e instanceof ApiError)) return e.message || fallback;
+  const map = {
+    network:        'Network error',
+    badrequest:     'Bad request',
+    unauthorized:   'Not signed in',
+    forbidden:      'Forbidden',
+    notfound:       'Not found',
+    timeout:        'Request timed out',
+    conflict:       'Conflict',
+    validation:     'Invalid input',
+    ratelimit:      'Rate limited — slow down',
+    unavailable:    'Service unavailable',
+    gatewaytimeout: 'Upstream timed out',
+    server:         'Server error',
+    client:         'Request error',
+  };
+  const prefix = map[e.category] || `HTTP ${e.status}`;
+  return `${prefix}: ${e.detail}`;
+}
+
+async function apiFetch(url, opts = {}) {
+  const { method = 'GET', body, headers = {}, raw = false, signal } = opts;
+  const init = { method, headers: { ...headers }, signal };
+  if (body !== undefined && body !== null) {
+    if (!init.headers['Content-Type']) init.headers['Content-Type'] = 'application/json';
+    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+  }
+  let r;
+  try {
+    r = await fetch(url, init);
+  } catch (e) {
+    // Network failure, CORS, DNS, offline, aborted, etc.
+    throw new ApiError(0, 'network', e.message || 'Network error');
+  }
+  if (!r.ok) {
+    let detail = r.statusText || `HTTP ${r.status}`;
+    try {
+      const ct = r.headers.get('content-type') || '';
+      if (ct.includes('application/json')) {
+        const j = await r.json();
+        detail = j.detail || j.error || j.message || detail;
+      } else {
+        const t = await r.text();
+        if (t) detail = t.slice(0, 500);
+      }
+    } catch { /* ignore parse errors */ }
+    throw new ApiError(r.status, _statusCategory(r.status), detail);
+  }
+  if (raw) return r;
+  if (r.status === 204) return null; // No Content
+  const ct = r.headers.get('content-type') || '';
+  try {
+    return ct.includes('application/json') ? await r.json() : await r.text();
+  } catch (e) {
+    // Server claimed success but body is unreadable / malformed.
+    throw new ApiError(r.status, 'parse', `Malformed response body: ${e.message}`);
+  }
+}
 
 /* ── Split Pane Drag ───────────────────────────────────────────── */
 (function initSplit() {
@@ -778,7 +876,7 @@ function renderWordCloud(data) {
     textStyle: { fontFamily:'Inter,sans-serif', color:()=>{const c=Object.values(NODE_COLORS);return c[Math.floor(Math.random()*c.length)];} },
     emphasis:{textStyle:{color:'#7c3aed'}}, data }] });
   wordCloudChart.off('click');
-  wordCloudChart.on('click', p => { searchNodes(p.name); });
+  wordCloudChart.on('click', p => { askChatFromCloud(p.name); });
   updateWordCloudToggle();
 }
 
@@ -880,7 +978,7 @@ async function loadStats() {
 
 async function showWelcomePanel() {
   const el = document.getElementById('left-detail-content');
-  document.querySelector('#left-content h3').textContent = 'Graph Search';
+  document.querySelector('#left-content h3').textContent = 'Apollo';
   const stats = await loadStats();
 
   let statsHtml = '';
@@ -935,19 +1033,22 @@ function _setChatReady() {
   document.getElementById('chat-send').disabled = false;
 }
 async function checkChatStatus() {
+  const badge = document.getElementById('chat-active-model');
   try {
     const d = await apiFetch('/api/chat/status');
+    if (badge) badge.textContent = d.model ? `${d.provider_label || d.provider}: ${d.model}` : 'no model';
     if (d.available) { _setChatReady(); return; }
-    // Key may be saved in settings but env not set on this boot — re-apply
-    await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}) });
-    const d2 = await apiFetch('/api/chat/status');
-    if (d2.available) { _setChatReady(); return; }
-    document.getElementById('chat-status').textContent = 'no API key';
-  } catch (e) { document.getElementById('chat-status').textContent = 'offline'; }
+    document.getElementById('chat-status').textContent = `no ${d.provider || ''} API key`.trim();
+  } catch (e) {
+    document.getElementById('chat-status').textContent = 'offline';
+    if (badge) badge.textContent = 'offline';
+  }
 }
 function appendChatMessage(role, content) {
   const m = document.getElementById('chat-messages');
+  // Only the most-recent assistant message is regenerable. Strip footers from
+  // any earlier assistant bubbles before adding the new message.
+  m.querySelectorAll('.chat-footer').forEach(el => el.remove());
   const wrapper = document.createElement('div');
   wrapper.className = `chat ${role === 'user' ? 'chat-end' : 'chat-start'}`;
   const header = document.createElement('div');
@@ -964,6 +1065,21 @@ function appendChatMessage(role, content) {
   }
   wrapper.appendChild(header);
   wrapper.appendChild(bubble);
+  if (role === 'assistant') {
+    const footer = document.createElement('div');
+    footer.className = 'chat-footer text-[10px] opacity-60 mt-0.5';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 regen-btn';
+    btn.title = 'Regenerate response (e.g. on timeout or bad answer)';
+    btn.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3 h-3">' +
+      '<path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" />' +
+      '</svg><span>Regenerate</span>';
+    btn.onclick = () => regenerateChatMessage(wrapper);
+    footer.appendChild(btn);
+    wrapper.appendChild(footer);
+  }
   m.appendChild(wrapper);
   m.scrollTop = m.scrollHeight;
   return bubble;
@@ -1017,37 +1133,142 @@ async function sendChatMessage() {
 
   if (!currentThreadId) {
     try {
-      const model = document.getElementById('chat-model').value;
-      const t = await fetch('/api/chat/threads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: msg.slice(0, 60), model }) }).then(r => r.json());
+      const t = await apiFetch('/api/chat/threads', {
+        method: 'POST',
+        body: { title: msg.slice(0, 60) },
+      });
       currentThreadId = t.id;
-    } catch (e) { /* proceed without persistence */ }
+    } catch (e) {
+      console.warn('Thread create failed:', e.status, e.detail);
+      showToast(`Chat history disabled this session (${formatApiError(e)})`, 'error');
+      // proceed without persistence — chat still works in-memory
+    }
   }
   appendChatMessage('user', msg); chatHistory.push({role:'user',content:msg});
   _persistMessage('user', msg);
   const ad = appendChatMessage('assistant','...');
   try {
-    const model = document.getElementById('chat-model').value;
-    const res = await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:chatHistory.slice(-10),context_node:selectedNode,model})});
-    if (!res.ok) { const e = await res.json().catch(()=>({})); ad.innerHTML=`<span class="text-error">Error: ${e.detail||res.statusText}</span>`; return; }
+    const full = await _streamAssistantResponse(msg, ad, chatHistory.slice(-10));
+    if (full !== null) {
+      chatHistory.push({role:'assistant',content:full});
+      _persistMessage('assistant', full);
+    }
+  } finally {
+    document.getElementById('chat-send').disabled = false;
+    if (chatTagify) { chatTagify.setDisabled(false); chatTagify.DOM.input.focus(); }
+    else { const i = document.getElementById('chat-input'); i.disabled = false; i.focus(); }
+  }
+}
+
+/* Stream a chat response into the given bubble. Returns the full text on
+   success, or null on error (the bubble is updated with the error message).
+   `historyForCall` is the prior message history sent to /api/chat. */
+async function _streamAssistantResponse(msg, ad, historyForCall) {
+  ad.innerHTML = '...';
+  let res;
+  try {
+    res = await apiFetch('/api/chat', {
+      method: 'POST',
+      body: { message: msg, history: historyForCall, context_node: selectedNode },
+      raw: true, // need the streaming Response body for SSE
+    });
+  } catch (e) {
+    ad.innerHTML = `<span class="text-error">${formatApiError(e, 'Chat failed')}</span>`;
+    // 503 typically means provider key not configured — refresh status badge.
+    if (e instanceof ApiError && e.status === 503) checkChatStatus();
+    return null;
+  }
+  try {
     const reader=res.body.getReader(), dec=new TextDecoder(); let full='';
     while(true) { const {done,value}=await reader.read(); if(done)break; for(const line of dec.decode(value,{stream:true}).split('\n')) {
       if(!line.startsWith('data: '))continue; const raw=line.slice(6);
-      if(raw==='[DONE]')continue; if(raw.startsWith('[ERROR]')){ad.innerHTML=`<span class="text-error">${raw}</span>`;return;}
-      // Reverse the SSE escaping done in server.py
+      if(raw==='[DONE]')continue; if(raw.startsWith('[ERROR]')){ad.innerHTML=`<span class="text-error">${raw}</span>`;return null;}
       const d = raw.replace(/\\r/g,'\r').replace(/\\n/g,'\n').replace(/\\\\/g,'\\');
       full+=d; ad.innerHTML='<div class="md-content">'+marked.parse(formatChatContent(full))+'</div>';
       document.getElementById('chat-messages').scrollTop=document.getElementById('chat-messages').scrollHeight;
     }}
     ad.querySelectorAll('pre code:not(.hljs)').forEach(b => hljs.highlightElement(b));
     _wireChipHandlers(ad);
-    chatHistory.push({role:'assistant',content:full});
-    _persistMessage('assistant', full);
-  } catch(e) { ad.innerHTML=`<span class="text-error">Failed: ${e.message}</span>`; }
-  finally {
-    document.getElementById('chat-send').disabled = false;
-    if (chatTagify) { chatTagify.setDisabled(false); chatTagify.DOM.input.focus(); }
-    else { const i = document.getElementById('chat-input'); i.disabled = false; i.focus(); }
+    return full;
+  } catch(e) { ad.innerHTML=`<span class="text-error">Failed: ${e.message}</span>`; return null; }
+}
+
+/* Regenerate the assistant response in the given wrapper. Finds the user
+   message that prompted it (the most recent prior user message) and replays
+   the request, replacing the bubble in place and updating persistence. */
+async function regenerateChatMessage(wrapper) {
+  if (!chatAvailable) return;
+  // Find the prior user message in the DOM (the immediately preceding
+  // wrapper with class chat-end).
+  const m = document.getElementById('chat-messages');
+  const wrappers = Array.from(m.children);
+  const idx = wrappers.indexOf(wrapper);
+  let userMsg = null;
+  for (let i = idx - 1; i >= 0; i--) {
+    if (wrappers[i].classList.contains('chat-end')) {
+      userMsg = wrappers[i].querySelector('.chat-bubble').textContent;
+      break;
+    }
   }
+  if (!userMsg) return;
+
+  // Drop the last assistant entry from in-memory history before replaying.
+  if (chatHistory.length && chatHistory[chatHistory.length - 1].role === 'assistant') {
+    chatHistory.pop();
+  }
+
+  const bubble = wrapper.querySelector('.chat-bubble');
+  const regenBtn = wrapper.querySelector('.regen-btn');
+  if (regenBtn) regenBtn.disabled = true;
+  try {
+    const full = await _streamAssistantResponse(userMsg, bubble, chatHistory.slice(-10));
+    if (full !== null) {
+      chatHistory.push({role:'assistant',content:full});
+      _replaceLastPersistedMessage('assistant', full);
+    }
+  } finally {
+    if (regenBtn) regenBtn.disabled = false;
+  }
+}
+
+function _replaceLastPersistedMessage(role, content) {
+  if (!currentThreadId) return;
+  apiFetch(`/api/chat/threads/${currentThreadId}/messages/last`, {
+    method: 'PUT',
+    body: { role, content },
+  }).catch((e) => _handlePersistError(e, 'Could not save regenerated reply'));
+}
+
+/* Shared handler for chat-history persistence failures.
+   - 404: thread was deleted out from under us → drop client state silently
+   - network/5xx: warn the user via toast (data only lives in memory)
+   - other 4xx: log + toast (likely a code bug we want to see) */
+function _handlePersistError(e, prefix) {
+  if (e instanceof ApiError && e.status === 404) {
+    console.warn('Chat thread no longer exists; resetting.');
+    currentThreadId = null;
+    return;
+  }
+  console.warn(prefix + ':', e.status, e.detail || e.message);
+  showToast(`${prefix} (${formatApiError(e)})`, 'error');
+}
+
+/* Send a chat message seeded from the Idea Cloud word click. Drops the
+   text into the chat input and auto-executes (no extra Send click needed). */
+function askChatFromCloud(term) {
+  if (!term) return;
+  const text = `Tell me about "${term}" in this codebase.`;
+  switchView('graph');                       // ensure chat panel is visible
+  if (chatTagify) {
+    chatTagify.removeAllTags();
+    chatTagify.DOM.input.textContent = text;
+  } else {
+    const input = document.getElementById('chat-input');
+    input.value = text;
+  }
+  // Defer one tick so Tagify's input event finishes wiring before we send.
+  if (chatAvailable) setTimeout(() => sendChatMessage(), 0);
+  else showToast('Chat not available — set an API key in Settings', 'error');
 }
 
 function askAboutNode(nodeId) {
@@ -1065,11 +1286,10 @@ function askAboutNode(nodeId) {
 
 /* ── Chat History ──────────────────────────────────────────────── */
 async function newChatThread() {
-  const model = document.getElementById('chat-model').value;
   try {
     const thread = await fetch('/api/chat/threads', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({}),
     }).then(r => r.json());
     currentThreadId = thread.id;
     chatHistory = [];
@@ -1121,7 +1341,6 @@ async function loadChatThread(threadId) {
       appendChatMessage(m.role, m.content);
       chatHistory.push({ role: m.role, content: m.content });
     });
-    if (thread.model) document.getElementById('chat-model').value = thread.model;
     document.getElementById('chat-thread-list').classList.add('hidden');
   } catch (e) { showToast('Failed to load thread', 'error'); }
 }
@@ -1140,10 +1359,10 @@ async function deleteChatThread(threadId) {
 
 function _persistMessage(role, content) {
   if (!currentThreadId) return;
-  fetch(`/api/chat/threads/${currentThreadId}/messages`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ role, content }),
-  }).catch(() => {});
+  apiFetch(`/api/chat/threads/${currentThreadId}/messages`, {
+    method: 'POST',
+    body: { role, content },
+  }).catch((e) => _handlePersistError(e, 'Could not save message'));
 }
 
 /* ── Image Generation ──────────────────────────────────────────── */
@@ -1181,27 +1400,98 @@ async function generateImage() {
 }
 
 /* ── Settings ──────────────────────────────────────────────────── */
+let _providerRegistry = [];
+
+function _esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function renderProvidersUI(d) {
+  _providerRegistry = d.providers || [];
+  const active = d.chat?.active_provider || (_providerRegistry[0] && _providerRegistry[0].id);
+  const perProvider = d.chat?.providers || {};
+
+  // Active-provider selector
+  const sel = document.getElementById('active-provider');
+  sel.innerHTML = _providerRegistry.map(p =>
+    `<option value="${_esc(p.id)}"${p.id===active?' selected':''}>${_esc(p.label)}</option>`
+  ).join('');
+
+  // Per-provider cards
+  const list = document.getElementById('providers-list');
+  list.innerHTML = _providerRegistry.map(p => {
+    const masked = d.api_keys?.[p.id] || '';
+    const inputId = `pk-${p.id}`;
+    const modelId = `pm-${p.id}`;
+    const selectedModel = perProvider[p.id]?.model || p.default_model;
+    const opts = p.models.map(m => `<option value="${_esc(m)}"${m===selectedModel?' selected':''}>${_esc(m)}</option>`).join('');
+    const status = masked ? '<span class="badge badge-success badge-xs">key set</span>' : '<span class="badge badge-ghost badge-xs">no key</span>';
+    return `
+      <div class="card bg-base-200 border border-base-300" data-provider="${_esc(p.id)}">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <div class="flex items-center gap-2">
+              <h4 class="font-semibold text-sm">${_esc(p.label)}</h4>
+              ${status}
+            </div>
+            <a href="${_esc(p.key_url)}" target="_blank" class="link link-primary text-xs">Get key ↗</a>
+          </div>
+          <label class="label py-1"><span class="label-text text-xs font-medium">API Key (env: ${_esc(p.env)})</span></label>
+          <div class="flex gap-2 mb-3">
+            <input id="${inputId}" type="password" placeholder="${_esc(masked || p.key_placeholder)}" class="input input-sm input-bordered flex-1 font-mono" autocomplete="off" />
+            <button type="button" class="btn btn-sm btn-ghost btn-square" onclick="togglePasswordVisibility('${inputId}')" aria-label="Toggle key visibility">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+            </button>
+          </div>
+          <label class="label py-1"><span class="label-text text-xs font-medium">Model</span></label>
+          <select id="${modelId}" class="select select-sm select-bordered w-full">${opts}</select>
+        </div>
+      </div>`;
+  }).join('');
+}
+
 async function loadSettings() {
   try {
     const d = await apiFetch('/api/settings');
-    document.getElementById('xai-api-key').value = d.api_keys?.xai_api_key||'';
-    document.getElementById('openai-api-key').value = d.api_keys?.openai_api_key||'';
-    if (d.chat?.default_model) document.getElementById('default-model').value = d.chat.default_model;
+    renderProvidersUI(d);
   } catch (e) {
-    console.error('Settings API not available, showing defaults:', e);
+    console.error('Settings API not available:', e);
   }
 }
+
 async function saveSettings() {
   const btn = document.getElementById('save-settings-btn');
-  btn.disabled=true; btn.innerHTML='<span class="loading loading-spinner loading-xs"></span> Saving...';
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span> Saving...';
   try {
-    const xk=document.getElementById('xai-api-key').value, ok=document.getElementById('openai-api-key').value, dm=document.getElementById('default-model').value;
-    const res = await fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      api_keys:{...(xk&&!xk.includes('•')?{xai_api_key:xk}:{}), ...(ok&&!ok.includes('•')?{openai_api_key:ok}:{})},
-      chat:{default_model:dm}})});
-    if (res.ok) { showToast('Settings saved','success'); checkChatStatus(); } else showToast('Failed to save','error');
-  } catch(e) { showToast('Error: '+e.message,'error'); }
-  finally { btn.disabled=false; btn.textContent='Save Settings'; }
+    const apiKeys = {};
+    const providers = {};
+    for (const p of _providerRegistry) {
+      const k = (document.getElementById(`pk-${p.id}`) || {}).value || '';
+      if (k && !k.includes('•')) apiKeys[p.id] = k;
+      const m = (document.getElementById(`pm-${p.id}`) || {}).value || '';
+      if (m) providers[p.id] = { model: m };
+    }
+    const active = document.getElementById('active-provider').value;
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_keys: apiKeys,
+        chat: { active_provider: active, providers },
+      }),
+    });
+    if (res.ok) {
+      showToast('Settings saved', 'success');
+      await loadSettings();   // refresh masked keys / status badges
+      checkChatStatus();
+    } else {
+      showToast('Failed to save', 'error');
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save Settings';
+  }
 }
 
 function showToast(msg,type) {
@@ -1424,4 +1714,19 @@ async function deleteIndex() {
 }
 
 /* ── Init ──────────────────────────────────────────────────────── */
-fetchIndexCount(); showWelcomePanel(); checkChatStatus(); loadFolderTree();
+const IS_DEV_MODE = new URLSearchParams(location.search).get('dev') === 'true';
+if (IS_DEV_MODE) {
+  document.getElementById('dev-toolbar')?.classList.remove('hidden');
+}
+fetchIndexCount(); checkChatStatus(); loadFolderTree();
+if (IS_DEV_MODE) {
+  // Dev mode: keep the original welcome panel and require a manual Load click.
+  showWelcomePanel();
+} else {
+  // Normal mode: auto-load the graph as soon as the DOM is ready.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', loadGraph);
+  } else {
+    loadGraph();
+  }
+}

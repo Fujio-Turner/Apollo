@@ -1,4 +1,4 @@
-# HTML & CSS Style Guide — Graph Search
+# HTML & CSS Style Guide — Apollo
 
 > Component reference: https://daisyui.com/components/
 >
@@ -11,14 +11,14 @@
 - **No HTML emojis.** Use SVG icons (Heroicons outline, 24x24 viewBox, `stroke-width="1.5"`) for all icons.
 - **DaisyUI first.** Use DaisyUI component classes before writing custom CSS. Only add custom styles when DaisyUI doesn't cover the need.
 - **Tailwind utilities** for layout, spacing, and one-off tweaks. Never write raw CSS for something Tailwind covers (`flex`, `gap-2`, `p-4`, `text-xs`, etc.).
-- **Separate files.** HTML structure in `index.html`, styles in `app.css`, logic in `app.js`. All live under `graph_search/web/static/`.
+- **Separate files.** HTML structure in `index.html`, styles in `app.css`, logic in `app.js`. All live under `apollo/web/static/`.
 
 ---
 
 ## 2. File Structure
 
 ```
-graph_search/web/static/
+apollo/web/static/
 ├── index.html    # HTML structure only — no inline <style> or <script> blocks
 ├── app.css       # All custom CSS (things DaisyUI + Tailwind can't cover)
 └── app.js        # All application JavaScript

@@ -69,6 +69,6 @@ class JsonStore:
         if path.exists():
             path.unlink()
         # Also remove file hashes
-        hashes = Path(".graph_search/file_hashes.json")
+        hashes = Path(".apollo/file_hashes.json")
         if hashes.exists():
             hashes.unlink()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-graph_search CLI — index a directory and query the code knowledge graph.
+Apollo CLI — index a directory and query the code knowledge graph.
 
 Usage:
     python main.py index <directory>
@@ -20,13 +20,19 @@ import json
 import os
 import sys
 
-from graph_search.graph import GraphBuilder, GraphQuery
-from graph_search.parser import MarkdownParser, PythonParser, TextFileParser, TreeSitterParser
-from graph_search.storage import open_store
+from dotenv import load_dotenv
 
-DEFAULT_INDEX_PATH = ".graph_search/index.json"
-DEFAULT_CBLITE_PATH = ".graph_search/graph.cblite2"
-HASHES_PATH = ".graph_search/file_hashes.json"
+# Load environment variables from .env (e.g. XAI_API_KEY) before anything
+# else imports modules that may read them.
+load_dotenv()
+
+from apollo.graph import GraphBuilder, GraphQuery
+from apollo.parser import MarkdownParser, PythonParser, TextFileParser, TreeSitterParser
+from apollo.storage import open_store
+
+DEFAULT_INDEX_PATH = "data/index.json"
+DEFAULT_CBLITE_PATH = "data/graph.cblite2"
+HASHES_PATH = "data/file_hashes.json"
 
 
 def _default_index_path(backend: str) -> str:
@@ -91,7 +97,7 @@ def cmd_index(args):
     # Generate embeddings if sentence-transformers is available
     if not args.no_embeddings:
         try:
-            from graph_search.embeddings import Embedder
+            from apollo.embeddings import Embedder
             print("Generating embeddings...")
             embedder = Embedder()
             embedder.embed_graph(graph)
@@ -101,7 +107,7 @@ def cmd_index(args):
 
     # Compute spatial coordinates
     if not args.no_spatial:
-        from graph_search.spatial import SpatialMapper
+        from apollo.spatial import SpatialMapper
         print("Computing spatial coordinates...")
         mapper = SpatialMapper()
         coords = mapper.compute_all(graph)
@@ -210,8 +216,8 @@ def cmd_search(args):
     # For cblite backend, try CBL-native vector search first
     if backend == "cblite":
         try:
-            from graph_search.search.cblite_semantic import CouchbaseLiteSemanticSearch
-            from graph_search.embeddings import Embedder
+            from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
+            from apollo.embeddings import Embedder
             embedder = Embedder()
             cbl_search = CouchbaseLiteSemanticSearch(store, embedder)
             if cbl_search.has_embeddings():
@@ -236,8 +242,8 @@ def cmd_search(args):
 
     if has_embeddings:
         try:
-            from graph_search.embeddings import Embedder
-            from graph_search.search import SemanticSearch
+            from apollo.embeddings import Embedder
+            from apollo.search import SemanticSearch
             embedder = Embedder()
             search = SemanticSearch(graph, embedder)
             results = search.search(args.text, top_k=args.top, node_type=args.type)
@@ -270,7 +276,7 @@ def cmd_search(args):
 def cmd_serve(args):
     """Start the web UI server."""
     import uvicorn
-    from graph_search.web.server import create_app
+    from apollo.web.server import create_app
 
     store, index_path = _open_store(args)
     backend = getattr(args, "backend", "json")
@@ -285,7 +291,7 @@ def cmd_serve(args):
 
     app = create_app(store, backend=backend, root_dir=root_dir, parsers=parsers)
     watch_msg = f", watching: {root_dir}" if root_dir else ""
-    print(f"Starting Graph Search UI at http://0.0.0.0:{args.port} (backend: {backend}{watch_msg})")
+    print(f"Starting Apollo UI at http://0.0.0.0:{args.port} (backend: {backend}{watch_msg})")
     uvicorn.run(app, host="0.0.0.0", port=args.port)
 
 
@@ -311,7 +317,7 @@ def cmd_watch(args):
     embedder = None
     if not args.no_embeddings:
         try:
-            from graph_search.embeddings import Embedder
+            from apollo.embeddings import Embedder
             embedder = Embedder()
         except ImportError:
             pass
@@ -330,7 +336,7 @@ def cmd_watch(args):
         store.save(graph)
         print(f"  Graph saved to {index_path}")
 
-    from graph_search.watcher import FileWatcher
+    from apollo.watcher import FileWatcher
     watcher = FileWatcher(
         root_dir=target_dir,
         graph=graph,
@@ -362,7 +368,7 @@ def cmd_spatial(args):
 
     graph = store.load(include_embeddings=False)
 
-    from graph_search.search.spatial import SpatialSearch
+    from apollo.search.spatial import SpatialSearch
     ss = SpatialSearch(graph)
 
     if args.face is not None:
@@ -407,7 +413,7 @@ def cmd_spatial_walk(args):
 
     graph = store.load(include_embeddings=False)
 
-    from graph_search.search.spatial import SpatialSearch
+    from apollo.search.spatial import SpatialSearch
     ss = SpatialSearch(graph)
 
     rings = ss.spatial_walk(args.node_id, step=args.step, max_rings=args.rings)
@@ -468,7 +474,7 @@ def _add_common_args(parser):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="graph_search",
+        prog="apollo",
         description="Code knowledge graph — index, query, and explore your codebase.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

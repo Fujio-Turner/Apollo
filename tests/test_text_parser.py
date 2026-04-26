@@ -1,7 +1,7 @@
 """Unit tests for TextFileParser."""
 import pytest
 
-from graph_search.parser import TextFileParser
+from apollo.parser import TextFileParser
 
 
 class TestTextFileParser:
@@ -181,7 +181,7 @@ Line3
     def test_parse_json_content_extracted(self, temp_dir):
         """Parsed JSON results contain a documents entry with file content."""
         json_file = temp_dir / "data.json"
-        json_file.write_text('{"name": "graph_search", "version": "1.0.0"}')
+        json_file.write_text('{"name": "apollo", "version": "1.0.0"}')
 
         parser = TextFileParser()
         result = parser.parse_file(str(json_file))
@@ -190,4 +190,4 @@ Line3
         docs = result.get("documents", [])
         assert len(docs) == 1
         assert docs[0]["doc_type"] == "json"
-        assert "graph_search" in docs[0]["content"]
+        assert "apollo" in docs[0]["content"]

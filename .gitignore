@@ -13,8 +13,9 @@ venv/
 env/
 
 # Graph Search data
+.apollo/
 .graph_search/
-data/
+
 
 # Target directory (user-provided codebase to index)
 target/

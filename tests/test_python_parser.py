@@ -1,7 +1,7 @@
 """Unit tests for PythonParser."""
 import pytest
 
-from graph_search.parser import PythonParser
+from apollo.parser import PythonParser
 
 
 class TestPythonParser:

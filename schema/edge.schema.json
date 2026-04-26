@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://graph-search.local/schema/edge.schema.json",
-  "title": "Graph Edge",
-  "description": "A directed edge in the Graph Search knowledge graph. Represents a relationship between two nodes.",
+  "$id": "https://apollo.local/schema/edge.schema.json",
+  "title": "Apollo Edge",
+  "description": "A directed edge in the Apollo knowledge graph. Represents a relationship between two nodes.",
   "type": "object",
   "required": ["source", "target", "type"],
   "properties": {

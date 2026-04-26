@@ -2,7 +2,7 @@
 import json
 import pytest
 
-from graph_search.storage import open_store
+from apollo.storage import open_store
 
 
 class TestStorageFactory:
