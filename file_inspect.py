@@ -50,17 +50,51 @@ class FileChangedError(Exception):
 
 # ── Path safety ────────────────────────────────────────────────────────────
 
+def _index_root(graph: nx.DiGraph) -> Path | None:
+    """The absolute path of the indexed project root, recorded by the builder
+    on the `dir::.` node as `abs_path`."""
+    if graph is None:
+        return None
+    root_node = graph.nodes.get("dir::.") or {}
+    abs_root = root_node.get("abs_path")
+    if not abs_root:
+        return None
+    try:
+        return Path(abs_root).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
 def _allowed_paths(graph: nx.DiGraph) -> set[str]:
-    """Set of every file/directory path the index already knows about (resolved)."""
+    """Set of every file/directory path the index already knows about (resolved).
+
+    Each node's path is first joined with its own `abs_path` if present, then
+    falls back to the indexed project root, then to the process CWD as a last
+    resort. This ensures the sandbox check works even when the server is
+    launched from a different directory than where the index was built.
+    """
     out: set[str] = set()
+    index_root = _index_root(graph)
     for _, data in graph.nodes(data=True):
-        if data.get("type") in ("file", "directory"):
-            p = data.get("path") or ""
-            if p:
-                try:
-                    out.add(str(Path(p).resolve()))
-                except OSError:
-                    pass
+        if data.get("type") not in ("file", "directory"):
+            continue
+        abs_p = data.get("abs_path")
+        if abs_p:
+            try:
+                out.add(str(Path(abs_p).expanduser().resolve(strict=False)))
+                continue
+            except (OSError, RuntimeError):
+                pass
+        p = data.get("path") or ""
+        if not p:
+            continue
+        raw = Path(p).expanduser()
+        if not raw.is_absolute() and index_root is not None:
+            raw = index_root / raw
+        try:
+            out.add(str(raw.resolve(strict=False)))
+        except (OSError, RuntimeError):
+            pass
     return out
 
 
@@ -86,13 +120,7 @@ def safe_path(path: str, graph: nx.DiGraph, root_dir: str | None) -> Path:
                 except (OSError, RuntimeError):
                     base = None
             if base is None:
-                root_node = graph.nodes.get("dir::.") if graph is not None else None
-                abs_root = root_node.get("abs_path") if root_node else None
-                if abs_root:
-                    try:
-                        base = Path(abs_root).expanduser().resolve(strict=False)
-                    except (OSError, RuntimeError):
-                        base = None
+                base = _index_root(graph)
             if base is not None:
                 raw = base / raw
         resolved = raw.resolve(strict=False)
