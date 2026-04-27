@@ -1,10 +1,66 @@
 """
-Markdown AST parser — extracts sections, code blocks, links, tables,
-task items, and frontmatter from Markdown files using mistune (v3) and
-python-frontmatter.
+plugins.markdown_gfm — GitHub Flavored Markdown plugin for Apollo
+=================================================================
 
-Produces a richer result than the generic TextFileParser while still
-including a whole-document ``documents`` entry for the embedding pipeline.
+This plugin parses Markdown files (``.md`` / ``.markdown``) into a
+structured result dictionary so Apollo can index, search, and visualize
+documentation alongside source code. It is one of the two reference
+plugins (the other is :mod:`plugins.python3`) and is a good template for
+any structured-text or markup-style language plugin.
+
+"GFM" in the module name means **GitHub Flavored Markdown**: we enable
+mistune's ``table`` and ``task_lists`` plugins so that pipe tables and
+``- [ ]`` checkboxes parse correctly. Strict CommonMark or other
+flavors (Pandoc, MultiMarkdown, AsciiDoc, …) would be a separate plugin
+file alongside this one — see ``guides/making_plugins.md``.
+
+What this plugin extracts
+-------------------------
+For every parseable Markdown file, :meth:`MarkdownParser.parse_source`
+returns a ``dict`` shaped like this::
+
+    {
+        "file":         str,
+        # The required "code-shape" keys are kept empty so the result
+        # plugs cleanly into pipelines that expect them.
+        "functions":    [],
+        "classes":      [],
+        "imports":      [],
+        "variables":    [],
+        # Markdown-specific keys:
+        "documents":    [ {name, doc_type, content, line_start, line_end} ],
+        "sections":     [ {name, level, line_start, line_end, content,
+                           parent_section} ],
+        "code_blocks":  [ {language, content, line_start, line_end} ],
+        "links":        [ {url, text, is_image, line, link_type} ],
+        "tables":       [ {headers, rows, line_start, line_end} ],
+        "task_items":   [ {text, checked, line} ],
+        "frontmatter":  dict | None,   # YAML/TOML metadata block
+        "title":        str | None,    # frontmatter "title" or first H1
+    }
+
+Design notes
+------------
+* **Whole document for embeddings.** We always include a single
+  ``documents`` entry containing the full raw text. This is what the
+  embedding pipeline consumes; the structured fields above are what the
+  graph and UI consume.
+* **Section hierarchy.** :meth:`_extract_sections` uses a stack-based
+  walk over headings to compute each section's parent, so that a level-3
+  heading correctly nests under the most recent level-2.
+* **Line numbers.** mistune's AST does not carry line numbers, so we
+  rediscover them by string-searching the original source. Helpers like
+  :func:`_find_heading_line`, :func:`_find_text_line`, and
+  :func:`_find_block_lines` do that recovery.
+* **Failure mode is silent.** Files larger than ``_MAX_FILE_SIZE`` and
+  unreadable files return ``None`` — the caller falls back to the
+  generic text indexer.
+
+Dependencies
+------------
+* `mistune <https://mistune.lepture.com/>`_ v3 — the AST renderer.
+* `python-frontmatter <https://python-frontmatter.readthedocs.io/>`_ —
+  parses YAML/TOML frontmatter blocks at the top of a file.
 """
 from __future__ import annotations
 
@@ -16,21 +72,61 @@ import mistune
 from mistune.plugins.table import table as plugin_table
 from mistune.plugins.task_lists import task_lists as plugin_task_lists
 
-from .base import BaseParser
+from apollo.parser.base import BaseParser
 
+# ---------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------
+
+# File extensions this plugin claims. ``.markdown`` is rare but valid.
 _MD_EXTENSIONS: frozenset[str] = frozenset({".md", ".markdown"})
 
-# Maximum file size we'll attempt to read (1 MB).
+# Maximum file size we'll attempt to read (1 MB). Larger files are
+# rejected — they're almost always generated artifacts (changelogs from
+# bots, exported wikis, etc.) and parsing them slows indexing without
+# adding much value.
 _MAX_FILE_SIZE = 1_048_576
 
-# Regex for locating a markdown heading line (used for line-number search).
+# Regex for locating a markdown heading line (used for line-number
+# recovery when mistune's AST doesn't carry line info).
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
 
 class MarkdownParser(BaseParser):
-    """Parses Markdown files into a structured AST-based result."""
+    """
+    Parse a Markdown file into Apollo's structured result dict.
+
+    Quick start
+    -----------
+    ::
+
+        parser = MarkdownParser()
+        if parser.can_parse("README.md"):
+            data = parser.parse_file("README.md")
+            print(data["title"])
+            for section in data["sections"]:
+                print(" " * section["level"], section["name"])
+
+    Pipeline (``parse_source`` → :meth:`_parse_raw`)
+    -----------------------------------------------
+    1. **Frontmatter** — ``python-frontmatter`` strips and parses any
+       leading ``---`` YAML/TOML block.
+    2. **AST** — mistune produces a list of dicts; we keep its native
+       shape rather than wrapping it in objects.
+    3. **Walks** — six small extractors collect sections, code blocks,
+       links, tables, task items, and the document title.
+    4. **Document entry** — a single whole-file ``documents`` entry is
+       always added so the embeddings pipeline gets something to index.
+
+    Each ``_extract_*`` method is independent and side-effect free; you
+    can replace one without touching the others.
+    """
 
     def __init__(self) -> None:
+        # Build the AST renderer once per parser instance. ``table`` and
+        # ``task_lists`` are mistune plugins (not Apollo plugins!) that
+        # add GFM-style support for ``| col |`` tables and ``- [ ]``
+        # checkboxes respectively.
         self._md = mistune.create_markdown(
             renderer="ast",
             plugins=[plugin_table, plugin_task_lists],
@@ -41,9 +137,15 @@ class MarkdownParser(BaseParser):
     # ------------------------------------------------------------------
 
     def can_parse(self, filepath: str) -> bool:
+        """Return True for ``.md`` / ``.markdown`` files (case-insensitive)."""
         return Path(filepath).suffix.lower() in _MD_EXTENSIONS
 
     def parse_file(self, filepath: str) -> dict | None:
+        """Read *filepath* from disk and delegate to :meth:`_parse_raw`.
+
+        Returns ``None`` for the wrong extension, files larger than
+        :data:`_MAX_FILE_SIZE`, or any I/O error.
+        """
         path = Path(filepath)
         if path.suffix.lower() not in _MD_EXTENSIONS:
             return None
@@ -59,6 +161,11 @@ class MarkdownParser(BaseParser):
         return self._parse_raw(raw, str(path))
 
     def parse_source(self, source: str, filepath: str) -> dict | None:
+        """Parse from an already-loaded source string.
+
+        Skipped when the path's extension isn't markdown, or the source
+        exceeds :data:`_MAX_FILE_SIZE` characters.
+        """
         if Path(filepath).suffix.lower() not in _MD_EXTENSIONS:
             return None
         if len(source) > _MAX_FILE_SIZE:
@@ -66,6 +173,14 @@ class MarkdownParser(BaseParser):
         return self._parse_raw(source, filepath)
 
     def _parse_raw(self, raw: str, filepath: str) -> dict | None:
+        """Run the full extraction pipeline on a raw Markdown string.
+
+        Empty/whitespace-only input returns ``None`` so the caller can
+        treat the file as unparseable. All exceptions thrown by
+        ``frontmatter`` are swallowed (we just treat the file as having
+        no frontmatter) so a malformed YAML block doesn't kill indexing
+        of an otherwise-valid document.
+        """
         if not raw.strip():
             return None
 
@@ -353,6 +468,17 @@ def _collect_text(node: dict) -> str:
 
 
 def _classify_link(url: str) -> str:
+    """Bucket a link URL into one of three coarse categories.
+
+    Returns one of:
+
+    * ``"external"`` — absolute ``http(s)://`` URL.
+    * ``"anchor"``   — same-document fragment (``#section``).
+    * ``"internal"`` — anything else (relative paths, ``mailto:``, etc.).
+
+    The graph layer uses this to colour links in the UI and to skip
+    crawling external URLs during reverse-link resolution.
+    """
     if url.startswith(("http://", "https://")):
         return "external"
     if url.startswith("#"):
@@ -411,3 +537,4 @@ def _find_block_lines(
     # Advance search_start past this block.
     new_search_start = pos + max(len(code), 3)
     return line_start, line_end, new_search_start
+
