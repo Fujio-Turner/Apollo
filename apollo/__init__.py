@@ -7,6 +7,7 @@ import sys
 _SUBPACKAGES = (
     "graph",
     "parser",
+    "plugins",
     "storage",
     "embeddings",
     "spatial",

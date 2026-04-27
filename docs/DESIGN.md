@@ -117,6 +117,48 @@ Responsible for reading source files and extracting a structured representation 
 
 **Recommendation**: Start with `ast` for Python-only support. Add Tree-sitter as a second parser backend when multi-language support is needed. The parser interface should be abstract so backends are swappable.
 
+#### 4.1.1 Plugin Architecture (implemented)
+
+Language support is now organized as a **drop-in plugin system**:
+
+```
+parser/                       # Generic plumbing
+├── base.py                   #   BaseParser ABC
+├── text_parser.py            #   Generic TextFileParser fallback
+└── treesitter_parser.py      #   Tree-sitter backend (multi-language)
+
+plugins/                      # One folder per language/format
+├── __init__.py               #   discover_plugins() — auto-discovery
+├── python3/                  #   Built-in: Python 3 (AST)
+│   ├── __init__.py           #     exports PLUGIN
+│   └── parser.py             #     PythonParser implementation
+└── markdown_gfm/             #   Built-in: GitHub Flavored Markdown
+    ├── __init__.py
+    └── parser.py
+```
+
+**Contract** — each plugin exposes a `PLUGIN` attribute pointing to a
+`BaseParser` subclass. `plugins.discover_plugins()` walks the package
+and instantiates everything it finds, in alphabetical order.
+
+**Why subpackages, not single files** — a plugin can grow to need
+helpers, vendored support code, sample data, or a third-party library
+loaded lazily. Putting everything in `plugins/<name>/` keeps each
+plugin self-contained: removing a language is one
+`rm -rf plugins/<name>/` away, and one plugin's deps can't break
+another's.
+
+**Backward compatibility** — the old import paths
+`from apollo.parser import PythonParser, MarkdownParser` still work via
+re-exports in `parser/__init__.py`, so the rest of the codebase didn't
+need to change when the move happened.
+
+**Adding a new language** — see [`guides/making_plugins.md`](../guides/making_plugins.md).
+The guide covers the folder layout, the result-dict shape, naming
+conventions (`go1/`, `java17/`, `markdown_common/`, `pdf_pypdf/`, …),
+how to handle third-party deps with lazy imports + per-plugin
+`requirements.txt`, and a complete worked example.
+
 ### 4.2 Graph Builder
 
 Takes parser output and constructs the graph:

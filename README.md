@@ -337,11 +337,47 @@ project-root `.env` file (which is gitignored):
 - **Embedding batch size 256** with `tqdm` progress bar.
 - **Non-blocking indexing** — runs in `run_in_executor` so the event loop stays free for status polls.
 
+## Language Plugins
+
+Apollo's language support is **plugin-based**. Each language lives in
+its own folder under `plugins/` — drop a new folder in, restart Apollo,
+and the new language is supported. No registry to edit, no core code to
+change.
+
+```
+plugins/
+├── python3/         # built-in: Python 3 source files (.py)
+├── markdown_gfm/    # built-in: GitHub Flavored Markdown (.md, .markdown)
+└── <your_lang>/     # ← drop a new folder here to add a language
+    ├── __init__.py  #   exports PLUGIN
+    └── parser.py    #   the BaseParser implementation
+```
+
+Plugins can:
+
+- Bring their own third-party libraries (lazy-imported, with an
+  optional per-plugin `requirements.txt`).
+- Self-disable when their dependencies aren't installed.
+- Add language-specific extraction (frameworks, decorators, embedded
+  SQL, regex patterns, etc.) on top of the standard
+  `functions / classes / imports / variables` schema.
+
+➡ **[How to make your own plugin →](guides/making_plugins.md)**
+
+The guide walks through the folder layout, the `BaseParser` contract,
+the standard result-dict shape, naming conventions
+(`python3/`, `go1/`, `java17/`, `markdown_common/`, `pdf_pypdf/`, …),
+how to handle third-party deps, a complete `plugins/go1/` worked
+example, and a smoke-test recipe.
+
 ## Project Structure
 
 ```
 apollo/
-├── parser/              # Language parsers (AST, Tree-sitter, Markdown, TextFile)
+├── parser/              # Generic parser plumbing (BaseParser, TextFile, Tree-sitter)
+├── plugins/             # Language plugins — drop-in folders, one per language
+│   ├── python3/         #   Python 3 (AST)
+│   └── markdown_gfm/    #   GitHub Flavored Markdown
 ├── graph/               # Graph builder and query engine
 ├── storage/             # JSON and Couchbase Lite backends
 ├── embeddings/          # Sentence-transformer embedding
@@ -361,6 +397,7 @@ apollo/
 - [`docs/DESIGN.md`](docs/DESIGN.md) — full design document with all 14 phases
 - [`docs/API.md`](docs/API.md) — REST API quick reference
 - [`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3.1 specification
+- [`guides/making_plugins.md`](guides/making_plugins.md) — **how to add a language plugin** (Go, PHP, Java, PDFs, anything)
 - [`guides/SCHEMA_DESIGN.md`](guides/SCHEMA_DESIGN.md) — database schema rules
 - [`guides/STYLE_HTML_CSS.md`](guides/STYLE_HTML_CSS.md) — HTML/CSS standards
 - [`guides/API_OPENAPI.md`](guides/API_OPENAPI.md) — API & OpenAPI maintenance guide
