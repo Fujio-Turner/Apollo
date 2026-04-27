@@ -23,6 +23,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from apollo.graph.query import GraphQuery
 from apollo.projects import ProjectManager, register_project_routes
+from apollo.reindex_service import ReindexService, ReindexConfig
 
 STATIC_DIR = Path(__file__).parent / "static"
 EXCLUDE_TYPES_WORDCLOUD = {"directory", "file", "import"}
@@ -64,6 +65,40 @@ DEFAULT_SETTINGS = {
             "anthropic": {"model": "claude-3-5-sonnet-latest"},
             "llama":     {"model": "llama-3.3-70b-versatile"},
         },
+        "max_tool_rounds": 5,
+        "streaming": True,
+    },
+    # UI / theming — controls the DaisyUI data-theme attribute.
+    "appearance": {
+        "theme": "dark",
+    },
+    # Graph rendering knobs (Phase 10). The slider default position, how
+    # many edges per node we send, and when to disable ECharts animation
+    # for large graphs.
+    "graph": {
+        "default_depth": 20,
+        "edge_cap_multiplier": 3,
+        "animation_threshold": 500,
+    },
+    # Indexer knobs (Phase 8/9). exclude_globs and extra_skip_dirs
+    # supplement the built-in _SKIP_DIRS blocklist.
+    "indexing": {
+        "exclude_globs": [],
+        "extra_skip_dirs": [],
+        "embedding_batch_size": 256,
+        "embedding_min_text_length": 40,
+    },
+    # Background re-index service (web/server.py ReindexConfig defaults).
+    "reindex": {
+        "strategy": "auto",
+        "sweep_interval_minutes": 30,
+        "sweep_on_session_start": True,
+        "local_max_hops": 1,
+        "force_full_after_runs": 50,
+    },
+    # Phase 14 web content capture folder (relative to project root).
+    "captures": {
+        "folder": "_apollo_web",
     },
 }
 
@@ -127,31 +162,67 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     
     # Initialize ProjectManager for project lifecycle management
     project_manager = ProjectManager(version=version)
+    
+    # Initialize ReindexService for background graph freshness
+    reindex_service: Optional[ReindexService] = None
+    if root_dir:
+        reindex_config = ReindexConfig(
+            strategy="auto",
+            sweep_interval_minutes=30,
+            sweep_on_session_start=True,
+            local_max_hops=1,
+            force_full_after_runs=50
+        )
+        reindex_service = ReindexService(root_dir, store, reindex_config)
 
-    # ── Standardized error responses ─────────────────────────────
-    def _error_body(status_code: int, error: str, detail) -> dict:
-        return {"status_code": status_code, "error": error, "detail": detail}
+    # ── Standardized error responses (Phase 14) ──────────────────
+    # Wire format combines the legacy `{status_code, error, detail}` keys
+    # (kept for backward compatibility with existing clients) with the new
+    # structured `error: {code, message, details?}` object documented in
+    # `schema/api-response.schema.json`.
+    from apollo.api import ErrorCode, ResponseValidator
+    _response_validator = ResponseValidator()
+
+    def _error_body(status_code: int, code: ErrorCode | str, message: str, detail=None) -> dict:
+        code_str = code.value if isinstance(code, ErrorCode) else str(code)
+        body: dict = {
+            "status_code": status_code,
+            "error": {"code": code_str, "message": message},
+        }
+        if detail is not None:
+            body["error"]["details"] = detail if isinstance(detail, dict) else {"detail": detail}
+        # Validate non-blockingly so schema drift gets logged but never breaks requests.
+        problems = _response_validator.validate(body)
+        if problems:
+            import logging
+            logging.getLogger("apollo.api").warning(
+                "Error response failed schema validation: %s", problems
+            )
+        return body
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(_req: Request, exc: HTTPException):
         phrase = HTTPStatus(exc.status_code).phrase if exc.status_code in HTTPStatus._value2member_map_ else "Error"
+        message = exc.detail if isinstance(exc.detail, str) else phrase
+        details = exc.detail if not isinstance(exc.detail, str) else None
+        code = ErrorCode.from_status(exc.status_code)
         return JSONResponse(
             status_code=exc.status_code,
-            content=_error_body(exc.status_code, phrase, exc.detail),
+            content=_error_body(exc.status_code, code, message, details),
         )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(_req: Request, exc: RequestValidationError):
         return JSONResponse(
             status_code=422,
-            content=_error_body(422, "Validation Error", exc.errors()),
+            content=_error_body(422, ErrorCode.VALIDATION_ERROR, "Validation Error", {"errors": exc.errors()}),
         )
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(_req: Request, exc: Exception):
         return JSONResponse(
             status_code=500,
-            content=_error_body(500, "Internal Server Error", "An unexpected error occurred"),
+            content=_error_body(500, ErrorCode.INTERNAL_ERROR, "An unexpected error occurred"),
         )
 
     # Load graph — skip embeddings in memory when using cblite (CBL handles vector search)
@@ -237,6 +308,14 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     async def _capture_loop():
         nonlocal _event_loop
         _event_loop = asyncio.get_running_loop()
+        
+        # Start background reindex sweep if service is available
+        if reindex_service and reindex_service.config.sweep_on_session_start:
+            try:
+                await reindex_service.start_background_sweep(delay_seconds=10.0)
+            except Exception as e:
+                import logging
+                logging.warning(f"Failed to start reindex service: {e}")
 
     # ── Register project management routes ────────────────────────
     register_project_routes(app, project_manager, store, backend)
@@ -349,7 +428,27 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
             t0 = time.time()
             print("⏳ [1/4] Parsing files...")
-            builder = GraphBuilder(parsers=build_parsers)
+            # Pull user-defined filters from the active project manifest
+            # (apollo.json) so the bootstrap wizard's choices actually take
+            # effect during indexing.
+            active_filters = None
+            try:
+                if (
+                    project_manager.manifest is not None
+                    and project_manager.root_dir is not None
+                    and os.path.abspath(str(project_manager.root_dir)) == os.path.abspath(target)
+                    and project_manager.manifest.filters is not None
+                ):
+                    active_filters = project_manager.manifest.filters.to_dict()
+                    print(f"   🔎 Applying project filters: mode={active_filters.get('mode')} "
+                          f"include_dirs={active_filters.get('include_dirs')} "
+                          f"exclude_dirs={active_filters.get('exclude_dirs')} "
+                          f"exclude_file_globs={active_filters.get('exclude_file_globs')} "
+                          f"include_doc_types={active_filters.get('include_doc_types')}")
+            except Exception as _e:
+                print(f"   ⚠️  Could not read project filters: {_e}")
+                active_filters = None
+            builder = GraphBuilder(parsers=build_parsers, filters=active_filters)
             graph = builder.build(target)
             n_nodes = graph.number_of_nodes()
             n_edges = graph.number_of_edges()
@@ -413,23 +512,102 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.delete("/api/index")
     def delete_index():
-        """Delete the current index and reset to an empty graph."""
-        nonlocal graph, q, search, chat_service
-        try:
-            store.delete()
-        except Exception:
-            pass
-        import networkx as nx
-        graph = nx.DiGraph()
-        q = GraphQuery(graph)
-        search = None
-        if chat_service is not None:
-            try:
-                from apollo.chat.service import ChatService
-                chat_service = ChatService(graph, search=None, embedder=embedder, root_dir=root_dir)
-            except Exception:
-                chat_service = None
-        return {"status": "deleted", "total_nodes": 0, "total_edges": 0}
+       """Delete the current index and reset to an empty graph."""
+       nonlocal graph, q, search, chat_service
+       try:
+           store.delete()
+       except Exception:
+           pass
+       import networkx as nx
+       graph = nx.DiGraph()
+       q = GraphQuery(graph)
+       search = None
+       if chat_service is not None:
+           try:
+               from apollo.chat.service import ChatService
+               chat_service = ChatService(graph, search=None, embedder=embedder, root_dir=root_dir)
+           except Exception:
+               chat_service = None
+       return {"status": "deleted", "total_nodes": 0, "total_edges": 0}
+
+    # ── Phase 9: Reindex Service Endpoints ────────────────────────
+    
+    @app.get("/api/index/history")
+    def get_reindex_history(limit: int = Query(20, ge=1, le=100)):
+       """Get reindex history (telemetry for last N runs)."""
+       if reindex_service is None:
+           raise HTTPException(status_code=503, detail="Reindex service not available")
+       history = reindex_service.get_history(limit)
+       return {
+           "history": [
+               {
+                   "duration_ms": s.duration_ms,
+                   "files_parsed": s.files_parsed,
+                   "nodes_added": s.nodes_added,
+                   "nodes_removed": s.nodes_removed,
+                   "edges_added": s.edges_added,
+                   "edges_removed": s.edges_removed,
+                   "timestamp": str(s.timestamp) if hasattr(s, 'timestamp') else None,
+                   "strategy": s.strategy if hasattr(s, 'strategy') else "unknown",
+               }
+               for s in history
+           ],
+           "count": len(history)
+       }
+    
+    @app.get("/api/index/last")
+    def get_last_reindex_stats():
+       """Get the most recent reindex statistics."""
+       if reindex_service is None:
+           raise HTTPException(status_code=503, detail="Reindex service not available")
+       stats = reindex_service.get_last_stats()
+       if stats is None:
+           return {
+               "status": "never_run",
+               "last_stats": None
+           }
+       return {
+           "status": "success",
+           "last_stats": {
+               "duration_ms": stats.duration_ms,
+               "files_parsed": stats.files_parsed,
+               "nodes_added": stats.nodes_added,
+               "nodes_removed": stats.nodes_removed,
+               "edges_added": stats.edges_added,
+               "edges_removed": stats.edges_removed,
+               "timestamp": str(stats.timestamp) if hasattr(stats, 'timestamp') else None,
+               "strategy": stats.strategy if hasattr(stats, 'strategy') else "unknown",
+           }
+       }
+    
+    @app.post("/api/index/sweep")
+    async def trigger_reindex_sweep():
+       """Manually trigger a background reindex sweep."""
+       if reindex_service is None:
+           raise HTTPException(status_code=503, detail="Reindex service not available")
+       
+       if reindex_service.is_reindexing():
+           return {
+               "status": "already_running",
+               "message": "A reindex operation is already in progress"
+           }
+       
+       try:
+           stats = await reindex_service.run_sweep()
+           return {
+               "status": "success",
+               "message": f"Sweep complete in {stats.duration_ms}ms",
+               "stats": {
+                   "duration_ms": stats.duration_ms,
+                   "files_parsed": stats.files_parsed,
+                   "nodes_added": stats.nodes_added,
+                   "nodes_removed": stats.nodes_removed,
+                   "edges_added": stats.edges_added,
+                   "edges_removed": stats.edges_removed,
+               }
+           }
+       except Exception as e:
+           raise HTTPException(status_code=500, detail=f"Sweep failed: {str(e)}")
 
     @app.get("/api/graph")
     def get_graph(
@@ -838,6 +1016,22 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         from apollo import file_inspect
         return _file_inspect_call(file_inspect.file_content, graph, root_dir, path)
 
+    @app.get("/api/file/raw")
+    def api_file_raw(path: str = Query(...)):
+        """Stream a file as-is — used by the Content div to render images
+        (and other binary assets referenced from indexed Markdown/HTML)
+        without base64-inlining them in JSON responses."""
+        from apollo import file_inspect
+        try:
+            resolved = file_inspect.safe_path(path, graph, root_dir)
+        except file_inspect.FileAccessError as e:
+            raise HTTPException(status_code=e.status_code, detail=str(e))
+        if not resolved.exists() or not resolved.is_file():
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        import mimetypes
+        mime, _ = mimetypes.guess_type(str(resolved))
+        return FileResponse(str(resolved), media_type=mime or "application/octet-stream")
+
     @app.get("/api/file/section")
     def api_file_section(
         path: str = Query(...),
@@ -971,10 +1165,21 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             pid: _mask_key(os.environ.get(p["env"], "") or "")
             for pid, p in PROVIDERS.items()
         }
+        # Merge stored values over defaults so newly-added sections
+        # always appear even on older settings.json files.
+        def _merged(section: str) -> dict:
+            base = dict(DEFAULT_SETTINGS.get(section, {}))
+            base.update(settings.get(section, {}) or {})
+            return base
         return {
             "providers": public_registry(),
             "api_keys": api_keys,
-            "chat": settings.get("chat", {}),
+            "chat": _merged("chat"),
+            "appearance": _merged("appearance"),
+            "graph": _merged("graph"),
+            "indexing": _merged("indexing"),
+            "reindex": _merged("reindex"),
+            "captures": _merged("captures"),
         }
 
     @app.put("/api/settings")
@@ -1007,6 +1212,57 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                         providers_cur.setdefault(pid, {}).update(
                             {k: v for k, v in cfg.items() if k in ("model",)}
                         )
+            if "max_tool_rounds" in chat_in:
+                try:
+                    chat_cur["max_tool_rounds"] = max(1, min(20, int(chat_in["max_tool_rounds"])))
+                except (TypeError, ValueError):
+                    pass
+            if "streaming" in chat_in:
+                chat_cur["streaming"] = bool(chat_in["streaming"])
+
+        # Free-form sections — validated structurally but values are trusted
+        # because everything is sourced from the local settings UI.
+        def _patch(section: str, allowed_keys: tuple, coercers: dict | None = None):
+            if section not in body or not isinstance(body[section], dict):
+                return
+            cur = current.setdefault(section, {})
+            for k, v in body[section].items():
+                if k not in allowed_keys:
+                    continue
+                if coercers and k in coercers:
+                    try:
+                        v = coercers[k](v)
+                    except (TypeError, ValueError):
+                        continue
+                cur[k] = v
+
+        _patch("appearance", ("theme",))
+        _patch(
+            "graph",
+            ("default_depth", "edge_cap_multiplier", "animation_threshold"),
+            {"default_depth": int, "edge_cap_multiplier": int, "animation_threshold": int},
+        )
+        _patch(
+            "indexing",
+            ("exclude_globs", "extra_skip_dirs", "embedding_batch_size", "embedding_min_text_length"),
+            {
+                "exclude_globs": lambda v: [str(x) for x in v] if isinstance(v, list) else [],
+                "extra_skip_dirs": lambda v: [str(x) for x in v] if isinstance(v, list) else [],
+                "embedding_batch_size": int,
+                "embedding_min_text_length": int,
+            },
+        )
+        _patch(
+            "reindex",
+            ("strategy", "sweep_interval_minutes", "sweep_on_session_start", "local_max_hops", "force_full_after_runs"),
+            {
+                "sweep_interval_minutes": int,
+                "sweep_on_session_start": bool,
+                "local_max_hops": int,
+                "force_full_after_runs": int,
+            },
+        )
+        _patch("captures", ("folder",))
 
         _save_settings(current)
 

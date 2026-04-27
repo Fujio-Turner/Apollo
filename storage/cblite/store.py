@@ -16,10 +16,14 @@ import json
 import math
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import networkx as nx
 
 from .ctypes_api import CBL
+
+if TYPE_CHECKING:
+    from apollo.graph.incremental import GraphDiff
 
 
 class CouchbaseLiteStore:
@@ -104,6 +108,53 @@ class CouchbaseLiteStore:
                 graph.add_edge(src, dst, **edge_data)
 
         return graph
+
+    def save_diff(self, diff: GraphDiff, graph: nx.DiGraph | None = None) -> None:
+        """Save only the changes (diff) to the database.
+        
+        Performs targeted document upserts/purges within a single transaction.
+        This is much more efficient than save() for large graphs with small changes.
+        
+        Args:
+            diff: GraphDiff containing nodes/edges to add/remove/modify
+            graph: Optional graph to read new node/edge attributes from
+                   If not provided, only purges are performed
+        """
+        cbl = self._open()
+        nodes_col = cbl.get_or_create_collection("nodes")
+        edges_col = cbl.get_or_create_collection("edges")
+        
+        cbl.begin_transaction()
+        try:
+            # Remove deleted nodes
+            for node_id in diff.nodes_removed:
+                cbl.purge_document(nodes_col, node_id)
+            
+            # Update/add nodes (modified + added)
+            if graph is not None:
+                for node_id in diff.nodes_added + diff.nodes_modified:
+                    if node_id in graph.nodes:
+                        attrs = dict(graph.nodes[node_id])
+                        cbl.save_document_json(nodes_col, node_id, json.dumps(attrs, default=str))
+            
+            # Remove deleted edges
+            for src, etype, dst in diff.edges_removed:
+                edge_id = f"{src}--{etype}-->{dst}"
+                cbl.purge_document(edges_col, edge_id)
+            
+            # Add new edges
+            if graph is not None:
+                for src, etype, dst in diff.edges_added:
+                    edge_id = f"{src}--{etype}-->{dst}"
+                    if graph.has_edge(src, dst):
+                        attrs = dict(graph.edges[src, dst])
+                        doc = {"source": src, "target": dst, **attrs}
+                        cbl.save_document_json(edges_col, edge_id, json.dumps(doc, default=str))
+            
+            cbl.end_transaction(commit=True)
+        except Exception:
+            cbl.end_transaction(commit=False)
+            raise
 
     def close(self) -> None:
         if self._cbl is not None:

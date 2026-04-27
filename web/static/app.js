@@ -255,6 +255,18 @@ function openBootstrapWizard(path) {
   _bootstrapState.path = path;
   _bootstrapState.currentStep = 1;
   document.getElementById('bootstrap-path').textContent = path;
+  // Wire mode-card buttons (idempotent: dataset.bound prevents re-binding)
+  const allBtn = document.getElementById('filter-mode-all-btn');
+  const customBtn = document.getElementById('filter-mode-custom-btn');
+  if (allBtn && !allBtn.dataset.bound) {
+    allBtn.addEventListener('click', () => selectBootstrapMode('all'));
+    allBtn.dataset.bound = '1';
+  }
+  if (customBtn && !customBtn.dataset.bound) {
+    customBtn.addEventListener('click', () => selectBootstrapMode('custom'));
+    customBtn.dataset.bound = '1';
+  }
+  selectBootstrapMode('all');
   showBootstrapStep(1);
   document.getElementById('bootstrap-modal').showModal();
 }
@@ -265,9 +277,10 @@ function closeBootstrapModal() {
 }
 
 function showBootstrapStep(step) {
-  document.querySelectorAll('.bootstrap-step').forEach(el => el.classList.remove('active'));
-  document.getElementById(`bootstrap-step-${step}`)?.classList.add('active');
-  
+  // Show only the active step (HTML uses .hidden, not .active)
+  document.querySelectorAll('.bootstrap-step').forEach(el => el.classList.add('hidden'));
+  document.getElementById(`bootstrap-step-${step}`)?.classList.remove('hidden');
+
   // Update steps indicator
   document.querySelectorAll('#bootstrap-steps .step').forEach((el, i) => {
     const stepNum = i + 1;
@@ -276,41 +289,69 @@ function showBootstrapStep(step) {
 
   _bootstrapState.currentStep = step;
 
-  // Load folder tree on step 2
-  if (step === 2) loadBootstrapFolderTree();
+  // Load folder tree + Tagify-ify the inputs the first time step 2 opens
+  if (step === 2) {
+    loadBootstrapFolderTree();
+    initBootstrapTagify();
+  }
   
   // Update button visibility
   const nextBtn = document.getElementById('bootstrap-next-btn');
   const doneBtn = document.getElementById('bootstrap-done-btn');
   const cancelBtn = document.getElementById('bootstrap-cancel-btn');
+  const backBtn = document.getElementById('bootstrap-back-btn');
   if (step === 4) {
     nextBtn.classList.add('hidden');
     doneBtn.classList.remove('hidden');
     cancelBtn.classList.add('hidden');
+    if (backBtn) backBtn.classList.add('hidden');
   } else {
     nextBtn.classList.remove('hidden');
     doneBtn.classList.add('hidden');
     cancelBtn.classList.remove('hidden');
+    // Back is available on step 2 (return to mode picker). Step 3 is mid-index.
+    if (backBtn) backBtn.classList.toggle('hidden', step !== 2);
+    // Hide Next while indexing — there's nothing to advance to manually.
+    if (step === 3) nextBtn.classList.add('hidden');
   }
+}
+
+function bootstrapPrevStep() {
+  const step = _bootstrapState.currentStep;
+  if (step === 2) showBootstrapStep(1);
+}
+
+function selectBootstrapMode(mode) {
+  const hidden = document.getElementById('filter-mode-hidden');
+  if (hidden) hidden.value = mode;
+  const allBtn = document.getElementById('filter-mode-all-btn');
+  const customBtn = document.getElementById('filter-mode-custom-btn');
+  const setActive = (el, active) => {
+    if (!el) return;
+    el.classList.toggle('border-primary', active);
+    el.classList.toggle('bg-primary/10', active);
+    el.classList.toggle('border-base-300', !active);
+    el.classList.toggle('bg-base-100', !active);
+  };
+  setActive(allBtn, mode === 'all');
+  setActive(customBtn, mode === 'custom');
 }
 
 async function bootstrapNextStep() {
   const step = _bootstrapState.currentStep;
-  
+
   if (step === 1) {
-    // Move to step 2 (custom) or 3 (all → indexing)
-    const mode = document.querySelector('input[name="filter-mode"]:checked')?.value || 'all';
+    const mode = document.getElementById('filter-mode-hidden')?.value || 'all';
     if (mode === 'all') {
-      await submitBootstrapInit({ mode: 'all' });
       showBootstrapStep(3);
+      await submitBootstrapInit({ mode: 'all' });
     } else {
       showBootstrapStep(2);
     }
   } else if (step === 2) {
-    // Serialize & submit
     const filters = serializeBootstrapFilters();
-    await submitBootstrapInit(filters);
     showBootstrapStep(3);
+    await submitBootstrapInit(filters);
   }
 }
 
@@ -318,8 +359,22 @@ async function loadBootstrapFolderTree() {
   const container = document.getElementById('bootstrap-folder-tree');
   container.innerHTML = '<div class="text-xs opacity-50 p-2">Loading folders…</div>';
   try {
-    const data = await apiFetch(`/api/projects/tree?depth=3&path=${encodeURIComponent(_bootstrapState.path || '')}`);
-    container.innerHTML = renderBootstrapFolderTree(data.tree || {}, 0);
+    // /api/projects/tree returns the tree object directly (not wrapped in .tree)
+    const tree = await apiFetch(`/api/projects/tree?depth=3`);
+    if (!tree) {
+      container.innerHTML = '<div class="text-xs opacity-50 p-2">No folder tree available.</div>';
+      return;
+    }
+    // Render the children of the root directly so the user picks top-level
+    // dirs/files inside the project instead of toggling the project itself.
+    // Hide dotfile/dotfolder entries (e.g. .git, .venv) — they're noise for
+    // most users and shouldn't be indexed.
+    const children = (tree.children || []).filter(c => !(c && typeof c.name === 'string' && c.name.startsWith('.')));
+    if (!children.length) {
+      container.innerHTML = '<div class="text-xs opacity-50 p-2">Folder is empty.</div>';
+      return;
+    }
+    container.innerHTML = children.map(c => renderBootstrapFolderTree(c, 0)).join('');
   } catch (e) {
     container.innerHTML = `<div class="alert alert-error text-xs p-2">${formatApiError(e)}</div>`;
   }
@@ -327,50 +382,114 @@ async function loadBootstrapFolderTree() {
 
 function renderBootstrapFolderTree(node, depth) {
   if (!node || !node.name) return '';
+  // Skip dotfile/dotfolder entries at any depth (e.g. .git, .venv, .DS_Store).
+  if (typeof node.name === 'string' && node.name.startsWith('.')) return '';
   const isDir = node.type === 'dir';
   const icon = isDir ? '📁' : '📄';
-  const hasChildren = isDir && node.children && node.children.length > 0;
-  const isBuiltIn = node.builtin === true;
-  
-  let html = `<div class="tree-row ${isBuiltIn ? 'tree-disabled' : ''}" style="--depth:${depth}">`;
-  if (hasChildren) {
-    html += `<input type="checkbox" class="checkbox checkbox-xs bootstrap-folder-check" data-path="${node.name}" ${isBuiltIn ? 'disabled' : 'checked'} />`;
-  } else {
-    html += '<span class="w-5"></span>';
-  }
-  html += `<span class="tree-label">${icon} ${node.name}</span>`;
-  if (node.count != null) html += `<span class="text-xs opacity-50">(${node.count})</span>`;
+  const hasChildren = isDir && Array.isArray(node.children) && node.children.length > 0;
+  const path = (node.path && node.path !== '.') ? node.path : node.name;
+  const safePath = String(path).replace(/"/g, '&quot;');
+  const counts = isDir
+    ? `<span class="text-xs opacity-50 ml-2">(${node.child_dir_count || 0} dirs, ${node.child_file_count || 0} files)</span>`
+    : '';
+
+  let html = `<div class="flex items-center gap-2 py-0.5" style="padding-left:${depth * 16}px">`;
+  // Every dir AND file gets a checkbox so the user can include/exclude individually.
+  html += `<input type="checkbox" class="checkbox checkbox-xs bootstrap-folder-check" data-path="${safePath}" data-type="${isDir ? 'dir' : 'file'}" checked />`;
+  html += `<span class="text-sm">${icon} ${node.name}</span>${counts}`;
   html += '</div>';
-  
-  if (hasChildren && depth < 2) {
+
+  if (hasChildren) {
     html += node.children.map(child => renderBootstrapFolderTree(child, depth + 1)).join('');
   }
-  
+
   return html;
 }
 
+let _bootstrapTagify = { globs: null, types: null };
+function initBootstrapTagify() {
+  if (typeof Tagify === 'undefined') return;
+  // Defer until after the modal layout pass so Tagify can measure its host.
+  requestAnimationFrame(() => {
+    const mkOpts = (whitelist) => ({
+      delimiters: ',',
+      dropdown: { enabled: 0, classname: 'bootstrap-tagify-dd' },
+      whitelist,
+      // Trim and drop empty values to avoid the "tag element doesn't exist" warning
+      transformTag: (tagData) => {
+        if (tagData && typeof tagData.value === 'string') {
+          tagData.value = tagData.value.trim();
+        }
+      },
+      validate: (tagData) => Boolean(tagData && tagData.value && tagData.value.trim())
+    });
+    const globsInput = document.getElementById('bootstrap-exclude-globs');
+    const typesInput = document.getElementById('bootstrap-doc-types');
+    try {
+      if (globsInput && !_bootstrapTagify.globs && !globsInput.dataset.tagified) {
+        _bootstrapTagify.globs = new Tagify(globsInput, mkOpts(
+          ['*.min.js', '*.lock', '*.pyc', '*.map', 'package-lock.json', '*.log', '*.tmp']
+        ));
+        globsInput.dataset.tagified = '1';
+      }
+      if (typesInput && !_bootstrapTagify.types && !typesInput.dataset.tagified) {
+        _bootstrapTagify.types = new Tagify(typesInput, mkOpts(
+          ['py', 'js', 'jsx', 'ts', 'tsx', 'md', 'json', 'yaml', 'toml', 'html', 'css', 'go', 'rs', 'sh', 'txt']
+        ));
+        typesInput.dataset.tagified = '1';
+      }
+    } catch (e) {
+      console.warn('Tagify init failed:', e);
+    }
+  });
+}
+
+function _readTagifyValues(inputId, fallbackInst) {
+  // Tagify writes JSON like '[{"value":"py"}]' into the original input.
+  const el = document.getElementById(inputId);
+  if (!el) return [];
+  // Prefer the live Tagify instance if we have one.
+  if (fallbackInst && Array.isArray(fallbackInst.value)) {
+    return fallbackInst.value.map(t => t.value).filter(Boolean);
+  }
+  const raw = el.value || '';
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(t => (t && t.value) || '').filter(Boolean);
+  } catch (_) { /* not JSON — fall through */ }
+  return raw.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+}
+
 function serializeBootstrapFilters() {
-  const mode = document.querySelector('input[name="filter-mode"]:checked')?.value || 'all';
+  const mode = document.getElementById('filter-mode-hidden')?.value || 'all';
   if (mode === 'all') return { mode: 'all' };
-  
-  // Custom: collect checked folders, globs, doc types
-  const includeDirs = Array.from(document.querySelectorAll('.bootstrap-folder-check:checked'))
+
+  // Split checked tree rows into directories and individual files.
+  const checkedRows = Array.from(document.querySelectorAll('.bootstrap-folder-check:checked'));
+  const includeDirs = checkedRows
+    .filter(el => el.dataset.type === 'dir')
     .map(el => el.dataset.path)
     .filter(Boolean);
-  
-  const excludeGlobs = (document.getElementById('bootstrap-exclude-globs').value || '')
-    .split(',')
-    .map(s => s.trim())
+
+  // Files that the user UNchecked → add to exclude_file_globs (exact path match).
+  const allRows = Array.from(document.querySelectorAll('.bootstrap-folder-check'));
+  const uncheckedFiles = allRows
+    .filter(el => el.dataset.type === 'file' && !el.checked)
+    .map(el => el.dataset.path)
     .filter(Boolean);
-  
-  const docTypes = (document.getElementById('bootstrap-doc-types').value || '')
-    .split(',')
-    .map(s => s.trim())
+  const uncheckedDirs = allRows
+    .filter(el => el.dataset.type === 'dir' && !el.checked)
+    .map(el => el.dataset.path)
     .filter(Boolean);
-  
+
+  const excludeGlobs = _readTagifyValues('bootstrap-exclude-globs', _bootstrapTagify.globs)
+    .concat(uncheckedFiles);
+  const docTypes = _readTagifyValues('bootstrap-doc-types', _bootstrapTagify.types);
+
   return {
     mode: 'custom',
     include_dirs: includeDirs,
+    exclude_dirs: uncheckedDirs,
     exclude_file_globs: excludeGlobs,
     include_doc_types: docTypes
   };
@@ -378,11 +497,28 @@ function serializeBootstrapFilters() {
 
 async function submitBootstrapInit(filters) {
   try {
+    // 1. Persist filters to _apollo/apollo.json
     _bootstrapState.projectInfo = await apiFetch('/api/projects/init', {
       method: 'POST',
       body: { path: _bootstrapState.path, filters }
     });
-    // Now listen for indexing events (SSE or polling)
+    // 2. Actually start indexing. The /api/index worker reads
+    //    project_manager.manifest.filters and applies them to GraphBuilder,
+    //    so the filters chosen in the wizard take effect here.
+    fetch('/api/index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directory: _bootstrapState.path })
+    }).then(r => {
+      if (!r.ok) return r.json().then(d => { throw new Error(d.detail || ('Error ' + r.status)); });
+      return r.json();
+    }).then(() => {
+      graphCacheClear();
+      fetchIndexCount();
+    }).catch(e => {
+      showToast('Indexing failed: ' + (e.message || e), 'error');
+    });
+    // 3. Watch progress (polls /api/projects/current; status modal also updates)
     listenBootstrapIndexing();
   } catch (e) {
     showToast(formatApiError(e), 'error');
@@ -390,33 +526,49 @@ async function submitBootstrapInit(filters) {
 }
 
 function listenBootstrapIndexing() {
-  // Poll the indexing status
+  // Poll /api/indexing-status (the same endpoint the regular indexing modal
+  // uses). The previous version polled /api/projects/current, whose payload
+  // has no `indexing` field — so the modal was stuck on "Starting…".
+  let polling = false;
   const pollInterval = setInterval(async () => {
+    if (polling) return;
+    polling = true;
     try {
-      const data = await apiFetch('/api/projects/current');
-      if (!data || !data.indexing) {
+      const r = await fetch('/api/indexing-status');
+      const s = await r.json();
+
+      const step = s.step || 1;
+      const label = s.step_label || 'Starting…';
+      const detailEl = document.getElementById('bootstrap-indexing-detail');
+      const labelEl = document.getElementById('bootstrap-step-label');
+      if (labelEl) labelEl.textContent = label;
+      if (detailEl) detailEl.textContent = s.detail || '';
+
+      // Mark sub-steps as complete (1..step-1 done; current is in-progress)
+      document.querySelectorAll('#bootstrap-indexing-steps .step').forEach((el, i) => {
+        el.classList.toggle('step-primary', i + 1 <= step);
+      });
+
+      // Indexing finished when active=false AND step has reached 4.
+      if (!s.active && step >= 4) {
         clearInterval(pollInterval);
-        if (data?.initial_index_completed) {
-          document.getElementById('bootstrap-stat-files').textContent = data.stats?.files_indexed || '—';
-          document.getElementById('bootstrap-stat-nodes').textContent = data.stats?.nodes || '—';
-          document.getElementById('bootstrap-stat-edges').textContent = data.stats?.edges || '—';
-          showBootstrapStep(4);
-          loadGraph(); // Load the newly indexed graph
-        }
-      } else {
-        // Update step label
-        const step = data.indexing.step || 1;
-        const label = ['Parsing files', 'Generating embeddings', 'Saving to store', 'Rebuilding search'][step - 1] || 'Indexing…';
-        document.getElementById('bootstrap-step-label').textContent = label;
-        
-        // Mark steps as complete
-        document.querySelectorAll('#bootstrap-indexing-steps .step').forEach((el, i) => {
-          el.classList.toggle('step-primary', i + 1 < step);
-        });
+        // Pull final counts from /api/projects/current (after indexing).
+        try {
+          const data = await apiFetch('/api/projects/current');
+          document.getElementById('bootstrap-stat-files').textContent = data?.stats?.files_indexed ?? '—';
+          document.getElementById('bootstrap-stat-nodes').textContent = data?.stats?.nodes ?? '—';
+          document.getElementById('bootstrap-stat-edges').textContent = data?.stats?.edges ?? '—';
+        } catch (_) { /* best-effort */ }
+        showBootstrapStep(4);
+        graphCacheClear();
+        fetchIndexCount();
+        loadGraph();
       }
     } catch (e) {
       clearInterval(pollInterval);
-      showToast('Indexing failed: ' + formatApiError(e), 'error');
+      showToast('Indexing failed: ' + (e?.message || e), 'error');
+    } finally {
+      polling = false;
     }
   }, 1000);
 }
@@ -436,8 +588,29 @@ function _openNativePicker() {
   txt.textContent = 'Select a folder…';
   fetch('/api/browse-folder', { method: 'POST' })
     .then(r => { if (!r.ok) throw new Error('Cancelled'); return r.json(); })
-    .then(data => {
+    .then(async data => {
       if (!data.path) { dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; txt.textContent = 'Ready'; return; }
+      // Route through /api/projects/open so first-time folders trigger the
+      // bootstrap wizard (file/folder/file-type filters) instead of
+      // unconditionally indexing the entire folder.
+      try {
+        const proj = await apiFetch('/api/projects/open', {
+          method: 'POST',
+          body: { path: data.path }
+        });
+        if (proj && proj.needs_bootstrap) {
+          dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+          txt.textContent = 'Configure project…';
+          openBootstrapWizard(data.path);
+          return;
+        }
+      } catch (e) {
+        showToast(formatApiError(e), 'error');
+        dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+        txt.textContent = 'Ready';
+        return;
+      }
+      // Already-bootstrapped project → reindex normally.
       txt.textContent = 'Indexing ' + data.path + '…';
       showIndexingModal(data.path);
       return fetch('/api/index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ directory: data.path }) })
@@ -879,12 +1052,46 @@ async function showFileContent(data) {
       ${file.is_binary ? '<span class="badge badge-sm badge-warning">binary</span>' : ''}
     </div>`;
 
+  const IMAGE_EXTS = ['.png','.jpg','.jpeg','.gif','.webp','.svg','.bmp','.ico','.avif'];
+  const filePath = data.path || file.path;
+  const fileDir = filePath ? filePath.replace(/[^/\\]+$/, '').replace(/[/\\]+$/, '') : '';
+  const rawUrl = (p) => `/api/file/raw?path=${encodeURIComponent(p)}`;
+  // Resolve a (possibly-relative) src against the file's directory.
+  // Leaves absolute URLs (http/https/data:) untouched.
+  const resolveSrc = (src) => {
+    if (!src) return src;
+    if (/^(?:[a-z]+:)?\/\//i.test(src) || src.startsWith('data:')) return src;
+    if (src.startsWith('/')) return rawUrl(src.replace(/^\/+/, ''));
+    const joined = fileDir ? `${fileDir}/${src}` : src;
+    // Normalize ../ and ./
+    const parts = [];
+    for (const seg of joined.split(/[/\\]+/)) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') { parts.pop(); continue; }
+      parts.push(seg);
+    }
+    return rawUrl(parts.join('/'));
+  };
+  // Rewrite all <img src> attributes inside an HTML string so they resolve via /api/file/raw.
+  const rewriteImgSrc = (html) => {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    tmp.querySelectorAll('img[src]').forEach(img => {
+      img.setAttribute('src', resolveSrc(img.getAttribute('src')));
+    });
+    return tmp.innerHTML;
+  };
+
   let body;
   if (file.is_binary) {
-    body = '<div class="text-xs opacity-60 py-4 italic">Binary file — preview not available.</div>';
+    if (IMAGE_EXTS.includes(ext) && filePath) {
+      body = `<div class="md-content"><img src="${escapeHtml(rawUrl(filePath))}" alt="${escapeHtml(file.name || filePath)}" style="max-width:100%;height:auto;border-radius:6px"></div>`;
+    } else {
+      body = '<div class="text-xs opacity-60 py-4 italic">Binary file — preview not available.</div>';
+    }
   } else if (ext === '.md' || ext === '.markdown') {
     const html = (typeof marked !== 'undefined') ? marked.parse(file.content) : `<pre>${escapeHtml(file.content)}</pre>`;
-    body = `<div class="md-content">${html}</div>`;
+    body = `<div class="md-content">${rewriteImgSrc(html)}</div>`;
   } else if (ext === '.html' || ext === '.htm') {
     const safeSrc = file.content.replace(/<\/script>/gi, '<\\/script>');
     const iframe = `<iframe sandbox="allow-same-origin" style="width:100%;height:480px;border:1px solid var(--fallback-b3,#444);border-radius:6px;background:#fff" srcdoc="${escapeHtml(safeSrc)}"></iframe>`;
@@ -2209,10 +2416,12 @@ async function generateImage() {
 
 /* ── Settings ──────────────────────────────────────────────────── */
 let _providerRegistry = [];
+let _settingsCache = null;
 
 function _esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 function renderProvidersUI(d) {
+  _settingsCache = d;
   _providerRegistry = d.providers || [];
   const active = d.chat?.active_provider || (_providerRegistry[0] && _providerRegistry[0].id);
   const perProvider = d.chat?.providers || {};
@@ -2223,43 +2432,195 @@ function renderProvidersUI(d) {
     `<option value="${_esc(p.id)}"${p.id===active?' selected':''}>${_esc(p.label)}</option>`
   ).join('');
 
-  // Per-provider cards
+  // Preserve any unsaved typing across re-renders (e.g. when toggling
+  // active provider) by snapshotting current input values first.
+  const _typed = {};
   const list = document.getElementById('providers-list');
+  if (list) {
+    _providerRegistry.forEach(p => {
+      const k = document.getElementById(`pk-${p.id}`);
+      if (k && k.value && !k.value.includes('•')) _typed[p.id] = k.value;
+    });
+  }
+
+  // Per-provider cards (DaisyUI card component — card-body / card-title / card-actions)
   list.innerHTML = _providerRegistry.map(p => {
     const masked = d.api_keys?.[p.id] || '';
     const inputId = `pk-${p.id}`;
     const modelId = `pm-${p.id}`;
     const selectedModel = perProvider[p.id]?.model || p.default_model;
     const opts = p.models.map(m => `<option value="${_esc(m)}"${m===selectedModel?' selected':''}>${_esc(m)}</option>`).join('');
-    const status = masked ? '<span class="badge badge-success badge-xs">key set</span>' : '<span class="badge badge-ghost badge-xs">no key</span>';
+    const isActive = p.id === active;
+    const status = masked
+      ? '<span class="badge badge-success badge-sm">key set</span>'
+      : '<span class="badge badge-ghost badge-sm">no key</span>';
+    const activeBadge = isActive ? '<span class="badge badge-primary badge-sm">active</span>' : '';
+    const cardCls = isActive
+      ? 'card bg-base-200 border-2 border-primary shadow-md'
+      : 'card bg-base-200 border border-base-300 shadow-sm';
     return `
-      <div class="card bg-base-200 border border-base-300" data-provider="${_esc(p.id)}">
-        <div class="card-body p-4">
-          <div class="flex items-center justify-between gap-2 mb-2">
+      <div class="${cardCls}" data-provider="${_esc(p.id)}">
+        <div class="card-body p-5 gap-3">
+          <div class="flex items-start justify-between gap-2">
+            <h2 class="card-title text-base">${_esc(p.label)}</h2>
             <div class="flex items-center gap-2">
-              <h4 class="font-semibold text-sm">${_esc(p.label)}</h4>
+              ${activeBadge}
               ${status}
             </div>
-            <a href="${_esc(p.key_url)}" target="_blank" class="link link-primary text-xs">Get key ↗</a>
           </div>
-          <label class="label py-1"><span class="label-text text-xs font-medium">API Key (env: ${_esc(p.env)})</span></label>
-          <div class="flex gap-2 mb-3">
-            <input id="${inputId}" type="password" placeholder="${_esc(masked || p.key_placeholder)}" class="input input-sm input-bordered flex-1 font-mono" autocomplete="off" />
-            <button type="button" class="btn btn-sm btn-ghost btn-square" onclick="togglePasswordVisibility('${inputId}')" aria-label="Toggle key visibility">
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+          <p class="text-xs opacity-50 -mt-1">
+            <a href="${_esc(p.key_url)}" target="_blank" class="link link-primary">Get key ↗</a>
+            <span class="opacity-60">· stored in env <code class="font-mono">${_esc(p.env)}</code></span>
+          </p>
+
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">API Key</span></label>
+            <div class="flex gap-2">
+              <input id="${inputId}" type="password" placeholder="${_esc(masked || p.key_placeholder)}" class="input input-sm input-bordered flex-1 font-mono" autocomplete="off" />
+              <button type="button" class="btn btn-sm btn-ghost btn-square" onclick="togglePasswordVisibility('${inputId}')" aria-label="Toggle key visibility">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Model</span></label>
+            <select id="${modelId}" class="select select-sm select-bordered w-full">${opts}</select>
+          </div>
+
+          <div class="card-actions justify-end mt-1">
+            <button type="button" class="btn btn-xs ${isActive ? 'btn-primary' : 'btn-ghost'}" onclick="setActiveProvider('${_esc(p.id)}')" ${isActive ? 'disabled' : ''}>
+              ${isActive ? 'Active' : 'Set active'}
             </button>
           </div>
-          <label class="label py-1"><span class="label-text text-xs font-medium">Model</span></label>
-          <select id="${modelId}" class="select select-sm select-bordered w-full">${opts}</select>
         </div>
       </div>`;
   }).join('');
+
+  // Restore any in-flight key typing that the user hadn't saved yet.
+  Object.entries(_typed).forEach(([pid, v]) => {
+    const el = document.getElementById(`pk-${pid}`);
+    if (el) el.value = v;
+  });
+}
+
+function setActiveProvider(pid) {
+  const sel = document.getElementById('active-provider');
+  if (!sel) return;
+  sel.value = pid;
+  // Re-render cards from the cached payload so the active border/button
+  // updates immediately. Persisted on Save Settings.
+  if (_settingsCache) {
+    _settingsCache = { ..._settingsCache, chat: { ...(_settingsCache.chat || {}), active_provider: pid } };
+    renderProvidersUI(_settingsCache);
+  }
+}
+
+function _setVal(id, val) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!val;
+  else el.value = val == null ? '' : val;
+}
+
+function _getVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return undefined;
+  return el.type === 'checkbox' ? el.checked : el.value;
+}
+
+function _csv(s) {
+  return String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function renderExtraSettings(d) {
+  const chat = d.chat || {};
+  _setVal('chat-max-tool-rounds', chat.max_tool_rounds ?? 5);
+  _setVal('chat-streaming', chat.streaming !== false);
+
+  const appearance = d.appearance || {};
+  _setVal('appearance-theme', appearance.theme || 'dark');
+
+  const g = d.graph || {};
+  _setVal('graph-default-depth', g.default_depth ?? 20);
+  _setVal('graph-edge-cap', g.edge_cap_multiplier ?? 3);
+  _setVal('graph-anim-threshold', g.animation_threshold ?? 500);
+
+  const idx = d.indexing || {};
+  _setVal('indexing-exclude-globs', (idx.exclude_globs || []).join(', '));
+  _setVal('indexing-extra-skip-dirs', (idx.extra_skip_dirs || []).join(', '));
+  _setVal('indexing-embed-batch', idx.embedding_batch_size ?? 256);
+  _setVal('indexing-embed-min', idx.embedding_min_text_length ?? 40);
+
+  const r = d.reindex || {};
+  _setVal('reindex-strategy', r.strategy || 'auto');
+  _setVal('reindex-interval', r.sweep_interval_minutes ?? 30);
+  _setVal('reindex-max-hops', r.local_max_hops ?? 1);
+  _setVal('reindex-force-full', r.force_full_after_runs ?? 50);
+  _setVal('reindex-on-start', r.sweep_on_session_start !== false);
+
+  const c = d.captures || {};
+  _setVal('captures-folder', c.folder || '_apollo_web');
+}
+
+function collectExtraSettings() {
+  return {
+    chat: {
+      max_tool_rounds: parseInt(_getVal('chat-max-tool-rounds'), 10) || 5,
+      streaming: !!_getVal('chat-streaming'),
+    },
+    appearance: { theme: _getVal('appearance-theme') || 'dark' },
+    graph: {
+      default_depth: parseInt(_getVal('graph-default-depth'), 10) || 20,
+      edge_cap_multiplier: parseInt(_getVal('graph-edge-cap'), 10) || 3,
+      animation_threshold: parseInt(_getVal('graph-anim-threshold'), 10) || 500,
+    },
+    indexing: {
+      exclude_globs: _csv(_getVal('indexing-exclude-globs')),
+      extra_skip_dirs: _csv(_getVal('indexing-extra-skip-dirs')),
+      embedding_batch_size: parseInt(_getVal('indexing-embed-batch'), 10) || 256,
+      embedding_min_text_length: parseInt(_getVal('indexing-embed-min'), 10) || 40,
+    },
+    reindex: {
+      strategy: _getVal('reindex-strategy') || 'auto',
+      sweep_interval_minutes: parseInt(_getVal('reindex-interval'), 10) || 30,
+      sweep_on_session_start: !!_getVal('reindex-on-start'),
+      local_max_hops: parseInt(_getVal('reindex-max-hops'), 10) || 1,
+      force_full_after_runs: parseInt(_getVal('reindex-force-full'), 10) || 50,
+    },
+    captures: { folder: _getVal('captures-folder') || '_apollo_web' },
+  };
+}
+
+function switchSettingsTab(tabId) {
+  document.querySelectorAll('#settings-tablist .tab').forEach(t => {
+    t.classList.toggle('tab-active', t.dataset.tab === tabId);
+  });
+  document.querySelectorAll('.settings-tab-panel').forEach(p => {
+    p.classList.toggle('hidden', p.dataset.panel !== tabId);
+  });
+}
+
+function initSettingsTabs() {
+  const list = document.getElementById('settings-tablist');
+  if (!list || list.dataset.bound === '1') return;
+  list.dataset.bound = '1';
+  list.addEventListener('click', e => {
+    const t = e.target.closest('.tab');
+    if (t && t.dataset.tab) switchSettingsTab(t.dataset.tab);
+  });
 }
 
 async function loadSettings() {
   try {
+    initSettingsTabs();
     const d = await apiFetch('/api/settings');
     renderProvidersUI(d);
+    renderExtraSettings(d);
+    // NOTE: Don't force the saved theme onto the live DOM here. The user
+    // may have toggled light/dark via the sidebar button; opening the
+    // Settings view shouldn't override that choice. Theme is applied on
+    // explicit save (see saveSettings) and on initial page load.
   } catch (e) {
     console.error('Settings API not available:', e);
   }
@@ -2279,16 +2640,26 @@ async function saveSettings() {
       if (m) providers[p.id] = { model: m };
     }
     const active = document.getElementById('active-provider').value;
+    const extra = collectExtraSettings();
     const res = await fetch('/api/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         api_keys: apiKeys,
-        chat: { active_provider: active, providers },
+        chat: { active_provider: active, providers, ...extra.chat },
+        appearance: extra.appearance,
+        graph: extra.graph,
+        indexing: extra.indexing,
+        reindex: extra.reindex,
+        captures: extra.captures,
       }),
     });
     if (res.ok) {
       showToast('Settings saved', 'success');
+      // Apply theme immediately so user sees the change.
+      if (extra.appearance?.theme) {
+        document.documentElement.setAttribute('data-theme', extra.appearance.theme);
+      }
       await loadSettings();   // refresh masked keys / status badges
       checkChatStatus();
     } else {

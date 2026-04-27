@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.local/schema/api-response.schema.json",
+  "title": "Apollo API Response",
+  "description": "Standard envelope for Apollo HTTP API responses. Either a success envelope (status='success' + data) or an error envelope (status_code + error.{code,message,details?}).",
+  "oneOf": [
+    { "$ref": "#/$defs/SuccessResponse" },
+    { "$ref": "#/$defs/ErrorResponse" }
+  ],
+  "$defs": {
+    "SuccessResponse": {
+      "type": "object",
+      "required": ["status", "data"],
+      "properties": {
+        "status": { "const": "success" },
+        "data": {}
+      },
+      "additionalProperties": true
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["status_code", "error"],
+      "properties": {
+        "status_code": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "VALIDATION_ERROR",
+                "NOT_FOUND",
+                "CONFLICT",
+                "UNAUTHORIZED",
+                "FORBIDDEN",
+                "INTERNAL_ERROR",
+                "FILE_NOT_FOUND",
+                "INVALID_PATH",
+                "PATH_ESCAPE",
+                "FILE_CHANGED",
+                "GRAPH_ERROR",
+                "INDEX_ERROR",
+                "CHAT_ERROR",
+                "PROJECT_ERROR"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "details": { "type": "object" }
+          },
+          "additionalProperties": false
+        },
+        "detail": {},
+        "error_legacy": {}
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -199,17 +199,167 @@ tailwind.config = {
         <button class="btn btn-primary btn-sm" id="save-settings-btn">Save Settings</button>
       </div>
 
-      <div class="mb-8">
-        <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Active Provider</h3>
-        <p class="text-xs opacity-50 mb-3">Pick the provider used for chat. Only one is active at a time, and its API key must be set below.</p>
-        <select id="active-provider" class="select select-sm select-bordered w-full" aria-label="Active provider"></select>
+      <!-- Tabs -->
+      <div role="tablist" class="tabs tabs-bordered mb-6" id="settings-tablist">
+        <button type="button" role="tab" class="tab tab-active" data-tab="ai">AI Providers</button>
+        <button type="button" role="tab" class="tab" data-tab="appearance">Appearance</button>
+        <button type="button" role="tab" class="tab" data-tab="graph">Graph</button>
+        <button type="button" role="tab" class="tab" data-tab="indexing">Indexing</button>
+        <button type="button" role="tab" class="tab" data-tab="reindex">Re-index</button>
+        <button type="button" role="tab" class="tab" data-tab="captures">Captures</button>
       </div>
 
-      <div class="mb-8">
-        <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Providers</h3>
-        <p class="text-xs opacity-50 mb-3">Each card holds its own API key + model selection. Configure as many as you like; only the active one is used.</p>
-        <div id="providers-list" class="flex flex-col gap-4"></div>
-      </div>
+      <!-- ── AI Providers Tab ─────────────────────────────────── -->
+      <section class="settings-tab-panel" data-panel="ai">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Active Provider</h3>
+          <p class="text-xs opacity-50 mb-3">Pick the provider used for chat. Only one is active at a time, and its API key must be set below.</p>
+          <select id="active-provider" class="select select-sm select-bordered w-full" aria-label="Active provider"></select>
+        </div>
+
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Providers</h3>
+          <p class="text-xs opacity-50 mb-3">Each card holds its own API key + model selection. Configure as many as you like; only the active one is used.</p>
+          <div id="providers-list" class="flex flex-col gap-4"></div>
+        </div>
+
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Chat Behavior</h3>
+          <p class="text-xs opacity-50 mb-3">How the AI chat pipeline runs requests against the active provider.</p>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Max tool-call rounds</span></label>
+            <p class="text-xs opacity-40 mb-1">Upper bound on chained tool calls (search_graph, get_node, …) per user turn. Default 5.</p>
+            <input id="chat-max-tool-rounds" type="number" min="1" max="20" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control">
+            <label class="label py-1 cursor-pointer justify-start gap-3">
+              <input id="chat-streaming" type="checkbox" class="toggle toggle-sm toggle-primary" />
+              <span class="label-text text-xs font-medium">Stream responses token-by-token</span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Appearance Tab ──────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="appearance">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Theme</h3>
+          <p class="text-xs opacity-50 mb-3">DaisyUI theme applied to the entire UI via the <code class="font-mono">data-theme</code> attribute.</p>
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Theme</span></label>
+            <select id="appearance-theme" class="select select-sm select-bordered w-48" aria-label="UI theme">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="cupcake">Cupcake</option>
+              <option value="dracula">Dracula</option>
+              <option value="nord">Nord</option>
+              <option value="cyberpunk">Cyberpunk</option>
+              <option value="sunset">Sunset</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Graph Tab ───────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="graph">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Graph Rendering</h3>
+          <p class="text-xs opacity-50 mb-3">Depth slider default and edge-cap behavior for the force-directed graph (see DESIGN §7, Phase 10).</p>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Default depth (initial node count)</span></label>
+            <p class="text-xs opacity-40 mb-1">Where the depth slider sits when the page loads. Lower = faster initial render.</p>
+            <input id="graph-default-depth" type="number" min="5" max="5000" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Edge cap multiplier</span></label>
+            <p class="text-xs opacity-40 mb-1">Edges sent to the browser are capped at <code class="font-mono">multiplier × node count</code>.</p>
+            <input id="graph-edge-cap" type="number" min="1" max="20" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Disable animation when nodes ≥</span></label>
+            <p class="text-xs opacity-40 mb-1">Above this threshold ECharts animation is turned off to keep the graph responsive.</p>
+            <input id="graph-anim-threshold" type="number" min="50" max="100000" class="input input-sm input-bordered w-32" />
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Indexing Tab ────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="indexing">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Indexing Filters</h3>
+          <p class="text-xs opacity-50 mb-3">Filters applied during indexing and embedding (see DESIGN §9, Phase 8/9).</p>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Exclude file patterns</span></label>
+            <p class="text-xs opacity-40 mb-1">Comma-separated globs (e.g. <code class="font-mono">*.min.js, *.lock, package-lock.json</code>).</p>
+            <input id="indexing-exclude-globs" type="text" class="input input-sm input-bordered w-full font-mono" placeholder="*.min.js, *.lock" />
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Extra skip directories</span></label>
+            <p class="text-xs opacity-40 mb-1">Comma-separated names to add to the built-in <code class="font-mono">_SKIP_DIRS</code> blocklist.</p>
+            <input id="indexing-extra-skip-dirs" type="text" class="input input-sm input-bordered w-full font-mono" placeholder="cache, generated" />
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Embedding batch size</span></label>
+            <p class="text-xs opacity-40 mb-1">Larger = faster total throughput, more memory. Default 256.</p>
+            <input id="indexing-embed-batch" type="number" min="1" max="2048" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Embedding minimum text length</span></label>
+            <p class="text-xs opacity-40 mb-1">Nodes with shorter source text are skipped from the vector index. Default 40.</p>
+            <input id="indexing-embed-min" type="number" min="0" max="10000" class="input input-sm input-bordered w-32" />
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Re-index Tab ────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="reindex">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Background Re-index</h3>
+          <p class="text-xs opacity-50 mb-3">Periodic graph-freshness service (<code class="font-mono">ReindexConfig</code> in <code class="font-mono">apollo/reindex_service.py</code>).</p>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Strategy</span></label>
+            <select id="reindex-strategy" class="select select-sm select-bordered w-48">
+              <option value="auto">Auto</option>
+              <option value="incremental">Incremental only</option>
+              <option value="full">Full only</option>
+              <option value="off">Disabled</option>
+            </select>
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Sweep interval (minutes)</span></label>
+            <input id="reindex-interval" type="number" min="1" max="1440" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Local max hops</span></label>
+            <p class="text-xs opacity-40 mb-1">How far cross-file resolution walks during incremental updates.</p>
+            <input id="reindex-max-hops" type="number" min="0" max="10" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Force full after N runs</span></label>
+            <p class="text-xs opacity-40 mb-1">After this many incremental sweeps, run a full re-index to recover from drift.</p>
+            <input id="reindex-force-full" type="number" min="1" max="10000" class="input input-sm input-bordered w-32" />
+          </div>
+          <div class="form-control">
+            <label class="label py-1 cursor-pointer justify-start gap-3">
+              <input id="reindex-on-start" type="checkbox" class="toggle toggle-sm toggle-primary" />
+              <span class="label-text text-xs font-medium">Sweep on session start</span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Captures Tab ────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="captures">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Web Captures</h3>
+          <p class="text-xs opacity-50 mb-3">Where Phase 14 web-content capture writes downloaded HTML/PDF/Markdown.</p>
+          <div class="form-control">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Capture folder</span></label>
+            <p class="text-xs opacity-40 mb-1">Path relative to the project root. Auto-created on first capture.</p>
+            <input id="captures-folder" type="text" class="input input-sm input-bordered w-full font-mono" placeholder="_apollo_web" />
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -275,31 +425,21 @@ tailwind.config = {
     <h3 class="font-bold text-lg mb-1" id="bootstrap-title">Bootstrap Project</h3>
     <p class="text-xs opacity-60 mb-4 truncate" id="bootstrap-path"></p>
 
-    <!-- Steps indicator -->
-    <ul class="steps steps-vertical w-full text-sm mb-4" id="bootstrap-steps">
-      <li class="step step-primary" data-step="1">Folders & Files</li>
-      <li class="step" data-step="2">Document Types</li>
-      <li class="step" data-step="3">Indexing</li>
-      <li class="step" data-step="4">Done</li>
-    </ul>
-
-    <!-- Step 1: Process All vs Custom Filters -->
+    <!-- Step 1: Process All vs Custom Filters (side-by-side cards) -->
     <div id="bootstrap-step-1" class="bootstrap-step">
-      <div class="form-control gap-3">
-        <label class="label cursor-pointer gap-3">
-          <input type="radio" name="filter-mode" value="all" class="radio radio-primary" checked />
-          <div class="flex-1">
-            <span class="label-text font-semibold">Process All Files</span>
-            <p class="text-xs opacity-60 mt-1">Index everything except built-in skip patterns.</p>
-          </div>
-        </label>
-        <label class="label cursor-pointer gap-3 mt-3">
-          <input type="radio" name="filter-mode" value="custom" class="radio radio-primary" />
-          <div class="flex-1">
-            <span class="label-text font-semibold">Custom Filters</span>
-            <p class="text-xs opacity-60 mt-1">Pick folders, exclude patterns, and file types.</p>
-          </div>
-        </label>
+      <input type="hidden" name="filter-mode" id="filter-mode-hidden" value="all" />
+      <p class="text-sm opacity-70 mb-3">Choose how to index this folder:</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div id="filter-mode-all-btn" role="button" tabindex="0"
+          class="cursor-pointer rounded-lg border-2 border-primary bg-primary/10 p-4 hover:bg-primary/20 transition select-none">
+          <div class="font-semibold text-sm mb-1">Process All Files</div>
+          <div class="text-xs opacity-70 leading-snug">Index everything except built-in skip patterns (node_modules, venv, build, etc.).</div>
+        </div>
+        <div id="filter-mode-custom-btn" role="button" tabindex="0"
+          class="cursor-pointer rounded-lg border-2 border-base-300 bg-base-100 p-4 hover:bg-base-300 transition select-none">
+          <div class="font-semibold text-sm mb-1">Custom Filters</div>
+          <div class="text-xs opacity-70 leading-snug">Pick specific folders, files, exclude patterns, and file types to index.</div>
+        </div>
       </div>
     </div>
 
@@ -364,10 +504,13 @@ tailwind.config = {
     </div>
 
     <!-- Modal action buttons -->
-    <div class="modal-action mt-6">
+    <div class="modal-action mt-6 flex items-center justify-between gap-2">
       <button type="button" class="btn btn-ghost btn-sm" id="bootstrap-cancel-btn" onclick="closeBootstrapModal()">Cancel</button>
-      <button type="button" class="btn btn-primary btn-sm" id="bootstrap-next-btn" onclick="bootstrapNextStep()">Next</button>
-      <button type="button" class="btn btn-primary btn-sm hidden" id="bootstrap-done-btn" onclick="closeBootstrapModal()">Explore</button>
+      <div class="flex items-center gap-2">
+        <button type="button" class="btn btn-outline btn-sm hidden" id="bootstrap-back-btn" onclick="bootstrapPrevStep()">Back</button>
+        <button type="button" class="btn btn-primary btn-sm" id="bootstrap-next-btn" onclick="bootstrapNextStep()">Next</button>
+        <button type="button" class="btn btn-primary btn-sm hidden" id="bootstrap-done-btn" onclick="closeBootstrapModal()">Explore</button>
+      </div>
     </div>
   </div>
 </dialog>

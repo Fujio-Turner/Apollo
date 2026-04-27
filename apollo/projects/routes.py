@@ -9,6 +9,18 @@ import fnmatch
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .annotations import AnnotationManager
+
+
+def _get_annotation_manager(project_manager) -> AnnotationManager:
+    """Build an AnnotationManager bound to the currently open project."""
+    if not project_manager.manifest or not project_manager.root_dir:
+        raise HTTPException(status_code=400, detail="No project currently open")
+    return AnnotationManager(
+        project_root=project_manager.root_dir,
+        project_id=project_manager.manifest.project_id,
+    )
+
 
 def register_project_routes(app: FastAPI, project_manager, store, backend: str):
     """Register all /api/projects/* endpoints."""
@@ -263,3 +275,123 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
             raise HTTPException(status_code=500, detail="Failed to build tree")
         
         return tree
+
+    # ────────────────────────────────────────────────────────────────
+    # Annotation endpoints (Phase 11)
+    # ────────────────────────────────────────────────────────────────
+
+    @app.post("/api/annotations/create")
+    async def create_annotation(request: Request):
+        """Create a new annotation.
+
+        Body: {
+            type: "highlight"|"bookmark"|"note"|"tag",
+            target: {type:"file"|"node", file_path|node_id: str},
+            content?: str,
+            tags?: list[str],
+            color?: str,
+            highlight_range?: {start_line, end_line, start_col?, end_col?}
+        }
+        """
+        try:
+            body = await request.json()
+            mgr = _get_annotation_manager(project_manager)
+            ann = mgr.create(
+                type=body.get("type"),
+                target=body.get("target") or {},
+                content=body.get("content"),
+                tags=body.get("tags"),
+                color=body.get("color"),
+                highlight_range=body.get("highlight_range"),
+            )
+            return ann.to_dict()
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/annotations/by-target")
+    def annotations_by_target(file: Optional[str] = None, node: Optional[str] = None):
+        """Find annotations for a file path or graph node ID."""
+        if not file and not node:
+            raise HTTPException(status_code=400, detail="Provide ?file= or ?node=")
+        mgr = _get_annotation_manager(project_manager)
+        if file:
+            results = mgr.find_by_target_file(file)
+        else:
+            results = mgr.find_by_target_node(node)
+        return {"annotations": [a.to_dict() for a in results]}
+
+    @app.get("/api/annotations/by-tag")
+    def annotations_by_tag(tag: str):
+        """Find annotations carrying the given tag."""
+        if not tag:
+            raise HTTPException(status_code=400, detail="Missing tag")
+        mgr = _get_annotation_manager(project_manager)
+        return {"annotations": [a.to_dict() for a in mgr.find_by_tag(tag)]}
+
+    @app.get("/api/annotations/collections")
+    def list_annotation_collections():
+        mgr = _get_annotation_manager(project_manager)
+        return {"collections": [c.to_dict() for c in mgr.list_collections()]}
+
+    @app.post("/api/annotations/collections")
+    async def create_annotation_collection(request: Request):
+        try:
+            body = await request.json()
+            name = body.get("name")
+            if not name:
+                raise HTTPException(status_code=400, detail="Missing name")
+            mgr = _get_annotation_manager(project_manager)
+            coll = mgr.create_collection(
+                name=name,
+                annotation_ids=body.get("annotation_ids"),
+                description=body.get("description"),
+            )
+            return coll.to_dict()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/annotations/collections/{collection_id}")
+    def delete_annotation_collection(collection_id: str):
+        mgr = _get_annotation_manager(project_manager)
+        ok = mgr.delete_collection(collection_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        return {"deleted": collection_id}
+
+    @app.get("/api/annotations/{annotation_id}")
+    def get_annotation(annotation_id: str):
+        mgr = _get_annotation_manager(project_manager)
+        ann = mgr.get(annotation_id)
+        if not ann:
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        return ann.to_dict()
+
+    @app.put("/api/annotations/{annotation_id}")
+    async def update_annotation(annotation_id: str, request: Request):
+        try:
+            body = await request.json()
+            mgr = _get_annotation_manager(project_manager)
+            ann = mgr.update(annotation_id, **body)
+            if not ann:
+                raise HTTPException(status_code=404, detail="Annotation not found")
+            return ann.to_dict()
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/annotations/{annotation_id}")
+    def delete_annotation(annotation_id: str):
+        mgr = _get_annotation_manager(project_manager)
+        ok = mgr.delete(annotation_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Annotation not found")
+        return {"deleted": annotation_id}

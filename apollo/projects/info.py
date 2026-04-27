@@ -22,6 +22,7 @@ class ProjectInfo:
     needs_bootstrap: bool
     filters: dict
     stats: Optional[dict] = None
+    resume_pending: bool = False  # True if bootstrap was interrupted
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON responses."""
@@ -30,6 +31,9 @@ class ProjectInfo:
     @classmethod
     def from_manifest(cls, manifest: ProjectManifest) -> "ProjectInfo":
         """Create from ProjectManifest."""
+        # resume_pending = bootstrap was started but not completed
+        resume_pending = not manifest.initial_index_completed and manifest.last_opened_at is not None
+        
         return cls(
             project_id=manifest.project_id,
             root_dir=manifest.root_dir,
@@ -43,4 +47,5 @@ class ProjectInfo:
             needs_bootstrap=not manifest.initial_index_completed,
             filters=manifest.filters.to_dict() if manifest.filters else {},
             stats=manifest.stats.to_dict() if manifest.stats else None,
+            resume_pending=resume_pending,
         )

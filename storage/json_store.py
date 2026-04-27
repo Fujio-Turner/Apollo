@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import networkx as nx
+
+if TYPE_CHECKING:
+    from apollo.graph.incremental import GraphDiff
 
 
 class JsonStore:
@@ -59,6 +63,20 @@ class JsonStore:
             graph.add_edge(src, dst, **edge)
 
         return graph
+
+    def save_diff(self, diff: GraphDiff, filepath: str | None = None) -> None:
+        """Save diff to graph — for JSON backend, this is just a full rewrite.
+        
+        The diff is provided for consistency with CBL backend, but JSON is simple
+        enough that full rewrites are acceptable.
+        
+        Note: This method requires access to the current graph. For a proper
+        implementation, we'd need to load, apply diff, and save. This is a
+        minimal stub that assumes the graph has already been updated.
+        """
+        # For now, this is a no-op — the caller should use save(updated_graph)
+        # In a full implementation, we'd apply the diff to the persisted version
+        pass
 
     def close(self) -> None:
         pass

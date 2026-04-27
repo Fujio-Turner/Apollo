@@ -84,8 +84,52 @@
         }
       }
     },
-    "stats": {
+    "storage": {
       "type": "object",
+      "description": "Storage backend configuration; frozen at project creation (see PLAN_PROJECT_BOOTSTRAP §6.2.2)",
+      "required": ["backend"],
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["json", "cblite"],
+          "description": "Persistent storage backend chosen at init time"
+        },
+        "db_hash": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{32}$",
+          "description": "MD5 of origin_abspath; canonical CBL project identifier (cblite only)"
+        },
+        "db_name": {
+          "type": ["string", "null"],
+          "pattern": "^apollo_[a-f0-9]{32}\\.cblite2$",
+          "description": "On-disk CBL bundle name (cblite only)"
+        },
+        "location_mode": {
+          "type": "string",
+          "enum": ["project", "global"],
+          "description": "'project' = bundle inside _apollo/; 'global' = under ~/.apollo/cblite/"
+        },
+        "db_relpath": {
+          "type": ["string", "null"],
+          "description": "Path to the CBL bundle relative to _apollo/ (project mode only)"
+        },
+        "origin_abspath": {
+          "type": ["string", "null"],
+          "description": "Absolute path used to compute db_hash; surfaced in the rebind dialog"
+        },
+        "cblite_version": {
+          "type": ["string", "null"],
+          "description": "libcblite version captured at create time, for migration gating"
+        },
+        "schema_version": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Apollo's own CBL document/index schema version"
+        }
+      }
+    },
+    "stats": {
+      "type": ["object", "null"],
       "description": "Summary of last completed index",
       "properties": {
         "files_indexed": {
