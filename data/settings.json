@@ -12,7 +12,7 @@
       "version": "1.0.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/markdown_gfm",
       "author": "Fujio Turner",
-      "sha256": "aad2c673f9bd5a0c7c39d69fecd0e946d43340ff2b8c1e50fc8438ed61bbad46"
+      "sha256": "116c8d0932313cc0fc48df05af85844fc3b9a0921c04d2ec67615642d70ddeee"
     },
     "pdf_pypdf": {
       "installed": true,
@@ -20,7 +20,7 @@
       "version": "1.0.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/pdf_pypdf",
       "author": "Fujio Turner",
-      "sha256": "08aaadf8404496d47944e7e58849642cb63fceb9fcfd83e7252a86643a7a155b"
+      "sha256": "4e86b16d7f3450661e3b1da8e07214cd95db9e953baf28cc212c4c5d550491bb"
     },
     "python3": {
       "installed": true,
@@ -28,7 +28,7 @@
       "version": "1.0.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/python3",
       "author": "Fujio Turner",
-      "sha256": "0b5ae630fb4ae16cb9f32a1b17aa1975c10f808a993d033ab7dfb881b5df4c99"
+      "sha256": "c9a2bdca3a7229c6046b5223a02bba41fe4d675057dadd7f99450bd726519aa7"
     }
   }
 }

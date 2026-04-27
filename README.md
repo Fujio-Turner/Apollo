@@ -14,6 +14,7 @@ An **Obsidian-for-your-filesystem** — a browser-based tool that scans any dire
 
 Instead of manually linking notes, Apollo **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
 
+![Version](https://img.shields.io/badge/Apollo-v1.0.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green)
 ![ECharts](https://img.shields.io/badge/ECharts-5-orange)

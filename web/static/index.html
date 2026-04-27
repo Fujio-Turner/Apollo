@@ -207,6 +207,7 @@ tailwind.config = {
         <button type="button" role="tab" class="tab" data-tab="indexing">Indexing</button>
         <button type="button" role="tab" class="tab" data-tab="reindex">Re-index</button>
         <button type="button" role="tab" class="tab" data-tab="captures">Captures</button>
+        <button type="button" role="tab" class="tab" data-tab="logging">Logging</button>
         <button type="button" role="tab" class="tab" data-tab="plugins">Plugins</button>
       </div>
 
@@ -358,6 +359,93 @@ tailwind.config = {
             <label class="label py-1"><span class="label-text text-xs font-medium">Capture folder</span></label>
             <p class="text-xs opacity-40 mb-1">Path relative to the project root. Auto-created on first capture.</p>
             <input id="captures-folder" type="text" class="input input-sm input-bordered w-full font-mono" placeholder="_apollo_web" />
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Logging Tab ─────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="logging">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Log Path &amp; Rotation</h3>
+          <p class="text-xs opacity-50 mb-3">
+            Where Apollo writes diagnostic logs. Changes are applied as soon as you click
+            <strong>Save Settings</strong> — no restart needed. See
+            <code class="font-mono">guides/LOGGING.md § 9</code> for the design.
+          </p>
+
+          <div class="form-control mb-4">
+            <label class="label py-1"><span class="label-text text-xs font-medium">Log file path</span></label>
+            <p class="text-xs opacity-40 mb-1">
+              Absolute or project-relative. Leave empty to fall back to the
+              <code class="font-mono">APOLLO_LOG_FILE</code> env var or the default
+              <code class="font-mono">.apollo/logs/apollo.log</code>.
+              Set to <code class="font-mono">off</code> / <code class="font-mono">none</code> /
+              <code class="font-mono">0</code> to disable file logging entirely.
+            </p>
+            <input id="logging-path" type="text" class="input input-sm input-bordered w-full font-mono" placeholder=".apollo/logs/apollo.log" />
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <div class="form-control">
+              <label class="label py-1"><span class="label-text text-xs font-medium">Log level</span></label>
+              <p class="text-xs opacity-40 mb-1">Empty = inherit <code class="font-mono">APOLLO_LOG_LEVEL</code> or default <code class="font-mono">INFO</code>.</p>
+              <select id="logging-level" class="select select-sm select-bordered">
+                <option value="">(inherit)</option>
+                <option value="DEBUG">DEBUG</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+                <option value="CRITICAL">CRITICAL</option>
+              </select>
+            </div>
+
+            <div class="form-control">
+              <label class="label py-1 cursor-pointer justify-start gap-3">
+                <input id="logging-json" type="checkbox" class="toggle toggle-sm toggle-primary" />
+                <span class="label-text text-xs font-medium">JSON-formatted records (one per line)</span>
+              </label>
+              <p class="text-xs opacity-40 mt-1 ml-12">For log shippers / structured ingest.</p>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+            <div class="form-control">
+              <label class="label py-1"><span class="label-text text-xs font-medium">Max file size (MB)</span></label>
+              <p class="text-xs opacity-40 mb-1">Per file before rollover.</p>
+              <input id="logging-max-size-mb" type="number" min="1" max="10240" step="1" class="input input-sm input-bordered" />
+            </div>
+            <div class="form-control">
+              <label class="label py-1"><span class="label-text text-xs font-medium">Retention (days)</span></label>
+              <p class="text-xs opacity-40 mb-1">Rotated files older than this are pruned.</p>
+              <input id="logging-max-age-days" type="number" min="0" max="3650" step="1" class="input input-sm input-bordered" />
+            </div>
+            <div class="form-control">
+              <label class="label py-1"><span class="label-text text-xs font-medium">Total budget (MB)</span></label>
+              <p class="text-xs opacity-40 mb-1">Sum of all rotated files. Oldest deleted first.</p>
+              <input id="logging-rotated-total-mb" type="number" min="0" max="1048576" step="1" class="input input-sm input-bordered" />
+            </div>
+          </div>
+        </div>
+
+        <div class="mb-8">
+          <div class="flex items-center justify-between mb-3 pb-2 border-b border-base-300">
+            <h3 class="text-sm font-semibold text-primary">Current Status</h3>
+            <button type="button" class="btn btn-xs btn-ghost" id="logging-refresh-btn">Refresh</button>
+          </div>
+          <p class="text-xs opacity-50 mb-3">Live snapshot of the on-disk log files Apollo is currently writing.</p>
+          <div id="logging-info-panel" class="text-xs">
+            <span class="opacity-50">Loading…</span>
+          </div>
+        </div>
+
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Effective Configuration</h3>
+          <p class="text-xs opacity-50 mb-3">
+            Resolved values currently in force, after merging UI choices, environment variables, and defaults.
+            Env vars override the form when set.
+          </p>
+          <div id="logging-settings-panel" class="text-xs">
+            <span class="opacity-50">Loading…</span>
           </div>
         </div>
       </section>

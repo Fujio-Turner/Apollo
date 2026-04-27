@@ -17,13 +17,17 @@ from fastapi.staticfiles import StaticFiles
 
 import asyncio
 import json as json_mod
+import logging
 import os
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from apollo.graph.query import GraphQuery
+from apollo.logging_config import apply_settings as apply_logging_settings, configure_logging
 from apollo.projects import ProjectManager, register_project_routes
 from apollo.reindex_service import ReindexService, ReindexConfig
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 EXCLUDE_TYPES_WORDCLOUD = {"directory", "file", "import"}
@@ -100,6 +104,18 @@ DEFAULT_SETTINGS = {
     "captures": {
         "folder": "_apollo_web",
     },
+    # Diagnostic logging (guides/LOGGING.md). Empty path falls back to
+    # APOLLO_LOG_FILE env var or the built-in default
+    # (.apollo/logs/apollo.log). Empty level falls back to APOLLO_LOG_LEVEL
+    # env var or "INFO". The numeric caps drive the rotating file handler.
+    "logging": {
+        "path": "",
+        "level": "",
+        "json_mode": False,
+        "max_size_mb": 100,
+        "max_age_days": 7,
+        "rotated_total_mb": 1024,
+    },
     # Plugins detected on disk under ``plugins/``. Populated dynamically
     # in ``_load_settings`` so the file always reflects what's installed.
     "plugins": {},
@@ -166,6 +182,15 @@ class ConnectionManager:
 
 def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
     """Create and configure the FastAPI application."""
+    # Bring up logging early using whatever the user has saved in
+    # ``data/settings.json``. Falls back to env vars / built-in defaults
+    # when the section is missing or this is a first-run install.
+    try:
+        _initial_logging_settings = (_load_settings() or {}).get("logging") or {}
+    except Exception:
+        _initial_logging_settings = {}
+    configure_logging(settings=_initial_logging_settings)
+
     app = FastAPI(title="Code Knowledge Graph Browser")
 
     app.add_middleware(
@@ -210,9 +235,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         # Validate non-blockingly so schema drift gets logged but never breaks requests.
         problems = _response_validator.validate(body)
         if problems:
-            import logging
-            logging.getLogger("apollo.api").warning(
-                "Error response failed schema validation: %s", problems
+            logger.warning(
+                "error response failed schema validation: %s", problems
             )
         return body
 
@@ -344,6 +368,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     def get_env():
         return {"native_picker": not _in_docker}
 
+    @app.get("/api/version")
+    def get_version():
+        """Get the Apollo version (Python backend)."""
+        import main
+        return {"version": main.__version__}
+
     @app.post("/api/browse-folder")
     async def browse_folder():
         """Open the native OS folder picker (only works on host, not Docker)."""
@@ -428,9 +458,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             from apollo.graph import GraphBuilder
             from apollo.parser import PythonParser, TextFileParser
 
-            print(f"\n{'='*60}")
-            print(f"📂 Indexing: {target}")
-            print(f"{'='*60}")
+            logger.info("indexing target: %s", target)
 
             if parsers:
                 build_parsers = parsers
@@ -443,7 +471,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                     pass
 
             t0 = time.time()
-            print("⏳ [1/4] Parsing files...")
+            logger.info("indexing step 1/4: parsing files in %s", target)
             # Pull user-defined filters from the active project manifest
             # (apollo.json) so the bootstrap wizard's choices actually take
             # effect during indexing.
@@ -456,13 +484,17 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                     and project_manager.manifest.filters is not None
                 ):
                     active_filters = project_manager.manifest.filters.to_dict()
-                    print(f"   🔎 Applying project filters: mode={active_filters.get('mode')} "
-                          f"include_dirs={active_filters.get('include_dirs')} "
-                          f"exclude_dirs={active_filters.get('exclude_dirs')} "
-                          f"exclude_file_globs={active_filters.get('exclude_file_globs')} "
-                          f"include_doc_types={active_filters.get('include_doc_types')}")
-            except Exception as _e:
-                print(f"   ⚠️  Could not read project filters: {_e}")
+                    logger.info(
+                        "applying project filters: mode=%s include_dirs=%s exclude_dirs=%s "
+                        "exclude_file_globs=%s include_doc_types=%s",
+                        active_filters.get('mode'),
+                        active_filters.get('include_dirs'),
+                        active_filters.get('exclude_dirs'),
+                        active_filters.get('exclude_file_globs'),
+                        active_filters.get('include_doc_types'),
+                    )
+            except Exception:
+                logger.exception("could not read project filters; proceeding without filters")
                 active_filters = None
             builder = GraphBuilder(parsers=build_parsers, filters=active_filters)
             graph = builder.build(target)
@@ -470,26 +502,30 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             n_edges = graph.number_of_edges()
             n_files = sum(1 for _, d in graph.nodes(data=True) if d.get("type") == "file")
             elapsed = time.time() - t0
-            print(f"   ✅ Parsed {n_files} files — {n_nodes} nodes, {n_edges} edges ({elapsed:.2f}s)")
+            logger.info(
+                "parsed %d files in %.2fs (%d nodes, %d edges)",
+                n_files, elapsed, n_nodes, n_edges,
+            )
 
             _indexing_status.update(step=2, step_label="Generating embeddings",
                                     detail=f"{n_files} files → {n_nodes} nodes, {n_edges} edges")
             t1 = time.time()
-            print(f"⏳ [2/4] Generating embeddings for {n_nodes} nodes...")
+            logger.info("indexing step 2/4: generating embeddings for %d nodes", n_nodes)
             try:
                 from apollo.embeddings import Embedder
                 emb = Embedder()
                 emb.embed_graph(graph)
-                print(f"   ✅ Embeddings done ({time.time() - t1:.2f}s)")
+                logger.info("embeddings generated in %.2fs", time.time() - t1)
             except Exception:
-                print(f"   ⚠️  Embeddings skipped ({time.time() - t1:.2f}s)")
+                logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
+                               time.time() - t1)
 
             _indexing_status.update(step=3, step_label="Saving to store",
                                     detail="Embeddings done")
             t2 = time.time()
-            print("⏳ [3/4] Saving to store...")
+            logger.info("indexing step 3/4: saving graph to store")
             store.save(graph)
-            print(f"   ✅ Saved ({time.time() - t2:.2f}s)")
+            logger.info("graph saved in %.2fs", time.time() - t2)
 
             q = GraphQuery(graph)
             stats = q.stats()
@@ -497,7 +533,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             _indexing_status.update(step=4, step_label="Rebuilding search",
                                     detail="Store saved")
             t3 = time.time()
-            print("⏳ [4/4] Rebuilding search index...")
+            logger.info("indexing step 4/4: rebuilding search index (backend=%s)", backend)
             try:
                 if backend == "cblite":
                     from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
@@ -507,14 +543,15 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                     from apollo.search.semantic import SemanticSearch
                     from apollo.embeddings.embedder import Embedder as Emb
                     search = SemanticSearch(graph, Emb())
-                print(f"   ✅ Search ready ({time.time() - t3:.2f}s)")
+                logger.info("search index ready in %.2fs", time.time() - t3)
             except Exception:
-                print(f"   ⚠️  Search unavailable ({time.time() - t3:.2f}s)")
+                logger.warning("search index unavailable after %.2fs", time.time() - t3)
 
             total = time.time() - t0
-            print(f"{'='*60}")
-            print(f"🎉 Indexing complete — {n_files} files, {n_nodes} nodes, {n_edges} edges in {total:.2f}s")
-            print(f"{'='*60}\n")
+            logger.info(
+                "indexing complete: %d files, %d nodes, %d edges in %.2fs",
+                n_files, n_nodes, n_edges, total,
+            )
 
             _indexing_status.update(
                 active=False, step=4, step_label="Complete",
@@ -806,8 +843,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if node_id not in graph:
             raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
 
-        import logging
-        log = logging.getLogger("apollo.connections")
+        log = logger
 
         node_data = graph.nodes[node_id]
         self_path = node_data.get("path")
@@ -1169,6 +1205,19 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     def stats():
         return q.stats()
 
+    # -------------------------------------------------------------- Logging --
+
+    @app.get("/api/logging/info")
+    def logging_info():
+        """Snapshot of Apollo's logging config + on-disk file sizes.
+
+        Powers the Settings → Logging tab so users can see where logs
+        are written, how big the active file is, and how many rotated
+        files are retained. See guides/LOGGING.md § 9.
+        """
+        from apollo.logging_config import get_logging_info
+        return get_logging_info((_load_settings() or {}).get("logging") or {})
+
     # ------------------------------------------------------------- Settings --
 
     @app.get("/api/settings")
@@ -1196,6 +1245,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "indexing": _merged("indexing"),
             "reindex": _merged("reindex"),
             "captures": _merged("captures"),
+            "logging": _merged("logging"),
             # Read-only: which plugins are present under ``plugins/``.
             "plugins": settings.get("plugins") or {},
         }
@@ -1281,8 +1331,29 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             },
         )
         _patch("captures", ("folder",))
+        _patch(
+            "logging",
+            ("path", "level", "json_mode", "max_size_mb", "max_age_days", "rotated_total_mb"),
+            {
+                "path": str,
+                "level": lambda v: str(v).upper() if v else "",
+                "json_mode": bool,
+                "max_size_mb": int,
+                "max_age_days": int,
+                "rotated_total_mb": int,
+            },
+        )
 
         _save_settings(current)
+
+        # Re-attach logging handlers so a new path / size / level takes
+        # effect immediately without requiring a server restart.
+        if "logging" in body:
+            try:
+                apply_logging_settings(current.get("logging") or {})
+                logger.info("logging settings reloaded from UI")
+            except Exception:
+                logger.exception("failed to apply logging settings update")
 
         # Reset chat client so it picks up any new key / provider switch
         nonlocal chat_service

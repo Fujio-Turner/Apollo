@@ -1171,7 +1171,18 @@ async function showFileContent(data) {
   };
 
   let body;
-  if (file.is_binary) {
+  if (ext === '.pdf' && filePath) {
+    const pdfSrc = escapeHtml(rawUrl(filePath));
+    body = `<div class="md-content">
+      <iframe src="${pdfSrc}" type="application/pdf"
+        style="width:100%;height:80vh;border:0;border-radius:6px;background:#fff"
+        title="${escapeHtml(file.name || filePath)}"></iframe>
+      <div class="text-xs opacity-60 mt-2">
+        If the PDF doesn't render above,
+        <a class="link" href="${pdfSrc}" target="_blank" rel="noopener">open it in a new tab</a>.
+      </div>
+    </div>`;
+  } else if (file.is_binary) {
     if (IMAGE_EXTS.includes(ext) && filePath) {
       body = `<div class="md-content"><img src="${escapeHtml(rawUrl(filePath))}" alt="${escapeHtml(file.name || filePath)}" style="max-width:100%;height:auto;border-radius:6px"></div>`;
     } else {
@@ -2659,6 +2670,14 @@ function renderExtraSettings(d) {
   const c = d.captures || {};
   _setVal('captures-folder', c.folder || '_apollo_web');
 
+  const lg = d.logging || {};
+  _setVal('logging-path', lg.path || '');
+  _setVal('logging-level', lg.level || '');
+  _setVal('logging-json', !!lg.json_mode);
+  _setVal('logging-max-size-mb', lg.max_size_mb ?? 100);
+  _setVal('logging-max-age-days', lg.max_age_days ?? 7);
+  _setVal('logging-rotated-total-mb', lg.rotated_total_mb ?? 1024);
+
   renderPluginsList(d.plugins || {});
 }
 
@@ -2737,6 +2756,14 @@ function collectExtraSettings() {
       force_full_after_runs: parseInt(_getVal('reindex-force-full'), 10) || 50,
     },
     captures: { folder: _getVal('captures-folder') || '_apollo_web' },
+    logging: {
+      path: _getVal('logging-path') || '',
+      level: (_getVal('logging-level') || '').toUpperCase(),
+      json_mode: !!_getVal('logging-json'),
+      max_size_mb: parseInt(_getVal('logging-max-size-mb'), 10) || 100,
+      max_age_days: parseInt(_getVal('logging-max-age-days'), 10) || 7,
+      rotated_total_mb: parseInt(_getVal('logging-rotated-total-mb'), 10) || 1024,
+    },
   };
 }
 
@@ -2772,7 +2799,130 @@ async function loadSettings() {
   } catch (e) {
     console.error('Settings API not available:', e);
   }
+  loadLoggingInfo();
 }
+
+function _formatBytes(n) {
+  if (n == null) return '—';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function _formatTime(epoch) {
+  if (epoch == null) return '—';
+  try {
+    return new Date(epoch * 1000).toLocaleString();
+  } catch (_) { return '—'; }
+}
+
+async function loadLoggingInfo() {
+  const infoEl = document.getElementById('logging-info-panel');
+  const settingsEl = document.getElementById('logging-settings-panel');
+  if (!infoEl || !settingsEl) return;
+  try {
+    const d = await apiFetch('/api/logging/info');
+
+    // ── Log files panel ──
+    if (!d.enabled) {
+      infoEl.innerHTML = `
+        <div class="alert alert-warning text-xs">
+          File logging is <strong>disabled</strong>. Set
+          <code class="font-mono">APOLLO_LOG_FILE</code> to a path (or unset it
+          to use the default <code class="font-mono">${d.default_path}</code>)
+          and restart the server to enable.
+        </div>`;
+    } else {
+      const a = d.active;
+      const activeRow = a
+        ? (a.error
+            ? `<tr><td class="opacity-60">Active</td><td colspan="2" class="text-error font-mono">${a.path} — ${a.error}</td></tr>`
+            : `<tr><td class="opacity-60">Active</td>
+                  <td class="font-mono break-all">${a.path}</td>
+                  <td class="text-right whitespace-nowrap">${_formatBytes(a.size_bytes)}</td>
+                </tr>
+                <tr><td class="opacity-60">Modified</td>
+                  <td colspan="2" class="font-mono opacity-70">${_formatTime(a.modified)}</td>
+                </tr>`)
+        : `<tr><td class="opacity-60">Active</td>
+              <td colspan="2" class="font-mono opacity-50">${d.path} (no events written yet)</td>
+            </tr>`;
+
+      const rotatedRows = (d.rotated || []).length === 0
+        ? `<tr><td colspan="3" class="opacity-50 text-center py-2">No rotated log files yet.</td></tr>`
+        : (d.rotated || []).map(r => `
+            <tr>
+              <td class="font-mono break-all opacity-80">${r.name}</td>
+              <td class="font-mono opacity-60 whitespace-nowrap">${_formatTime(r.modified)}</td>
+              <td class="text-right whitespace-nowrap">${_formatBytes(r.size_bytes)}</td>
+            </tr>`).join('');
+
+      const totalRotated = `${(d.rotated || []).length} file(s), ${_formatBytes(d.rotated_total_bytes)} total`;
+
+      infoEl.innerHTML = `
+        <table class="table table-xs w-full mb-3">
+          <tbody>
+            <tr><td class="opacity-60 w-32">Directory</td>
+              <td colspan="2" class="font-mono break-all">${d.directory || '—'}</td>
+            </tr>
+            ${activeRow}
+          </tbody>
+        </table>
+
+        <h4 class="text-xs font-semibold opacity-70 mt-4 mb-2">Rotated files <span class="opacity-50 font-normal">(${totalRotated})</span></h4>
+        <div class="overflow-x-auto rounded border border-base-300">
+          <table class="table table-xs w-full">
+            <thead class="opacity-60">
+              <tr><th>File</th><th>Modified</th><th class="text-right">Size</th></tr>
+            </thead>
+            <tbody>${rotatedRows}</tbody>
+          </table>
+        </div>`;
+    }
+
+    // ── Settings panel ──
+    const s = d.settings || {};
+    settingsEl.innerHTML = `
+      <table class="table table-xs w-full">
+        <tbody>
+          <tr><td class="opacity-60 w-56">Log level</td>
+            <td><span class="badge badge-sm">${d.level}</span>
+              <span class="opacity-50 ml-2 font-mono">APOLLO_LOG_LEVEL</span></td>
+          </tr>
+          <tr><td class="opacity-60">JSON formatter</td>
+            <td>${d.json_mode ? '<span class="badge badge-sm badge-primary">on</span>' : '<span class="badge badge-sm badge-ghost">off</span>'}
+              <span class="opacity-50 ml-2 font-mono">APOLLO_LOG_JSON</span></td>
+          </tr>
+          <tr><td class="opacity-60">Max file size before rollover</td>
+            <td>${s.max_size_mb} MB
+              <span class="opacity-50 ml-2 font-mono">APOLLO_LOG_MAX_SIZE_MB</span></td>
+          </tr>
+          <tr><td class="opacity-60">Retention age (rotated files)</td>
+            <td>${s.max_age_days} days
+              <span class="opacity-50 ml-2 font-mono">APOLLO_LOG_MAX_AGE_DAYS</span></td>
+          </tr>
+          <tr><td class="opacity-60">Total rotated-file budget</td>
+            <td>${s.rotated_total_mb} MB
+              <span class="opacity-50 ml-2 font-mono">APOLLO_LOG_ROTATED_TOTAL_MB</span></td>
+          </tr>
+        </tbody>
+      </table>`;
+  } catch (e) {
+    infoEl.innerHTML = `<div class="alert alert-error text-xs">Failed to load logging info: ${e}</div>`;
+    settingsEl.innerHTML = '';
+    console.error('Logging info API not available:', e);
+  }
+}
+
+// Wire up the refresh button once the DOM is ready.
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('logging-refresh-btn');
+  if (btn && !btn.dataset.bound) {
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', loadLoggingInfo);
+  }
+});
 
 async function saveSettings() {
   const btn = document.getElementById('save-settings-btn');
@@ -2800,6 +2950,7 @@ async function saveSettings() {
         indexing: extra.indexing,
         reindex: extra.reindex,
         captures: extra.captures,
+        logging: extra.logging,
       }),
     });
     if (res.ok) {

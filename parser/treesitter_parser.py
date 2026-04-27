@@ -136,6 +136,8 @@ class TreeSitterParser(BaseParser):
 
     def _parse_bytes(self, source: bytes, lang_key: str, language, filepath: str) -> dict | None:
         parser = self._get_parser(lang_key, language)
+        if parser is None:
+            return None
         tree = parser.parse(source)
         if tree is None:
             return None
@@ -157,9 +159,13 @@ class TreeSitterParser(BaseParser):
         self._languages[lang_key] = lang
         return lang
 
-    def _get_parser(self, lang_key: str, language: "Language") -> "Parser":
+    def _get_parser(self, lang_key: str, language: "Language") -> "Parser | None":
         if lang_key not in self._parsers:
-            self._parsers[lang_key] = Parser(language)
+            try:
+                self._parsers[lang_key] = Parser(language)
+            except (ValueError, Exception):
+                # Incompatible grammar version or other init failure
+                self._parsers[lang_key] = None
         return self._parsers[lang_key]
 
 

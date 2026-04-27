@@ -342,7 +342,7 @@ def main():
     
     with open(output_file, "w") as f:
         f.write("# Reindex Strategy Benchmarks\n\n")
-        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Generated: {time.strftime('%Y-%m-%dT%H:%M:%S')}\n\n")
         f.write(f"Test Project: {suite.test_root}\n")
         f.write(f"Files: {len(suite.python_files)} Python files\n")
         f.write(f"Mutations per run: {suite.mutations_per_run}\n")
