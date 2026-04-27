@@ -143,6 +143,16 @@ function formatApiError(e, fallback = 'Request failed') {
   return `${prefix}: ${e.detail}`;
 }
 
+function showToast(msg, type = 'info') {
+  let existing = document.querySelector('.toast-msg');
+  if (existing) existing.remove();
+  const toast = document.createElement('div');
+  toast.className = `toast-msg show alert alert-${type}`;
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  setTimeout(() => { toast.classList.remove('show'); setTimeout(() => toast.remove(), 300); }, 3000);
+}
+
 async function apiFetch(url, opts = {}) {
   const { method = 'GET', body, headers = {}, raw = false, signal } = opts;
   const init = { method, headers: { ...headers }, signal };
@@ -238,6 +248,179 @@ async function apiFetch(url, opts = {}) {
   document.addEventListener('mouseup', () => { dragging = false; });
 })();
 
+/* ── Bootstrap Wizard State ────────────────────────────────────── */
+let _bootstrapState = { currentStep: 1, projectInfo: null, path: null };
+
+function openBootstrapWizard(path) {
+  _bootstrapState.path = path;
+  _bootstrapState.currentStep = 1;
+  document.getElementById('bootstrap-path').textContent = path;
+  showBootstrapStep(1);
+  document.getElementById('bootstrap-modal').showModal();
+}
+
+function closeBootstrapModal() {
+  document.getElementById('bootstrap-modal').close();
+  _bootstrapState = { currentStep: 1, projectInfo: null, path: null };
+}
+
+function showBootstrapStep(step) {
+  document.querySelectorAll('.bootstrap-step').forEach(el => el.classList.remove('active'));
+  document.getElementById(`bootstrap-step-${step}`)?.classList.add('active');
+  
+  // Update steps indicator
+  document.querySelectorAll('#bootstrap-steps .step').forEach((el, i) => {
+    const stepNum = i + 1;
+    el.classList.toggle('step-primary', stepNum <= step);
+  });
+
+  _bootstrapState.currentStep = step;
+
+  // Load folder tree on step 2
+  if (step === 2) loadBootstrapFolderTree();
+  
+  // Update button visibility
+  const nextBtn = document.getElementById('bootstrap-next-btn');
+  const doneBtn = document.getElementById('bootstrap-done-btn');
+  const cancelBtn = document.getElementById('bootstrap-cancel-btn');
+  if (step === 4) {
+    nextBtn.classList.add('hidden');
+    doneBtn.classList.remove('hidden');
+    cancelBtn.classList.add('hidden');
+  } else {
+    nextBtn.classList.remove('hidden');
+    doneBtn.classList.add('hidden');
+    cancelBtn.classList.remove('hidden');
+  }
+}
+
+async function bootstrapNextStep() {
+  const step = _bootstrapState.currentStep;
+  
+  if (step === 1) {
+    // Move to step 2 (custom) or 3 (all → indexing)
+    const mode = document.querySelector('input[name="filter-mode"]:checked')?.value || 'all';
+    if (mode === 'all') {
+      await submitBootstrapInit({ mode: 'all' });
+      showBootstrapStep(3);
+    } else {
+      showBootstrapStep(2);
+    }
+  } else if (step === 2) {
+    // Serialize & submit
+    const filters = serializeBootstrapFilters();
+    await submitBootstrapInit(filters);
+    showBootstrapStep(3);
+  }
+}
+
+async function loadBootstrapFolderTree() {
+  const container = document.getElementById('bootstrap-folder-tree');
+  container.innerHTML = '<div class="text-xs opacity-50 p-2">Loading folders…</div>';
+  try {
+    const data = await apiFetch(`/api/projects/tree?depth=3&path=${encodeURIComponent(_bootstrapState.path || '')}`);
+    container.innerHTML = renderBootstrapFolderTree(data.tree || {}, 0);
+  } catch (e) {
+    container.innerHTML = `<div class="alert alert-error text-xs p-2">${formatApiError(e)}</div>`;
+  }
+}
+
+function renderBootstrapFolderTree(node, depth) {
+  if (!node || !node.name) return '';
+  const isDir = node.type === 'dir';
+  const icon = isDir ? '📁' : '📄';
+  const hasChildren = isDir && node.children && node.children.length > 0;
+  const isBuiltIn = node.builtin === true;
+  
+  let html = `<div class="tree-row ${isBuiltIn ? 'tree-disabled' : ''}" style="--depth:${depth}">`;
+  if (hasChildren) {
+    html += `<input type="checkbox" class="checkbox checkbox-xs bootstrap-folder-check" data-path="${node.name}" ${isBuiltIn ? 'disabled' : 'checked'} />`;
+  } else {
+    html += '<span class="w-5"></span>';
+  }
+  html += `<span class="tree-label">${icon} ${node.name}</span>`;
+  if (node.count != null) html += `<span class="text-xs opacity-50">(${node.count})</span>`;
+  html += '</div>';
+  
+  if (hasChildren && depth < 2) {
+    html += node.children.map(child => renderBootstrapFolderTree(child, depth + 1)).join('');
+  }
+  
+  return html;
+}
+
+function serializeBootstrapFilters() {
+  const mode = document.querySelector('input[name="filter-mode"]:checked')?.value || 'all';
+  if (mode === 'all') return { mode: 'all' };
+  
+  // Custom: collect checked folders, globs, doc types
+  const includeDirs = Array.from(document.querySelectorAll('.bootstrap-folder-check:checked'))
+    .map(el => el.dataset.path)
+    .filter(Boolean);
+  
+  const excludeGlobs = (document.getElementById('bootstrap-exclude-globs').value || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  
+  const docTypes = (document.getElementById('bootstrap-doc-types').value || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  
+  return {
+    mode: 'custom',
+    include_dirs: includeDirs,
+    exclude_file_globs: excludeGlobs,
+    include_doc_types: docTypes
+  };
+}
+
+async function submitBootstrapInit(filters) {
+  try {
+    _bootstrapState.projectInfo = await apiFetch('/api/projects/init', {
+      method: 'POST',
+      body: { path: _bootstrapState.path, filters }
+    });
+    // Now listen for indexing events (SSE or polling)
+    listenBootstrapIndexing();
+  } catch (e) {
+    showToast(formatApiError(e), 'error');
+  }
+}
+
+function listenBootstrapIndexing() {
+  // Poll the indexing status
+  const pollInterval = setInterval(async () => {
+    try {
+      const data = await apiFetch('/api/projects/current');
+      if (!data || !data.indexing) {
+        clearInterval(pollInterval);
+        if (data?.initial_index_completed) {
+          document.getElementById('bootstrap-stat-files').textContent = data.stats?.files_indexed || '—';
+          document.getElementById('bootstrap-stat-nodes').textContent = data.stats?.nodes || '—';
+          document.getElementById('bootstrap-stat-edges').textContent = data.stats?.edges || '—';
+          showBootstrapStep(4);
+          loadGraph(); // Load the newly indexed graph
+        }
+      } else {
+        // Update step label
+        const step = data.indexing.step || 1;
+        const label = ['Parsing files', 'Generating embeddings', 'Saving to store', 'Rebuilding search'][step - 1] || 'Indexing…';
+        document.getElementById('bootstrap-step-label').textContent = label;
+        
+        // Mark steps as complete
+        document.querySelectorAll('#bootstrap-indexing-steps .step').forEach((el, i) => {
+          el.classList.toggle('step-primary', i + 1 < step);
+        });
+      }
+    } catch (e) {
+      clearInterval(pollInterval);
+      showToast('Indexing failed: ' + formatApiError(e), 'error');
+    }
+  }, 1000);
+}
+
 /* ── My Files — Folder Browser ─────────────────────────────────── */
 let _browseCurrentPath = '/';
 function openFolderPicker() {
@@ -297,7 +480,7 @@ function _browseLoadDir(path) {
     })
     .catch(() => { listEl.innerHTML = '<li class="text-xs text-error p-2">Failed to load</li>'; });
 }
-function submitFolderPicker() {
+async function submitFolderPicker() {
   const errEl = document.getElementById('folder-picker-error');
   const loadEl = document.getElementById('folder-picker-loading');
   const goBtn = document.getElementById('folder-picker-go');
@@ -305,12 +488,29 @@ function submitFolderPicker() {
   loadEl.classList.remove('hidden');
   goBtn.disabled = true;
   closeFolderPicker();
-  showIndexingModal(_browseCurrentPath);
-  fetch('/api/index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ directory: _browseCurrentPath }) })
-    .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.detail || `Error ${r.status}`); }); return r.json(); })
-    .then(() => { graphCacheClear(); fetchIndexCount(); })
-    .catch(e => { errEl.textContent = e.message; errEl.classList.remove('hidden'); })
-    .finally(() => { loadEl.classList.add('hidden'); goBtn.disabled = false; });
+  
+  try {
+    const data = await apiFetch('/api/projects/open', {
+      method: 'POST',
+      body: { path: _browseCurrentPath }
+    });
+    
+    if (data.needs_bootstrap) {
+      // Open bootstrap wizard
+      openBootstrapWizard(_browseCurrentPath);
+    } else {
+      // Already indexed, load normally
+      graphCacheClear();
+      fetchIndexCount();
+      switchView('graph');
+    }
+  } catch (e) {
+    errEl.textContent = formatApiError(e);
+    errEl.classList.remove('hidden');
+    goBtn.disabled = false;
+  } finally {
+    loadEl.classList.add('hidden');
+  }
 }
 
 /* ── Indexing Progress Modal ────────────────────────────────────── */

@@ -482,3 +482,12 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 
 /* ── Generated Image ──────────────────────────────────────────── */
 .gen-image { max-width: 100%; border-radius: 8px; border: 1px solid oklch(var(--b3)); }
+
+/* ── Bootstrap Wizard ──────────────────────────────────────────── */
+.bootstrap-step { display: none; }
+.bootstrap-step.active { display: block; }
+#bootstrap-folder-tree .tree-row { padding-left: calc(var(--depth, 0) * 16px); }
+#bootstrap-folder-tree .tree-row.tree-disabled { text-decoration: line-through; opacity: 0.5; }
+.tagify { --tag-pad: 0.25em 0.5em; }
+.tagify__tag[data-exclude] > div { background: var(--er); }
+.tagify__tag[data-include] > div { background: var(--su); }

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.local/schema/apollo-project.schema.json",
+  "title": "Apollo Project Manifest",
+  "description": "Configuration and metadata for an Apollo-managed project folder.",
+  "type": "object",
+  "required": [
+    "project_id", "root_dir", "created_at", "created_by_version",
+    "initial_index_completed", "filters"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "https://apollo.local/schema/apollo-project.schema.json"
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^ap::",
+      "description": "ULID prefixed with 'ap::' for project identity"
+    },
+    "root_dir": {
+      "type": "string",
+      "description": "Absolute path to the project root"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of project creation"
+    },
+    "created_by_version": {
+      "type": "string",
+      "description": "Apollo version string at project creation"
+    },
+    "last_opened_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of last open"
+    },
+    "last_opened_by_version": {
+      "type": ["string", "null"],
+      "description": "Apollo version string of last open"
+    },
+    "last_indexed_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of last successful index"
+    },
+    "last_indexed_by_version": {
+      "type": ["string", "null"],
+      "description": "Apollo version string of last index"
+    },
+    "initial_index_completed": {
+      "type": "boolean",
+      "description": "True if first index has completed; false if bootstrap wizard still pending"
+    },
+    "filters": {
+      "type": "object",
+      "required": ["mode", "exclude_dirs", "exclude_file_globs", "include_doc_types"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["all", "custom"],
+          "description": "'all' uses built-in skip list; 'custom' applies user-configured filters"
+        },
+        "include_dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Relative paths to include (custom mode only)"
+        },
+        "exclude_dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Relative paths to exclude; merged with built-in skip list"
+        },
+        "exclude_file_globs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns to exclude (e.g., '*.min.js', '*.lock')"
+        },
+        "include_doc_types": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "File extensions to include (no leading dot); empty = all known plugin types"
+        }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "description": "Summary of last completed index",
+      "properties": {
+        "files_indexed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of files processed"
+        },
+        "nodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of knowledge graph nodes"
+        },
+        "edges": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of knowledge graph edges"
+        },
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Wall-clock time to complete index"
+        }
+      }
+    }
+  }
+}

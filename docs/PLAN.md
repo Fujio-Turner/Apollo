@@ -306,3 +306,42 @@ Built `graph_search/watcher.py` — `FileWatcher` class using `watchdog` to moni
 
 ### Step 9 — Non-Code File Support ✅
 Built `graph_search/parser/text_parser.py` — `TextFileParser` backend that indexes Markdown, JSON, YAML, CSV, TOML, and plain text files. Extracts full-text content (with JSON flattening and CSV row-to-text conversion) into `document` type nodes with `source` field for embedding. `GraphBuilder` extended with `documents` handling — creates `doc::<path>` nodes linked to their parent file via `defines` edges. `TextFileParser` always included in the parser list so non-code files are indexed alongside code. File watcher picks up non-code changes automatically via the unified `_SOURCE_EXTENSIONS` set. Spatial coordinates and semantic search work unchanged — document nodes get embeddings from their content just like code nodes.
+
+---
+
+## Phase 7 — Tree-sitter Multi-Language Parser ✅
+
+**Work Completed:**
+
+1. **Verified TreeSitterParser implementation** — `parser/treesitter_parser.py` is fully implemented with:
+   - Lazy grammar loaders for Python, JavaScript/TypeScript, Go, and Rust
+   - Language caching for performance
+   - Unified extraction methods across all languages
+   - `BaseParser` interface compliance
+   - Graceful degradation when optional grammar packages are missing
+
+2. **Comprehensive test suite** — Created `tests/test_treesitter_parser.py` with 24 tests covering:
+   - **Interface compliance** (7 tests) — verifies BaseParser implementation and file type recognition
+   - **Python extraction** (4 tests) — functions, imports, variables, calls
+   - **JavaScript parsing** (2 tests) — functions, classes, imports
+   - **TypeScript parsing** (1 test) — TypeScript syntax handling
+   - **Go/Rust parsing** (2 tests) — struct/function extraction
+   - **Error handling** (3 tests) — missing files, invalid syntax, binary data
+   - **Caching** (2 tests) — language and parser instance caching
+   - **Output schema** (3 tests) — required fields and structure validation
+
+3. **Integration tests** — Created `tests/test_treesitter_integration.py` with 9 tests covering:
+   - **GraphBuilder integration** (5 tests) — building graphs with TreeSitterParser, multi-language graphs, parser auto-selection
+   - **Edge cases** (2 tests) — empty directories, unsupported files
+   - **Call extraction** (2 tests) — function call edge creation in Python and JavaScript
+
+4. **Test Results**: All 33 tests pass (24 unit + 9 integration)
+
+**Key Features Verified:**
+- ✅ Supports Python, JavaScript/JSX, TypeScript/TSX, Go, Rust
+- ✅ Extracts functions, classes, imports, variables, and call sites
+- ✅ Parses from file or source string
+- ✅ Graceful handling of missing packages
+- ✅ Efficient parser and language caching
+- ✅ Generates `calls` edges for function call analysis
+- ✅ Integrates seamlessly with GraphBuilder

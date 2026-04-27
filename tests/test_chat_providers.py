@@ -19,8 +19,8 @@ import pytest
 # ── Provider registry ──────────────────────────────────────────────
 
 class TestProviderRegistry:
-     def test_all_expected_providers_registered(self):
-         from apollo.chat.providers import PROVIDERS
+    def test_all_expected_providers_registered(self):
+        from apollo.chat.providers import PROVIDERS
         assert set(PROVIDERS) == {"xai", "openai", "gemini", "anthropic", "llama"}
 
     def test_each_provider_has_required_fields(self):
@@ -77,8 +77,8 @@ def empty_graph():
 
 
 class TestChatServiceProviderResolution:
-     def test_defaults_to_xai_when_no_settings(self, empty_graph):
-         from apollo.chat.service import ChatService
+    def test_defaults_to_xai_when_no_settings(self, empty_graph):
+        from apollo.chat.service import ChatService
         svc = ChatService(empty_graph, settings_provider=lambda: {})
         assert svc.active_provider == "xai"
         assert svc.active_model == "grok-4-1-fast-non-reasoning"
@@ -129,8 +129,8 @@ class TestChatServiceProviderResolution:
 # ── ChatService client cache ───────────────────────────────────────
 
 class TestChatServiceClientCache:
-     def test_get_client_uses_provider_base_url_and_env(self, empty_graph):
-         from apollo.chat.service import ChatService
+    def test_get_client_uses_provider_base_url_and_env(self, empty_graph):
+        from apollo.chat.service import ChatService
         settings = {"chat": {"active_provider": "openai",
                              "providers": {"openai": {"model": "gpt-4o-mini"}}}}
         svc = ChatService(empty_graph, settings_provider=lambda: settings)
@@ -210,9 +210,9 @@ class TestChatServiceClientCache:
 
 @pytest.fixture
 def isolated_settings(tmp_path, monkeypatch):
-     """Point the server at a temp settings.json + .env so tests don't write
-     into the real project files."""
-     from apollo.web import server
+    """Point the server at a temp settings.json + .env so tests don't write
+    into the real project files."""
+    from apollo.web import server
     sp = tmp_path / "settings.json"
     ep = tmp_path / ".env"
     monkeypatch.setattr(server, "SETTINGS_PATH", sp)
