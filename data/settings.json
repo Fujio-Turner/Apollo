@@ -1,5 +1,34 @@
 {
   "chat": {
     "default_model": "grok-4-1-fast-non-reasoning"
+  },
+  "default_backend": "json",
+  "cblite_storage_root": null,
+  "recent_projects": [],
+  "plugins": {
+    "markdown_gfm": {
+      "installed": true,
+      "description": "GitHub Flavored Markdown plugin for Apollo. Uses `mistune` (with the `table` and `task_lists` extensions) plus `python-frontmatter` to extract sections, code blocks, links, tables, task items, and YAML/TOML frontmatter.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/markdown_gfm",
+      "author": "Fujio Turner",
+      "sha256": "aad2c673f9bd5a0c7c39d69fecd0e946d43340ff2b8c1e50fc8438ed61bbad46"
+    },
+    "pdf_pypdf": {
+      "installed": true,
+      "description": "PDF plugin for Apollo, powered by the `pypdf` library. Extracts page text from `.pdf` files and self-disables (falls back to the generic text indexer) when `pypdf` is not importable.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/pdf_pypdf",
+      "author": "Fujio Turner",
+      "sha256": "08aaadf8404496d47944e7e58849642cb63fceb9fcfd83e7252a86643a7a155b"
+    },
+    "python3": {
+      "installed": true,
+      "description": "Python 3 source-file plugin for Apollo. Parses .py files with the standard library `ast` module to extract functions, classes, methods, decorators, calls, complexity, exceptions, and framework patterns.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/python3",
+      "author": "Fujio Turner",
+      "sha256": "0b5ae630fb4ae16cb9f32a1b17aa1975c10f808a993d033ab7dfb881b5df4c99"
+    }
   }
 }

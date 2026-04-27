@@ -207,6 +207,7 @@ tailwind.config = {
         <button type="button" role="tab" class="tab" data-tab="indexing">Indexing</button>
         <button type="button" role="tab" class="tab" data-tab="reindex">Re-index</button>
         <button type="button" role="tab" class="tab" data-tab="captures">Captures</button>
+        <button type="button" role="tab" class="tab" data-tab="plugins">Plugins</button>
       </div>
 
       <!-- ── AI Providers Tab ─────────────────────────────────── -->
@@ -360,6 +361,17 @@ tailwind.config = {
           </div>
         </div>
       </section>
+
+      <!-- ── Plugins Tab ─────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="plugins">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Installed Plugins</h3>
+          <p class="text-xs opacity-50 mb-3">Plugins detected on disk under <code class="font-mono">plugins/</code>. This list is read-only — drop a new folder/file in <code class="font-mono">plugins/</code> and reload to install. See <code class="font-mono">guides/making_plugins.md</code>.</p>
+          <div id="plugins-list" class="text-xs">
+            <span class="opacity-50">Loading…</span>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -457,8 +469,8 @@ tailwind.config = {
         <!-- Exclude file globs -->
         <div>
           <label class="label"><span class="label-text font-semibold text-sm">Exclude File Patterns</span></label>
-          <input type="text" id="bootstrap-exclude-globs" class="input input-sm input-bordered w-full" placeholder="*.min.js, *.lock, package-lock.json" />
-          <p class="text-xs opacity-50 mt-1">Comma-separated glob patterns.</p>
+          <input type="text" id="bootstrap-exclude-globs" class="input input-sm input-bordered w-full" placeholder=".*, *.min.js, *.lock, package-lock.json" />
+          <p class="text-xs opacity-50 mt-1">Comma-separated glob patterns. Sensible defaults (dotfiles, lockfiles, minified assets) are pre-filled — remove any chip you want indexed.</p>
         </div>
 
         <!-- Include doc types -->

@@ -38,9 +38,29 @@ _SOURCE_EXTENSIONS = (
     | _MARKDOWN_EXTENSIONS
 )
 
-# Directories that are always skipped — dependency/vendored/build/generated code.
-# These contain third-party code, not the user's own source.
-_SKIP_DIRS: frozenset[str] = frozenset({
+# Directories that are ALWAYS skipped — Apollo's own per-project state and
+# version-control metadata. These must never be indexed regardless of the
+# user's custom filters (they're not source code, they're internal storage,
+# and indexing them creates feedback loops with the file watcher).
+#
+# Apollo's per-project store lives in ``<project>/_apollo/`` (manifest,
+# annotations, reindex history, cblite db, …) and the web UI's per-project
+# state lives in ``<project>/_apollo_web/``. The legacy dot-prefixed
+# ``.apollo`` is also listed for backward compatibility — older projects
+# still have one and the file watcher / reindex service write to it.
+_ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({
+    "_apollo",       # Apollo's per-project store (current name).
+    "_apollo_web",   # Apollo web UI's per-project state.
+    ".apollo",       # Legacy / workspace-root variant.
+    ".git",          # Git metadata.
+})
+
+# Directories that are also skipped by default — dependency/vendored/build/
+# generated code. These contain third-party or generated code, not the user's
+# own source. Unlike ``_ALWAYS_SKIP_DIRS`` above, advanced users could in
+# principle override these via custom include filters; the dot-prefix rule in
+# ``_discover_files`` is what enforces them today.
+_SKIP_DIRS: frozenset[str] = _ALWAYS_SKIP_DIRS | frozenset({
     # Python
     "venv", ".venv", "env", ".env", "virtualenv",
     "site-packages", "dist-packages",
@@ -138,11 +158,19 @@ class GraphBuilder:
 
     def _is_dir_included(self, rel_dir: str) -> bool:
         """Check whether a directory (relative to root) should be walked."""
+        # Hard skip Apollo's own state dir / VCS metadata, regardless of any
+        # user filter. ``_discover_files`` already prunes dot-folders, but we
+        # double-check here so that future code paths (or relaxed dot rules)
+        # can never accidentally index ``.apollo`` / ``.git``.
+        rel_norm = rel_dir.replace(os.sep, "/")
+        if rel_norm:
+            first = rel_norm.split("/", 1)[0]
+            if first in _ALWAYS_SKIP_DIRS:
+                return False
         f = self._filters
         if not f:
             return True
         # User exclude_dirs: match by name OR by relative path prefix.
-        rel_norm = rel_dir.replace(os.sep, "/")
         for excl in f["exclude_dirs"]:
             excl_norm = excl.replace(os.sep, "/")
             if (

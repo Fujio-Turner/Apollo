@@ -280,13 +280,52 @@ def cmd_serve(args):
 
     store, index_path = _open_store(args)
     backend = getattr(args, "backend", "json")
+    parser_name = getattr(args, "parser", "auto")
+
+    # Auto-index the bundled demo/ folder on first run so the UI has
+    # something to display without requiring the user to run
+    # `python main.py index` separately.
+    demo_dir = os.path.abspath("demo")
+    if (
+        backend == "json"
+        and not os.path.exists(index_path)
+        and os.path.isdir(demo_dir)
+    ):
+        print(f"No index found at '{index_path}'. Auto-indexing demo/ folder...")
+        parsers_for_demo = _build_parsers(parser_name)
+        builder = GraphBuilder(parsers=parsers_for_demo)
+        graph = builder.build(demo_dir)
+
+        # Embeddings (best-effort)
+        try:
+            from apollo.embeddings import Embedder
+            print("  Generating embeddings...")
+            Embedder().embed_graph(graph)
+        except ImportError:
+            print("  Skipping embeddings (sentence-transformers not installed).")
+
+        # Spatial coordinates
+        try:
+            from apollo.spatial import SpatialMapper
+            print("  Computing spatial coordinates...")
+            SpatialMapper().compute_all(graph)
+        except Exception as e:
+            print(f"  Skipping spatial layout: {e}")
+
+        os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
+        store.save(graph)
+        print(f"  Demo index saved to {index_path}")
+
+        # Default the live watcher to demo/ as well, unless the user
+        # already pointed it somewhere else.
+        if not getattr(args, "watch_dir", None):
+            args.watch_dir = demo_dir
 
     if backend == "json" and not os.path.exists(index_path):
         print(f"Error: No index found at '{index_path}'. Run 'index' first.", file=sys.stderr)
         sys.exit(1)
 
     root_dir = getattr(args, "watch_dir", None)
-    parser_name = getattr(args, "parser", "auto")
     parsers = _build_parsers(parser_name) if root_dir else None
 
     app = create_app(store, backend=backend, root_dir=root_dir, parsers=parsers)

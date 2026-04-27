@@ -72,6 +72,58 @@ class TestGraphBuilder:
         # main.py should be in the graph
         assert any("main.py" in str(node) for node in graph.nodes)
     
+    def test_build_skips_apollo_state_dirs(self, temp_dir):
+        """``_apollo/``, ``_apollo_web/``, ``.apollo/`` are never indexed.
+
+        These hold Apollo's per-project state (manifest, annotations,
+        chat history, file hashes, …) and must never leak into the graph.
+        ``_apollo*`` does NOT start with a dot, so the generic dot-prefix
+        rule wouldn't catch it — they must be hard-coded.
+        """
+        for name in ("_apollo", "_apollo_web", ".apollo"):
+            d = temp_dir / name
+            d.mkdir()
+            (d / "leak.py").write_text("def leak():\n    pass")
+            (d / "state.json").write_text("{}")
+
+        # A real source file outside the state dirs should still be indexed.
+        (temp_dir / "main.py").write_text("def main():\n    pass")
+
+        builder = GraphBuilder(parsers=[PythonParser()])
+        graph = builder.build(str(temp_dir))
+
+        assert graph is not None
+        assert any("main.py" in str(node) for node in graph.nodes)
+        for node in graph.nodes:
+            for name in ("_apollo/", "_apollo_web/", ".apollo/"):
+                assert name not in str(node), (
+                    f"Apollo state dir {name!r} must never be indexed, "
+                    f"got node: {node}"
+                )
+
+    def test_apollo_dir_skipped_even_when_user_includes_it(self, temp_dir):
+        """Custom filters cannot un-skip ``_apollo`` (defense in depth)."""
+        apollo_dir = temp_dir / "_apollo"
+        apollo_dir.mkdir()
+        (apollo_dir / "leak.py").write_text("def leak():\n    pass")
+        (temp_dir / "ok.py").write_text("def ok():\n    pass")
+
+        # Maliciously / accidentally add "_apollo" to include_dirs.
+        filters = {
+            "mode": "custom",
+            "include_dirs": ["_apollo", "."],
+            "exclude_dirs": [],
+            "include_doc_types": [],
+            "exclude_file_globs": [],
+        }
+        builder = GraphBuilder(parsers=[PythonParser()], filters=filters)
+        graph = builder.build(str(temp_dir))
+
+        for node in graph.nodes:
+            assert "_apollo/" not in str(node), (
+                f"_apollo must remain skipped even via include_dirs, got: {node}"
+            )
+
     def test_build_skips_node_modules(self, temp_dir):
         """Test that builder skips node_modules directories."""
         # Create node_modules directory

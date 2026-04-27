@@ -32,3 +32,4 @@ Thumbs.db
 
 # Environment variables
 .env
+_dev_only/

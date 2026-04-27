@@ -1,0 +1,39 @@
+Sunflowers at Spring Gardens
+============================
+
+Sunflowers are the giants of Spring Gardens. Maria Alvarez plants them
+in the Front Walk every June, where they replace the spent tulips and
+provide a wall of yellow until late September.
+
+Featured varieties
+------------------
+
+- Russian Mammoth — the classic yellow giant, up to 3.5 metres tall.
+- Velvet Queen   — a deep crimson-red sunflower for the Heritage
+                   Border.
+- Lemon Queen    — a soft pale-yellow multi-headed variety.
+- Teddy Bear     — a fluffy dwarf sunflower (60 cm) for the front of
+                   the border.
+
+See catalog.json for the full list, varieties.csv for a quick table,
+and garden_plan.yaml for where each sunflower lives.
+
+Care notes
+----------
+
+Sunflowers are the easiest crop in Spring Gardens. Maria's routine is:
+
+  1. Sow seeds direct in late May once the soil is warm.
+  2. Water deeply once a week — sunflowers are drought tolerant once
+     established.
+  3. Stake the tall varieties (Russian Mammoth, Velvet Queen) once
+     they reach 1 metre.
+
+Companion planting
+------------------
+
+Sunflowers are kept on the opposite side of the garden from the roses
+because they shade them out. They are interplanted with squash and
+sweetcorn (a "three sisters" planting) and bordered with daisies.
+
+Photograph: see sunflower_photo.jpeg.

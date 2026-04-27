@@ -100,14 +100,30 @@ DEFAULT_SETTINGS = {
     "captures": {
         "folder": "_apollo_web",
     },
+    # Plugins detected on disk under ``plugins/``. Populated dynamically
+    # in ``_load_settings`` so the file always reflects what's installed.
+    "plugins": {},
 }
 
 
 def _load_settings():
     if SETTINGS_PATH.exists():
         with open(SETTINGS_PATH) as f:
-            return json_mod.load(f)
-    return dict(DEFAULT_SETTINGS)
+            settings = json_mod.load(f)
+    else:
+        settings = dict(DEFAULT_SETTINGS)
+    # Refresh the plugins section from the live plugins/ directory so
+    # settings.json is always an accurate mirror of what's installed.
+    try:
+        from apollo.projects.settings import detect_installed_plugins
+        detected = detect_installed_plugins()
+        if settings.get("plugins") != detected:
+            settings["plugins"] = detected
+            _save_settings(settings)
+    except Exception:
+        # Detection is best-effort; never block settings load on it.
+        pass
+    return settings
 
 
 def _save_settings(settings):
@@ -1180,6 +1196,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "indexing": _merged("indexing"),
             "reindex": _merged("reindex"),
             "captures": _merged("captures"),
+            # Read-only: which plugins are present under ``plugins/``.
+            "plugins": settings.get("plugins") or {},
         }
 
     @app.put("/api/settings")
