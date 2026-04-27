@@ -269,6 +269,109 @@ tailwind.config = {
   <form method="dialog" class="modal-backdrop"><button>close</button></form>
 </dialog>
 
+<!-- ═══ BOOTSTRAP WIZARD MODAL ═══ -->
+<dialog id="bootstrap-modal" class="modal">
+  <div class="modal-box bg-base-200 max-w-2xl">
+    <h3 class="font-bold text-lg mb-1" id="bootstrap-title">Bootstrap Project</h3>
+    <p class="text-xs opacity-60 mb-4 truncate" id="bootstrap-path"></p>
+
+    <!-- Steps indicator -->
+    <ul class="steps steps-vertical w-full text-sm mb-4" id="bootstrap-steps">
+      <li class="step step-primary" data-step="1">Folders & Files</li>
+      <li class="step" data-step="2">Document Types</li>
+      <li class="step" data-step="3">Indexing</li>
+      <li class="step" data-step="4">Done</li>
+    </ul>
+
+    <!-- Step 1: Process All vs Custom Filters -->
+    <div id="bootstrap-step-1" class="bootstrap-step">
+      <div class="form-control gap-3">
+        <label class="label cursor-pointer gap-3">
+          <input type="radio" name="filter-mode" value="all" class="radio radio-primary" checked />
+          <div class="flex-1">
+            <span class="label-text font-semibold">Process All Files</span>
+            <p class="text-xs opacity-60 mt-1">Index everything except built-in skip patterns.</p>
+          </div>
+        </label>
+        <label class="label cursor-pointer gap-3 mt-3">
+          <input type="radio" name="filter-mode" value="custom" class="radio radio-primary" />
+          <div class="flex-1">
+            <span class="label-text font-semibold">Custom Filters</span>
+            <p class="text-xs opacity-60 mt-1">Pick folders, exclude patterns, and file types.</p>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <!-- Step 2: Custom Filters (hidden by default) -->
+    <div id="bootstrap-step-2" class="bootstrap-step hidden">
+      <div class="space-y-4">
+        <!-- Folder tree -->
+        <div>
+          <label class="label"><span class="label-text font-semibold text-sm">Folders to Index</span></label>
+          <div id="bootstrap-folder-tree" class="border border-base-300 rounded p-2 bg-base-100 max-h-60 overflow-y-auto text-sm">
+            <div class="text-xs opacity-50 p-2">Loading folders...</div>
+          </div>
+        </div>
+
+        <!-- Exclude file globs -->
+        <div>
+          <label class="label"><span class="label-text font-semibold text-sm">Exclude File Patterns</span></label>
+          <input type="text" id="bootstrap-exclude-globs" class="input input-sm input-bordered w-full" placeholder="*.min.js, *.lock, package-lock.json" />
+          <p class="text-xs opacity-50 mt-1">Comma-separated glob patterns.</p>
+        </div>
+
+        <!-- Include doc types -->
+        <div>
+          <label class="label"><span class="label-text font-semibold text-sm">File Types to Index</span></label>
+          <input type="text" id="bootstrap-doc-types" class="input input-sm input-bordered w-full" placeholder="py, md, js, ts, json" />
+          <p class="text-xs opacity-50 mt-1">File extensions (no dot). Comma-separated.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Indexing (reuses Phase 8 modal visually) -->
+    <div id="bootstrap-step-3" class="bootstrap-step hidden">
+      <div class="alert alert-info text-sm">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m0-10.036A9.75 9.75 0 006.455 2.126A9.75 9.75 0 0021.75 12a9.75 9.75 0 01-15.313 7.154A9.75 9.75 0 016.455 21.75" /></svg>
+        <div>Indexing in progress. This may take a few minutes depending on your project size.</div>
+      </div>
+      <ul class="steps steps-vertical w-full text-sm mt-4" id="bootstrap-indexing-steps">
+        <li class="step" data-step="1">Parsing files</li>
+        <li class="step" data-step="2">Generating embeddings</li>
+        <li class="step" data-step="3">Saving to store</li>
+        <li class="step" data-step="4">Rebuilding search</li>
+      </ul>
+      <div id="bootstrap-indexing-detail" class="text-xs opacity-50 mt-3 font-mono"></div>
+      <div id="bootstrap-spinner" class="flex items-center gap-2 mt-4">
+        <span class="loading loading-spinner loading-sm text-primary"></span>
+        <span class="text-xs" id="bootstrap-step-label">Starting…</span>
+      </div>
+    </div>
+
+    <!-- Step 4: Done -->
+    <div id="bootstrap-step-4" class="bootstrap-step hidden">
+      <div class="flex items-center gap-3 text-success mb-4">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+        <span class="text-lg font-semibold">Project ready!</span>
+      </div>
+      <p class="text-sm opacity-70 mb-3">Your project is now indexed and ready to explore.</p>
+      <div id="bootstrap-done-stats" class="text-xs opacity-60 space-y-1 bg-base-100 rounded p-2 mb-3">
+        <div>Files indexed: <span id="bootstrap-stat-files">—</span></div>
+        <div>Nodes: <span id="bootstrap-stat-nodes">—</span></div>
+        <div>Edges: <span id="bootstrap-stat-edges">—</span></div>
+      </div>
+    </div>
+
+    <!-- Modal action buttons -->
+    <div class="modal-action mt-6">
+      <button type="button" class="btn btn-ghost btn-sm" id="bootstrap-cancel-btn" onclick="closeBootstrapModal()">Cancel</button>
+      <button type="button" class="btn btn-primary btn-sm" id="bootstrap-next-btn" onclick="bootstrapNextStep()">Next</button>
+      <button type="button" class="btn btn-primary btn-sm hidden" id="bootstrap-done-btn" onclick="closeBootstrapModal()">Explore</button>
+    </div>
+  </div>
+</dialog>
+
 <script src="/static/app.js"></script>
 </body>
 </html>

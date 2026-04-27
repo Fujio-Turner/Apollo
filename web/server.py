@@ -22,6 +22,7 @@ import os
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from apollo.graph.query import GraphQuery
+from apollo.projects import ProjectManager, register_project_routes
 
 STATIC_DIR = Path(__file__).parent / "static"
 EXCLUDE_TYPES_WORDCLOUD = {"directory", "file", "import"}
@@ -112,7 +113,7 @@ class ConnectionManager:
             self.disconnect(ws)
 
 
-def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None) -> FastAPI:
+def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(title="Code Knowledge Graph Browser")
 
@@ -123,6 +124,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    
+    # Initialize ProjectManager for project lifecycle management
+    project_manager = ProjectManager(version=version)
 
     # ── Standardized error responses ─────────────────────────────
     def _error_body(status_code: int, error: str, detail) -> dict:
@@ -233,6 +237,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     async def _capture_loop():
         nonlocal _event_loop
         _event_loop = asyncio.get_running_loop()
+
+    # ── Register project management routes ────────────────────────
+    register_project_routes(app, project_manager, store, backend)
 
     # ------------------------------------------------------------------ API --
 

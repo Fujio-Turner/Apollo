@@ -7,6 +7,9 @@ numpy
 sentence-transformers
 openai>=1.0.0
 watchdog>=3.0.0
+pytest>=7.0
+jsonschema>=4.0
+python-ulid>=1.0
 # Tree-sitter multi-language parser (optional — Step 7)
 tree-sitter>=0.23.0,<0.24
 tree-sitter-python>=0.23
