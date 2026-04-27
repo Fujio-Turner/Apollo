@@ -64,6 +64,7 @@ Dependencies
 """
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -73,6 +74,8 @@ from mistune.plugins.table import table as plugin_table
 from mistune.plugins.task_lists import task_lists as plugin_task_lists
 
 from apollo.parser.base import BaseParser
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Module-level constants
@@ -153,9 +156,11 @@ class MarkdownParser(BaseParser):
         try:
             size = path.stat().st_size
             if size > _MAX_FILE_SIZE:
+                logger.debug("skipping %s: %d bytes exceeds limit", path, size)
                 return None
             raw = path.read_text(encoding="utf-8", errors="replace")
-        except (OSError, IOError):
+        except (OSError, IOError) as exc:
+            logger.warning("failed to read %s: %s", path, exc)
             return None
 
         return self._parse_raw(raw, str(path))
@@ -190,6 +195,7 @@ class MarkdownParser(BaseParser):
             fm = dict(post.metadata) if post.metadata else None
             body = post.content  # content without frontmatter
         except Exception:
+            logger.debug("frontmatter parse failed for %s; treating as no frontmatter", filepath)
             fm = None
             body = raw
 

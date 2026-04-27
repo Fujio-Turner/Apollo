@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -112,7 +115,7 @@ class SessionManager:
                     data = json.load(f)
                 return SessionData.from_dict(data)
             except (json.JSONDecodeError, ValueError) as e:
-                print(f"Warning: Failed to load session state: {e}. Using defaults.")
+                logger.warning("failed to load session state from %s: %s; using defaults", self.current_state_file, e)
         
         return SessionData()
     

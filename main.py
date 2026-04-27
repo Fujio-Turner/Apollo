@@ -15,8 +15,11 @@ Usage:
     python main.py status
 """
 
+__version__ = "1.0.0"
+
 import argparse
 import json
+import logging
 import os
 import sys
 
@@ -27,8 +30,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from apollo.graph import GraphBuilder, GraphQuery
+from apollo.logging_config import configure_logging
 from apollo.parser import MarkdownParser, PythonParser, TextFileParser, TreeSitterParser
 from apollo.storage import open_store
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_INDEX_PATH = "data/index.json"
 DEFAULT_CBLITE_PATH = "data/graph.cblite2"
@@ -512,6 +518,8 @@ def _add_common_args(parser):
 
 
 def main():
+    configure_logging()
+    logger.info("Apollo v%s starting", __version__)
     parser = argparse.ArgumentParser(
         prog="apollo",
         description="Code knowledge graph — index, query, and explore your codebase.",
@@ -618,6 +626,7 @@ def main():
         "spatial-walk": cmd_spatial_walk,
         "inspect": cmd_inspect,
     }
+    logger.info("CLI: %s", args.command)
     commands[args.command](args)
 
 

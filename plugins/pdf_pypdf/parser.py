@@ -70,9 +70,12 @@ Install with::
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from apollo.parser.base import BaseParser
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Module-level constants
@@ -155,8 +158,10 @@ class PdfParser(BaseParser):
         try:
             size = path.stat().st_size
             if size > _MAX_FILE_SIZE:
+                logger.debug("skipping %s: %d bytes exceeds limit", path, size)
                 return None
-        except OSError:
+        except OSError as exc:
+            logger.warning("failed to stat %s: %s", path, exc)
             return None
 
         # Lazy import — Apollo stays importable without pypdf.
@@ -164,11 +169,14 @@ class PdfParser(BaseParser):
             from pypdf import PdfReader
             from pypdf.errors import PdfReadError
         except ImportError:
+            logger.debug("pypdf not installed; skipping %s", path)
             return None
 
         try:
             reader = PdfReader(str(path))
-        except (OSError, PdfReadError, Exception):
+        except (OSError, PdfReadError, Exception) as exc:
+            logger.warning("failed to open %s as PDF: %s: %s",
+                           path, type(exc).__name__, exc)
             return None
 
         # Try to unlock with the empty password if encrypted; if that
@@ -176,13 +184,16 @@ class PdfParser(BaseParser):
         if getattr(reader, "is_encrypted", False):
             try:
                 if not reader.decrypt(""):
+                    logger.debug("encrypted PDF %s could not be unlocked with empty password", path)
                     return None
             except Exception:
+                logger.exception("error decrypting %s", path)
                 return None
 
         try:
             return self._parse_reader(reader, str(path))
         except Exception:
+            logger.exception("unexpected failure parsing %s", path)
             return None
 
     # ``parse_source`` is intentionally not overridden — PDFs are binary

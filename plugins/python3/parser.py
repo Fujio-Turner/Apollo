@@ -60,11 +60,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Optional
 
 from apollo.parser.base import BaseParser
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Module-level regexes & constants
@@ -145,7 +148,8 @@ class PythonParser(BaseParser):
         filepath = Path(filepath)
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
-        except (OSError, IOError):
+        except (OSError, IOError) as exc:
+            logger.warning("failed to read %s: %s", filepath, exc)
             return None
         return self.parse_source(source, str(filepath))
 
@@ -158,7 +162,8 @@ class PythonParser(BaseParser):
         """
         try:
             tree = ast.parse(source, filename=filepath)
-        except (SyntaxError, UnicodeDecodeError):
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            logger.warning("syntax error in %s: %s; falling back to text indexer", filepath, exc)
             return None
 
         source_lines = source.splitlines()

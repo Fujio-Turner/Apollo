@@ -235,7 +235,7 @@ import sys
 
 
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-_DEFAULT_DATEFMT = "%H:%M:%S"
+_DEFAULT_DATEFMT = "%Y-%m-%dT%H:%M:%S"  # ISO-8601 format
 
 
 def configure_logging(level: str | None = None) -> None:
@@ -269,14 +269,14 @@ configure_logging()                       # before app = FastAPI(...)
 
 ### Environment variables
 
-| Variable                          | Default | Effect                                                   |
-| --------------------------------- | ------- | -------------------------------------------------------- |
-| `APOLLO_LOG_LEVEL`                | `INFO`  | Root level. One of `DEBUG INFO WARNING ERROR CRITICAL`.  |
-| `APOLLO_LOG_FILE`                 | unset   | If set, also tee logs to this path (rotating handler — see [§ 9](#9-log-rotation--sizing)). |
-| `APOLLO_LOG_JSON`                 | `0`     | If `1`, switch the formatter to JSON (one record/line).  |
-| `APOLLO_LOG_MAX_SIZE_MB`          | `100`   | Max size (in MB) of an individual log file before rollover. |
-| `APOLLO_LOG_MAX_AGE_DAYS`         | `7`     | Days to retain rotated log files. Older files are pruned. |
-| `APOLLO_LOG_ROTATED_TOTAL_MB`     | `1024`  | Total size cap (in MB) for *all* rotated files combined. Oldest are deleted first. |
+| Variable                          | Default                       | Effect                                                   |
+| --------------------------------- | ----------------------------- | -------------------------------------------------------- |
+| `APOLLO_LOG_LEVEL`                | `INFO`                        | Root level. One of `DEBUG INFO WARNING ERROR CRITICAL`.  |
+| `APOLLO_LOG_FILE`                 | `.apollo/logs/apollo.log`     | Path of the rotating log file. Set to `off` / `none` / `0` (or empty) to disable file logging entirely. See [§ 9](#9-log-rotation--sizing). |
+| `APOLLO_LOG_JSON`                 | `0`                           | If `1`, switch the formatter to JSON (one record/line).  |
+| `APOLLO_LOG_MAX_SIZE_MB`          | `100`                         | Max size (in MB) of an individual log file before rollover. |
+| `APOLLO_LOG_MAX_AGE_DAYS`         | `7`                           | Days to retain rotated log files. Older files are pruned. |
+| `APOLLO_LOG_ROTATED_TOTAL_MB`     | `1024`                        | Total size cap (in MB) for *all* rotated files combined. Oldest are deleted first. |
 
 Library code **never** reads these directly — they belong to the
 configurator only.
@@ -404,9 +404,15 @@ additive — stderr remains the canonical stream for containers and CI.
 
 ### Operational notes
 
-- **Log directory.** Default for Apollo is `.apollo/logs/apollo.log`.
-  The directory is created on first write; never check it into git
-  (already covered by `.apollo/` being gitignored).
+- **Default log path.** When `APOLLO_LOG_FILE` is unset, Apollo writes
+  to `.apollo/logs/apollo.log`. The directory is created on first
+  write; never check it into git (already covered by `.apollo/` being
+  gitignored). To opt out entirely, set `APOLLO_LOG_FILE=off` (or
+  `none`, `0`, or empty string) — Apollo will then log only to stderr.
+- **Inspecting log files from the UI.** The web UI exposes the
+  resolved path, the active file's size, and every rotated file's size
+  / age under **Settings → Logging**. The same data is also available
+  programmatically via `GET /api/logging/info`.
 - **Concurrent processes.** The CLI, `web/server.py`, and the watcher
   may all be running at once. Each process opens its own file handle;
   if they share `APOLLO_LOG_FILE`, expect interleaved rollovers. For
@@ -416,9 +422,9 @@ additive — stderr remains the canonical stream for containers and CI.
 - **Disk-full safety.** The handler honours `total_mb_cap` *after* a
   rollover, so a single oversized record can briefly push the budget
   over the line. Size budgets are eventually-consistent, not hard caps.
-- **Rotated filename format.** `<base>.<YYYYMMDD-HHMMSS>.log` keeps
-  files lexically sortable by rotation time, which matches the
-  oldest-first deletion logic.
+- **Rotated filename format.** `<base>.<ISO-8601-timestamp>.log` (e.g., `apollo.log.2024-12-31T15-30-45.log`) keeps
+   files lexically sortable by rotation time, which matches the
+   oldest-first deletion logic. Timestamps follow ISO-8601 format for consistency.
 - **JSON mode.** `APOLLO_LOG_JSON=1` only swaps the *formatter*; the
   rotation handler is unchanged. JSON records are still subject to all
   three size caps.

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -183,7 +186,7 @@ class SettingsManager:
                     data = json.load(f)
                 loaded = SettingsData.from_dict(data)
             except (json.JSONDecodeError, ValueError) as e:
-                print(f"Warning: Failed to load settings: {e}. Using defaults.")
+                logger.warning("failed to load settings from %s: %s; using defaults", self.path, e)
                 loaded = SettingsData()
         else:
             loaded = SettingsData()
