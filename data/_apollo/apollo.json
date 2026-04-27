@@ -1,0 +1,35 @@
+{
+  "project_id": "ap::01KQ6Z8XW57EF3SQ0KTW0RG1XD",
+  "root_dir": "/Users/fujioturner/Documents/git_folders/fujio-turner/Apollo/data",
+  "created_at": "2026-04-27T08:00:43.911340Z",
+  "created_by_version": "0.7.2",
+  "initial_index_completed": false,
+  "filters": {
+    "mode": "all",
+    "include_dirs": [],
+    "exclude_dirs": [],
+    "exclude_file_globs": [],
+    "include_doc_types": []
+  },
+  "storage": {
+    "backend": "json",
+    "db_hash": null,
+    "db_name": null,
+    "location_mode": "project",
+    "db_relpath": null,
+    "origin_abspath": null,
+    "cblite_version": null,
+    "schema_version": 1
+  },
+  "last_opened_at": "2026-04-27T08:00:43.913178Z",
+  "last_opened_by_version": "0.7.2",
+  "last_indexed_at": null,
+  "last_indexed_by_version": null,
+  "stats": {
+    "files_indexed": 0,
+    "nodes": 0,
+    "edges": 0,
+    "elapsed_seconds": 0.0
+  },
+  "$schema": "https://apollo.local/schema/apollo-project.schema.json"
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.local/schema/reindex-history.schema.json",
+  "title": "Apollo Reindex History",
+  "description": "Telemetry rows persisted at <project>/_apollo/reindex_history.json (capped at 100 entries). Each entry is one ReindexStats record produced by graph/incremental.py and written by apollo/reindex_service.py / apollo/projects/reindex.py (see PLAN_PROJECT_BOOTSTRAP §9 and PLAN_INCREMENTAL_REINDEX).",
+  "type": "array",
+  "items": { "$ref": "#/$defs/ReindexStats" },
+  "$defs": {
+    "ReindexStats": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "started_at",
+        "duration_ms",
+        "files_total",
+        "files_parsed",
+        "files_skipped"
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["full", "resolve_full", "resolve_local"],
+          "description": "Which incremental strategy ran"
+        },
+        "started_at": {
+          "type": "number",
+          "minimum": 0,
+          "description": "UNIX timestamp (seconds, may be fractional)"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock duration of the run in milliseconds"
+        },
+        "files_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total files considered"
+        },
+        "files_parsed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Files actually re-parsed this run"
+        },
+        "files_skipped": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Files skipped because their content hash was unchanged"
+        },
+        "affected_files": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Files re-resolved (resolve_local strategy only)"
+        },
+        "edges_resolved": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of edges re-resolved during this run"
+        },
+        "edges_added": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Edges added relative to prior graph"
+        },
+        "edges_removed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Edges removed relative to prior graph"
+        },
+        "bytes_written": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes written by the storage backend during persistence"
+        }
+      }
+    }
+  }
+}

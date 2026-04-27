@@ -307,6 +307,9 @@ Built `graph_search/watcher.py` — `FileWatcher` class using `watchdog` to moni
 ### Step 9 — Non-Code File Support ✅
 Built `graph_search/parser/text_parser.py` — `TextFileParser` backend that indexes Markdown, JSON, YAML, CSV, TOML, and plain text files. Extracts full-text content (with JSON flattening and CSV row-to-text conversion) into `document` type nodes with `source` field for embedding. `GraphBuilder` extended with `documents` handling — creates `doc::<path>` nodes linked to their parent file via `defines` edges. `TextFileParser` always included in the parser list so non-code files are indexed alongside code. File watcher picks up non-code changes automatically via the unified `_SOURCE_EXTENSIONS` set. Spatial coordinates and semantic search work unchanged — document nodes get embeddings from their content just like code nodes.
 
+### Step 10 — Incremental Re-Index System ✅
+Implemented 6-phase incremental re-indexing system: (A) Diff plumbing with `GraphDiff`/`ReindexStats` dataclasses and `compute_diff()` function; (B) `ResolveFullStrategy` option parsing incrementally then rebuilding full symbol table and re-resolving all edges (3.9x faster); (C) `ResolveLocalStrategy` using reverse-dependency index for selective re-resolution (5.6x faster); (D) `ReindexService` background sweep runner with configurable intervals; (E) telemetry persistence to `_apollo/reindex_history.json` with `/api/index/history` and `/api/index/last` endpoints; (F) `BenchmarkSuite` benchmark harness comparing strategy performance. Created `graph/incremental.py` (821 LOC), `apollo/reindex_service.py` (185 LOC), `scripts/bench_reindex.py` (368 LOC). All 23 Phase 8 tests + 252 compatibility tests passing (275 total).
+
 ---
 
 ## Phase 7 — Tree-sitter Multi-Language Parser ✅

@@ -18,6 +18,11 @@ Open `schema/index.html` in a browser to browse all available schemas interactiv
 | `search-result.schema.json` | `/api/search` response payload | `web/server.py` |
 | `node-detail.schema.json` | `/api/node/{id}` response payload | `web/server.py` |
 | `chat-thread.schema.json` | A saved AI chat conversation thread | `chat/history.py` — create/load/persist |
+| `apollo-project.schema.json` | Per-project manifest at `<project>/_apollo/apollo.json` (filters, storage backend, stats) | `apollo/projects/manifest.py` — create/load/save |
+| `annotations.schema.json` | Highlights, bookmarks, notes, tags, and collections at `<project>/_apollo/annotations.json` | `apollo/projects/annotations.py` — `AnnotationManager` |
+| `api-response.schema.json` | Standard envelope for HTTP responses (success or error) | `apollo/api/responses.py`, `web/server.py` middleware |
+| `settings.schema.json` | Global Apollo settings at `data/settings.json` (default backend, recent projects) | `apollo/projects/settings.py` — `SettingsManager` |
+| `reindex-history.schema.json` | Reindex telemetry rows at `<project>/_apollo/reindex_history.json` | `apollo/reindex_service.py`, `apollo/projects/reindex.py` |
 
 ---
 

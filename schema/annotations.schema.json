@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.local/schema/annotations.schema.json",
+  "title": "Apollo Annotations",
+  "type": "object",
+  "required": ["version", "project_id", "annotations"],
+  "properties": {
+    "version": { "type": "string", "const": "1.0" },
+    "project_id": { "type": "string", "pattern": "^ap::" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "last_modified_at": { "type": "string", "format": "date-time" },
+    "annotations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/annotation" }
+    },
+    "collections": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/collection" }
+    }
+  },
+  "definitions": {
+    "annotation": {
+      "type": "object",
+      "required": ["id", "type", "target", "created_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^an::" },
+        "type": { "enum": ["highlight", "bookmark", "note", "tag"] },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/definitions/file_target" },
+            { "$ref": "#/definitions/node_target" }
+          ]
+        },
+        "highlight_range": { "$ref": "#/definitions/highlight_range" },
+        "content": { "type": ["string", "null"] },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "color": { "enum": ["red", "yellow", "green", "blue", "purple", "gray"] },
+        "stale": { "type": "boolean" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "last_modified_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "collection": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^coll::" },
+        "name": { "type": "string" },
+        "description": { "type": ["string", "null"] },
+        "annotation_ids": { "type": "array", "items": { "type": "string" } },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "highlight_range": {
+      "type": "object",
+      "required": ["start_line", "end_line"],
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "start_col": { "type": ["integer", "null"], "minimum": 0 },
+        "end_col": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "file_target": {
+      "type": "object",
+      "required": ["type", "file_path"],
+      "properties": {
+        "type": { "const": "file" },
+        "file_path": { "type": "string" }
+      }
+    },
+    "node_target": {
+      "type": "object",
+      "required": ["type", "node_id"],
+      "properties": {
+        "type": { "const": "node" },
+        "node_id": { "type": "string" }
+      }
+    }
+  }
+}

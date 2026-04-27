@@ -17,13 +17,14 @@ from .info import ProjectInfo
 class ProjectManager:
     """Manages the currently open Apollo project."""
 
-    def __init__(self, version: str, default_backend: str = "json"):
-        """Initialize with Apollo version string."""
+    def __init__(self, version: str, default_backend: str = "json", settings_manager=None):
+        """Initialize with Apollo version string and optional settings manager."""
         self.version = version
         self.default_backend = default_backend
         self._manifest: Optional[ProjectManifest] = None
         self._root_dir: Optional[Path] = None
         self._store = None  # Reference to currently open store (JSON or CBL)
+        self._settings_manager = settings_manager  # For recent_projects cleanup
 
     @property
     def manifest(self) -> Optional[ProjectManifest]:
@@ -187,6 +188,10 @@ class ProjectManager:
         Args:
             mode: "incremental" for delta updates, "full" to delete and rebuild the graph.
         
+        For "full" reprocess:
+        - Deletes graph.json and embeddings.npy (or CBL database)
+        - PRESERVES annotations.json, chat/, and apollo.json (user data)
+        
         Returns:
             dict with reprocess info (mode, backend, db_path if applicable)
         """
@@ -199,15 +204,38 @@ class ProjectManager:
             "project_id": self._manifest.project_id,
         }
         
-        # For full reprocess with CBL, delete the database
-        if mode == "full" and self._manifest.storage.backend == "cblite":
-            db_path = self._resolve_cbl_path(self._manifest)
-            if db_path and db_path.exists():
-                self._close_existing()  # Close handle before deleting
-                shutil.rmtree(db_path, ignore_errors=True)
-                result["db_deleted"] = str(db_path)
-                # Recreate empty cblite directory
-                db_path.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "full":
+            apollo_dir = self._root_dir / "_apollo"
+            
+            # For JSON backend: delete graph.json and embeddings.npy
+            if self._manifest.storage.backend == "json":
+                graph_file = apollo_dir / "graph.json"
+                embeddings_file = apollo_dir / "embeddings.npy"
+                
+                if graph_file.exists():
+                    graph_file.unlink()
+                    result["graph_deleted"] = str(graph_file)
+                
+                if embeddings_file.exists():
+                    embeddings_file.unlink()
+                    result["embeddings_deleted"] = str(embeddings_file)
+            
+            # For CBL backend: delete the database bundle, keep cblite/ dir
+            elif self._manifest.storage.backend == "cblite":
+                db_path = self._resolve_cbl_path(self._manifest)
+                if db_path and db_path.exists():
+                    self._close_existing()  # Close handle before deleting
+                    shutil.rmtree(db_path, ignore_errors=True)
+                    result["db_deleted"] = str(db_path)
+                    # Recreate empty cblite directory for next indexing
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Reset index completion flag and stats for re-indexing
+            self._manifest.last_indexed_at = None
+            self._manifest.last_indexed_by_version = None
+            self._manifest.stats = None
+            self._manifest.save()
+            result["manifest_reset"] = True
         
         return result
     
@@ -255,6 +283,7 @@ class ProjectManager:
         """Remove the current project (delete _apollo/ and _apollo_web/).
         
         Closes any open store handle first to allow safe deletion on Windows.
+        Also removes project from recent_projects list if SettingsManager is available.
         
         Returns list of deleted paths.
         """
@@ -276,6 +305,10 @@ class ProjectManager:
         if apollo_web_dir.exists():
             shutil.rmtree(apollo_web_dir)
             deleted.append(str(apollo_web_dir))
+        
+        # Remove from recent_projects if settings manager available
+        if self._settings_manager and self._root_dir:
+            self._settings_manager.remove_recent_project(self._root_dir)
         
         # Clear in-memory state
         self._manifest = None

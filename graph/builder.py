@@ -14,6 +14,7 @@ Node IDs follow the pattern:
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -101,12 +102,87 @@ def _parse_one(item: tuple) -> dict | None:
 class GraphBuilder:
     """Builds a knowledge graph from a directory of source files."""
 
-    def __init__(self, parsers: list[BaseParser] | None = None):
+    def __init__(
+        self,
+        parsers: list[BaseParser] | None = None,
+        filters: dict | None = None,
+    ):
         self.graph = nx.DiGraph()
         self._parsers: list[BaseParser] = parsers or [PythonParser()]
         self._symbol_table: dict[str, str] = {}  # qualified_name -> node_id
         self._file_imports: dict[str, list[dict]] = {}  # file -> imports
         self._root: Path | None = None
+        # User-defined filters from ProjectManifest.filters (apollo.json).
+        # When None or mode=="all", only built-in _SKIP_DIRS apply.
+        self._filters = self._normalize_filters(filters)
+
+    @staticmethod
+    def _normalize_filters(filters: dict | None) -> dict | None:
+        if not filters:
+            return None
+        mode = filters.get("mode", "all")
+        include_dirs = [d.strip("/").rstrip(os.sep) for d in (filters.get("include_dirs") or []) if d]
+        exclude_dirs = [d.strip("/").rstrip(os.sep) for d in (filters.get("exclude_dirs") or []) if d]
+        # Lowercase, strip leading dot, for ext whitelist
+        include_doc_types = {
+            t.lower().lstrip(".") for t in (filters.get("include_doc_types") or []) if t
+        }
+        exclude_file_globs = list(filters.get("exclude_file_globs") or [])
+        return {
+            "mode": mode,
+            "include_dirs": include_dirs,
+            "exclude_dirs": exclude_dirs,
+            "include_doc_types": include_doc_types,
+            "exclude_file_globs": exclude_file_globs,
+        }
+
+    def _is_dir_included(self, rel_dir: str) -> bool:
+        """Check whether a directory (relative to root) should be walked."""
+        f = self._filters
+        if not f:
+            return True
+        # User exclude_dirs: match by name OR by relative path prefix.
+        rel_norm = rel_dir.replace(os.sep, "/")
+        for excl in f["exclude_dirs"]:
+            excl_norm = excl.replace(os.sep, "/")
+            if (
+                rel_norm == excl_norm
+                or rel_norm.startswith(excl_norm + "/")
+                or os.path.basename(rel_norm) == excl_norm
+            ):
+                return False
+        # In custom mode with include_dirs, prune anything outside the whitelist.
+        if f["mode"] == "custom" and f["include_dirs"]:
+            for inc in f["include_dirs"]:
+                inc_norm = inc.replace(os.sep, "/")
+                # rel is inside the included dir, OR is an ancestor of it
+                # (so we can descend into it).
+                if (
+                    rel_norm == inc_norm
+                    or rel_norm.startswith(inc_norm + "/")
+                    or inc_norm.startswith(rel_norm + "/")
+                ):
+                    return True
+            return False
+        return True
+
+    def _is_file_included(self, rel_path: str) -> bool:
+        """Check whether a file (relative to root) should be indexed."""
+        f = self._filters
+        if not f:
+            return True
+        rel_norm = rel_path.replace(os.sep, "/")
+        # Glob excludes (path or basename match)
+        base = os.path.basename(rel_norm)
+        for pat in f["exclude_file_globs"]:
+            if fnmatch.fnmatch(rel_norm, pat) or fnmatch.fnmatch(base, pat):
+                return False
+        # Extension whitelist
+        if f["include_doc_types"]:
+            ext = os.path.splitext(base)[1].lower().lstrip(".")
+            if ext not in f["include_doc_types"]:
+                return False
+        return True
 
     def build(self, root_dir: str) -> nx.DiGraph:
         """Scan a directory and build the full graph."""
@@ -228,13 +304,24 @@ class GraphBuilder:
 
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune hidden dirs, __pycache__, dependency dirs, and venvs
-            dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith(".")
-                and d != "__pycache__"
-                and d not in _SKIP_DIRS
-                and not _is_venv_dir(os.path.join(dirpath, d))
-            ]
+            kept = []
+            for d in dirnames:
+                if (
+                    d.startswith(".")
+                    or d == "__pycache__"
+                    or d in _SKIP_DIRS
+                    or _is_venv_dir(os.path.join(dirpath, d))
+                ):
+                    continue
+                # Compute the dir's path relative to root and consult user filters.
+                child_abs = os.path.join(dirpath, d)
+                rel_dir = os.path.relpath(child_abs, root)
+                if rel_dir == ".":
+                    rel_dir = ""
+                if not self._is_dir_included(rel_dir):
+                    continue
+                kept.append(d)
+            dirnames[:] = kept
             dirnames.sort()
 
             for fname in sorted(filenames):
@@ -243,6 +330,10 @@ class GraphBuilder:
 
                 src_file = Path(dirpath) / fname
                 rel_path = str(src_file.relative_to(root))
+
+                # User filters: extension whitelist + glob excludes.
+                if not self._is_file_included(rel_path):
+                    continue
 
                 # Every file becomes a node. A parser is optional — files
                 # without one are still indexed as plain `file` nodes so
