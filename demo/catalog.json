@@ -1,0 +1,49 @@
+{
+  "garden": "Spring Gardens",
+  "head_gardener": "Maria Alvarez",
+  "year": 2026,
+  "flowers": [
+    {
+      "common_name": "Rose",
+      "botanical_name": "Rosa",
+      "varieties": ["Crimson Glory", "Iceberg", "New Dawn", "Lady of Shalott"],
+      "bed": "South Wall, Centre Court, Heritage Border",
+      "season": "May-October",
+      "doc": "roses.md"
+    },
+    {
+      "common_name": "Tulip",
+      "botanical_name": "Tulipa",
+      "varieties": ["Queen of Night", "Apricot Beauty", "Princess Irene", "Spring Green"],
+      "bed": "Front Walk, Heritage Border",
+      "season": "March-May",
+      "doc": "tulips.md"
+    },
+    {
+      "common_name": "Sunflower",
+      "botanical_name": "Helianthus annuus",
+      "varieties": ["Russian Mammoth", "Velvet Queen", "Lemon Queen", "Teddy Bear"],
+      "bed": "Front Walk, Heritage Border",
+      "season": "June-September",
+      "doc": "sunflowers.txt"
+    },
+    {
+      "common_name": "Daisy",
+      "botanical_name": "Bellis perennis",
+      "varieties": ["Pomponette", "Tasso Pink"],
+      "bed": "All borders",
+      "season": "April-October",
+      "doc": "care_guide.md"
+    }
+  ],
+  "related_files": [
+    "README.md",
+    "roses.md",
+    "tulips.md",
+    "sunflowers.txt",
+    "care_guide.md",
+    "varieties.csv",
+    "garden_plan.yaml",
+    "info.html"
+  ]
+}

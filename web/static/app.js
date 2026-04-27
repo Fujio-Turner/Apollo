@@ -367,9 +367,14 @@ async function loadBootstrapFolderTree() {
     }
     // Render the children of the root directly so the user picks top-level
     // dirs/files inside the project instead of toggling the project itself.
-    // Hide dotfile/dotfolder entries (e.g. .git, .venv) — they're noise for
-    // most users and shouldn't be indexed.
-    const children = (tree.children || []).filter(c => !(c && typeof c.name === 'string' && c.name.startsWith('.')));
+    // Hide dotfile/dotfolder entries (e.g. .git, .venv) and Apollo's own
+    // state dirs (_apollo, _apollo_web) — they're noise for most users and
+    // shouldn't be indexed.
+    const children = (tree.children || []).filter(
+      c => c && typeof c.name === 'string'
+        && !c.name.startsWith('.')
+        && !_isApolloStateName(c.name)
+    );
     if (!children.length) {
       container.innerHTML = '<div class="text-xs opacity-50 p-2">Folder is empty.</div>';
       return;
@@ -382,8 +387,13 @@ async function loadBootstrapFolderTree() {
 
 function renderBootstrapFolderTree(node, depth) {
   if (!node || !node.name) return '';
-  // Skip dotfile/dotfolder entries at any depth (e.g. .git, .venv, .DS_Store).
-  if (typeof node.name === 'string' && node.name.startsWith('.')) return '';
+  // Skip dotfile/dotfolder entries at any depth (e.g. .git, .venv, .DS_Store)
+  // and Apollo's own state dirs (_apollo, _apollo_web) — they're never
+  // indexable and must not appear in the custom-filters tree.
+  if (typeof node.name === 'string'
+      && (node.name.startsWith('.') || _isApolloStateName(node.name))) {
+    return '';
+  }
   const isDir = node.type === 'dir';
   const icon = isDir ? '📁' : '📄';
   const hasChildren = isDir && Array.isArray(node.children) && node.children.length > 0;
@@ -406,6 +416,28 @@ function renderBootstrapFolderTree(node, depth) {
   return html;
 }
 
+// Default "do not index" patterns pre-filled into the bootstrap wizard's
+// exclude-globs input. ``.*`` covers every dotfile (e.g. .DS_Store, .env,
+// .gitignore) — by convention dotfiles are hidden / config / local-only and
+// rarely belong in a code index. The other entries are common minified,
+// generated, or lockfile artifacts. Users can remove any of these chips if
+// they really do want them indexed.
+const _DEFAULT_EXCLUDE_GLOBS = [
+  '.*',                  // all dotfiles (auto-hidden by convention)
+  '*.min.js', '*.min.css',
+  '*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+  '*.pyc', '*.pyo',
+  '*.map',
+  '*.log', '*.tmp', '*.bak', '*.swp',
+];
+
+const _DEFAULT_DOC_TYPES_WHITELIST = [
+  'py', 'js', 'jsx', 'ts', 'tsx',
+  'md', 'json', 'yaml', 'yml', 'toml',
+  'html', 'css', 'scss',
+  'go', 'rs', 'sh', 'txt', 'pdf',
+];
+
 let _bootstrapTagify = { globs: null, types: null };
 function initBootstrapTagify() {
   if (typeof Tagify === 'undefined') return;
@@ -427,15 +459,14 @@ function initBootstrapTagify() {
     const typesInput = document.getElementById('bootstrap-doc-types');
     try {
       if (globsInput && !_bootstrapTagify.globs && !globsInput.dataset.tagified) {
-        _bootstrapTagify.globs = new Tagify(globsInput, mkOpts(
-          ['*.min.js', '*.lock', '*.pyc', '*.map', 'package-lock.json', '*.log', '*.tmp']
-        ));
+        _bootstrapTagify.globs = new Tagify(globsInput, mkOpts(_DEFAULT_EXCLUDE_GLOBS));
+        // Pre-fill so users SEE the defaults (dotfiles, lockfiles, …) and
+        // can remove any they actually want indexed.
+        try { _bootstrapTagify.globs.addTags(_DEFAULT_EXCLUDE_GLOBS); } catch (_) {}
         globsInput.dataset.tagified = '1';
       }
       if (typesInput && !_bootstrapTagify.types && !typesInput.dataset.tagified) {
-        _bootstrapTagify.types = new Tagify(typesInput, mkOpts(
-          ['py', 'js', 'jsx', 'ts', 'tsx', 'md', 'json', 'yaml', 'toml', 'html', 'css', 'go', 'rs', 'sh', 'txt']
-        ));
+        _bootstrapTagify.types = new Tagify(typesInput, mkOpts(_DEFAULT_DOC_TYPES_WHITELIST));
         typesInput.dataset.tagified = '1';
       }
     } catch (e) {
@@ -460,6 +491,26 @@ function _readTagifyValues(inputId, fallbackInst) {
   return raw.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
 }
 
+// Apollo's own per-project state and VCS metadata — never indexable, never
+// shown in the custom-filters UI, and stripped from any filter payload sent
+// to the server. The backend enforces the same rule, but we belt-and-brace
+// here so users can never accidentally include them.
+//
+// ``_apollo`` (per-project store) and ``_apollo_web`` (web-UI state) do NOT
+// start with a dot, so the dotfile filter does not catch them and they must
+// be named explicitly here.
+const _ALWAYS_SKIP_DIRS = new Set([
+  '_apollo', '_apollo_web', '.apollo', '.git',
+]);
+function _isApolloStateName(name) {
+  return name === '_apollo' || name === '_apollo_web' || name === '.apollo';
+}
+function _isAlwaysSkipped(path) {
+  if (!path) return false;
+  const first = String(path).replace(/\\/g, '/').split('/')[0];
+  return _ALWAYS_SKIP_DIRS.has(first);
+}
+
 function serializeBootstrapFilters() {
   const mode = document.getElementById('filter-mode-hidden')?.value || 'all';
   if (mode === 'all') return { mode: 'all' };
@@ -469,7 +520,7 @@ function serializeBootstrapFilters() {
   const includeDirs = checkedRows
     .filter(el => el.dataset.type === 'dir')
     .map(el => el.dataset.path)
-    .filter(Boolean);
+    .filter(p => p && !_isAlwaysSkipped(p));
 
   // Files that the user UNchecked → add to exclude_file_globs (exact path match).
   const allRows = Array.from(document.querySelectorAll('.bootstrap-folder-check'));
@@ -1081,6 +1132,43 @@ async function showFileContent(data) {
     });
     return tmp.innerHTML;
   };
+  // Rewrite asset references inside a full HTML document string so that <link>,
+  // <script>, <img>, <source>, <video>, <audio>, etc. resolve via /api/file/raw.
+  // Uses DOMParser so <head>/<body> structure is preserved (unlike a div wrapper).
+  const rewriteHtmlAssets = (html) => {
+    let doc;
+    try { doc = new DOMParser().parseFromString(html, 'text/html'); }
+    catch (e) { return html; }
+    const ATTRS = [
+      ['img', 'src'], ['img', 'srcset'],
+      ['source', 'src'], ['source', 'srcset'],
+      ['video', 'src'], ['video', 'poster'],
+      ['audio', 'src'],
+      ['link', 'href'],
+      ['script', 'src'],
+      ['iframe', 'src'],
+      ['use', 'href'], ['use', 'xlink:href'],
+    ];
+    for (const [tag, attr] of ATTRS) {
+      doc.querySelectorAll(`${tag}[${attr.includes(':') ? attr.replace(':', '\\:') : attr}]`).forEach(el => {
+        const val = el.getAttribute(attr);
+        if (!val) return;
+        if (attr === 'srcset') {
+          // srcset is a comma-separated list of "url descriptor" pairs.
+          const rewritten = val.split(',').map(part => {
+            const trimmed = part.trim();
+            if (!trimmed) return '';
+            const [url, ...desc] = trimmed.split(/\s+/);
+            return [resolveSrc(url), ...desc].join(' ');
+          }).filter(Boolean).join(', ');
+          el.setAttribute(attr, rewritten);
+        } else {
+          el.setAttribute(attr, resolveSrc(val));
+        }
+      });
+    }
+    return '<!doctype html>\n' + doc.documentElement.outerHTML;
+  };
 
   let body;
   if (file.is_binary) {
@@ -1093,8 +1181,17 @@ async function showFileContent(data) {
     const html = (typeof marked !== 'undefined') ? marked.parse(file.content) : `<pre>${escapeHtml(file.content)}</pre>`;
     body = `<div class="md-content">${rewriteImgSrc(html)}</div>`;
   } else if (ext === '.html' || ext === '.htm') {
-    const safeSrc = file.content.replace(/<\/script>/gi, '<\\/script>');
-    const iframe = `<iframe sandbox="allow-same-origin" style="width:100%;height:480px;border:1px solid var(--fallback-b3,#444);border-radius:6px;background:#fff" srcdoc="${escapeHtml(safeSrc)}"></iframe>`;
+    const rewritten = rewriteHtmlAssets(file.content);
+    const safeSrc = rewritten.replace(/<\/script>/gi, '<\\/script>');
+    const displayPath = relativePath(data.path) || file.relative_path || relativePath(file.path) || file.name || '';
+    const iframe = `<iframe sandbox="allow-scripts" style="width:100%;height:480px;border:0;background:#fff;display:block" srcdoc="${escapeHtml(safeSrc)}"></iframe>`;
+    const mockup = `
+      <div class="mockup-browser border border-base-300 bg-base-200">
+        <div class="mockup-browser-toolbar">
+          <div class="input border border-base-300">${escapeHtml(displayPath)}</div>
+        </div>
+        <div class="bg-base-100">${iframe}</div>
+      </div>`;
     let highlighted;
     try { highlighted = hljs.highlight(file.content, { language: 'html', ignoreIllegals: true }).value; }
     catch(e) { highlighted = escapeHtml(file.content); }
@@ -1103,8 +1200,8 @@ async function showFileContent(data) {
         <button role="tab" class="tab tab-active" data-tab="detail-tab-preview" onclick="switchDetailTab(this)">Preview</button>
         <button role="tab" class="tab" data-tab="detail-tab-source" onclick="switchDetailTab(this)">Source</button>
       </div>
-      <div id="detail-tab-preview">${iframe}</div>
-      <div id="detail-tab-source" class="hidden"><pre class="detail-code-block"><code class="hljs">${highlighted}</code></pre></div>`;
+      <div id="detail-tab-preview">${mockup}</div>
+      <div id="detail-tab-source" class="hidden"><pre class="detail-code-block"><code class="hljs language-html">${highlighted}</code></pre></div>`;
   } else {
     let highlighted;
     try {
@@ -2561,6 +2658,57 @@ function renderExtraSettings(d) {
 
   const c = d.captures || {};
   _setVal('captures-folder', c.folder || '_apollo_web');
+
+  renderPluginsList(d.plugins || {});
+}
+
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function renderPluginsList(plugins) {
+  const host = document.getElementById('plugins-list');
+  if (!host) return;
+  const names = Object.keys(plugins).sort();
+  if (!names.length) {
+    host.innerHTML = '<span class="opacity-50">No plugins detected under <code class="font-mono">plugins/</code>.</span>';
+    return;
+  }
+  const cards = names.map(name => {
+    const p = plugins[name] || {};
+    const installed = !!p.installed;
+    const badge = installed
+      ? '<span class="badge badge-success badge-sm">installed</span>'
+      : '<span class="badge badge-ghost badge-sm">unavailable</span>';
+    const desc = p.description
+      ? `<p class="text-xs opacity-70 mt-1">${_esc(p.description)}</p>`
+      : '<p class="text-xs opacity-40 italic mt-1">No description (missing or invalid plugin.md)</p>';
+    const version = p.version
+      ? `<span class="badge badge-outline badge-sm font-mono cursor-help" title="SHA-256(parser.py): ${_esc(p.sha256) || '(unavailable)'}">v${_esc(p.version)}</span>`
+      : '<span class="badge badge-ghost badge-sm">no version</span>';
+    const url = p.url
+      ? `<a href="${_esc(p.url)}" target="_blank" rel="noopener" class="link link-primary text-xs break-all">${_esc(p.url)}</a>`
+      : '<span class="opacity-40 text-xs italic">no url</span>';
+    const author = p.author
+      ? `<span class="text-xs">${_esc(p.author)}</span>`
+      : '<span class="opacity-40 text-xs italic">unknown</span>';
+    return `
+      <div class="border border-base-300 rounded-lg p-3 mb-3">
+        <div class="flex items-center gap-2 flex-wrap">
+          <code class="font-mono text-sm font-semibold">${_esc(name)}</code>
+          ${version}
+          ${badge}
+        </div>
+        ${desc}
+        <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 mt-2 text-xs">
+          <span class="opacity-50">Author:</span>${author}
+          <span class="opacity-50">URL:</span>${url}
+        </div>
+      </div>`;
+  }).join('');
+  host.innerHTML = cards;
 }
 
 function collectExtraSettings() {

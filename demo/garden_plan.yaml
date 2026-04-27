@@ -1,0 +1,50 @@
+# 2026 planting plan for Spring Gardens
+# Maintained by Maria Alvarez
+
+garden: Spring Gardens
+year: 2026
+head_gardener: Maria Alvarez
+
+beds:
+  - name: South Wall
+    length_m: 18
+    flowers:
+      - rose: New Dawn
+    notes: Climbing roses trained on horizontal wires.
+
+  - name: Centre Court
+    length_m: 12
+    flowers:
+      - rose: Crimson Glory
+      - rose: Iceberg
+    notes: Bush roses interplanted with garlic and chives.
+
+  - name: Heritage Border
+    length_m: 24
+    flowers:
+      - rose: Lady of Shalott
+      - tulip: Queen of Night
+      - tulip: Spring Green
+      - sunflower: Velvet Queen
+      - sunflower: Teddy Bear
+      - daisy: Pomponette
+    notes: Mixed border for year-round interest.
+
+  - name: Front Walk
+    length_m: 30
+    flowers:
+      - tulip: Apricot Beauty
+      - tulip: Princess Irene
+      - sunflower: Russian Mammoth
+      - sunflower: Lemon Queen
+    notes: Tulips in spring, sunflowers replace them in June.
+
+related_documents:
+  - README.md
+  - roses.md
+  - tulips.md
+  - sunflowers.txt
+  - care_guide.md
+  - catalog.json
+  - varieties.csv
+  - info.html

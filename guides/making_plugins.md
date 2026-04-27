@@ -52,7 +52,12 @@ to support multiple, ship multiple plugin folders.
    from .parser import GoParser
    PLUGIN = GoParser
    ```
-4. Done. `plugins.discover_plugins()` will pick it up automatically.
+4. Inside it, create `plugin.md` — the **plugin manifest** with a
+   YAML front-matter block declaring `description`, `version`, `url`,
+   and `author` (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
+5. Done. `plugins.discover_plugins()` will pick it up automatically
+   and Apollo's **Settings → Plugins** tab will show the manifest
+   metadata alongside a SHA-256 hash of `parser.py`.
 
 No registry to edit. No imports to add elsewhere. Drop the folder in,
 restart Apollo, and the new language is supported.
@@ -66,13 +71,16 @@ plugins/
 ├── __init__.py            # discover_plugins() — do not edit
 ├── markdown_gfm/          # built-in: GitHub Flavored Markdown
 │   ├── __init__.py        #   exports PLUGIN
-│   └── parser.py          #   the BaseParser implementation
+│   ├── parser.py          #   the BaseParser implementation
+│   └── plugin.md          #   manifest (description / version / url / author)
 ├── python3/               # built-in: Python 3 (AST)
 │   ├── __init__.py
-│   └── parser.py
+│   ├── parser.py
+│   └── plugin.md
 └── <your_language>/       # ← your new plugin goes here
     ├── __init__.py
-    └── parser.py
+    ├── parser.py
+    └── plugin.md
 ```
 
 Each plugin is a **self-contained subpackage**. Everything one plugin
@@ -151,6 +159,75 @@ to the generic text indexer.
 When Apollo already has the file contents in memory it will call this
 method instead, so you can avoid a redundant disk read. If you skip it,
 the base class will simply call `parse_file()` again.
+
+---
+
+### 2.5. The plugin manifest (`plugin.md`)
+
+Every subpackage plugin **must** ship a `plugin.md` file alongside
+`parser.py`. It is a regular Markdown document with a YAML
+**front-matter** block at the top that Apollo parses (via the existing
+`python-frontmatter` dependency) to populate the
+**Settings → Plugins** tab.
+
+Single-file plugins (`plugins/foo.py`) put their manifest next to the
+file as `plugins/foo.plugin.md`.
+
+#### Required format
+
+```markdown
+---
+name: go1
+description: Go 1.x source-file plugin for Apollo. Parses .go files and
+  extracts packages, functions, structs, interfaces, and imports.
+version: 1.0.0
+url: https://github.com/your-org/apollo-go-plugin
+author: Jane Doe / Acme Corp
+---
+
+# Go 1.x Plugin
+
+Optional human-readable documentation goes in the body. Anything below
+the closing `---` is ignored by the manifest parser; it's purely for
+humans browsing the source tree.
+```
+
+#### Field reference
+
+| Key           | Required | Description                                                                                                  |
+| ------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `name`        | optional | Display name. Defaults to the folder name when omitted.                                                      |
+| `description` | **yes**  | One-paragraph summary shown in the Plugins tab. Plain text or short inline Markdown.                          |
+| `version`     | **yes**  | Semver-style version string (e.g. `1.0.0`, `2.3.1-beta`). Shown as a badge.                                  |
+| `url`         | **yes**  | Project / source / docs URL. Rendered as a link in the Plugins tab.                                          |
+| `author`      | **yes**  | Person, team, or company that maintains the plugin.                                                          |
+
+Anything else in the front-matter block is ignored, so feel free to
+keep your own keys (e.g. `license`, `tags`, `homepage`) — they just
+won't appear in the UI.
+
+#### Hash of `parser.py` (auto-computed)
+
+Apollo computes a **SHA-256 hash of `parser.py`** every time it loads
+the settings file and exposes it on each plugin entry as `sha256`. The
+**Plugins** tab shows it on hover of the version badge so users can
+verify that the on-disk parser matches what they expect — useful for
+audits and supply-chain checks.
+
+> **Why SHA-256, not SHA-1 or MD5?** Both SHA-1 and MD5 have known
+> practical collision attacks (SHAttered, 2017; MD5 collisions known
+> since 2004) and are no longer recommended for integrity
+> verification. SHA-256 is the modern standard used by `pip`, `npm`,
+> Homebrew, Linux distros, code signing, and Git's newer object
+> hashing. You do **not** put the hash in `plugin.md` yourself — it
+> is always derived from the live file.
+
+#### What happens if `plugin.md` is missing or malformed
+
+The plugin still loads (so existing installations don't break), but
+the Plugins tab will render its description / version / url / author
+as empty / "no description". New plugins should always ship a valid
+manifest.
 
 ---
 
@@ -255,7 +332,8 @@ Create the folder layout:
 ```
 plugins/go1/
 ├── __init__.py
-└── parser.py
+├── parser.py
+└── plugin.md
 ```
 
 **`plugins/go1/parser.py`** — the actual parser:
@@ -305,6 +383,24 @@ from .parser import GoParser
 PLUGIN = GoParser
 
 __all__ = ["GoParser", "PLUGIN"]
+```
+
+**`plugins/go1/plugin.md`** — the manifest shown in
+**Settings → Plugins**:
+
+```markdown
+---
+name: go1
+description: Go 1.x source-file plugin for Apollo. Parses .go files
+  and extracts packages, functions, structs, interfaces, and imports.
+version: 0.1.0
+url: https://github.com/your-org/apollo-go-plugin
+author: Your Name
+---
+
+# Go 1.x Plugin
+
+Free-form description goes here.
 ```
 
 That's the entire plugin. Drop the `go1/` folder under `plugins/` and
@@ -419,6 +515,9 @@ Before you commit a new plugin:
 - [ ] Folder contains `parser.py` with the `BaseParser` subclass.
 - [ ] Folder contains `__init__.py` that does
       `from .parser import YourParser` and `PLUGIN = YourParser`.
+- [ ] Folder contains `plugin.md` with a valid YAML front-matter block
+      providing **`description`, `version`, `url`, `author`**
+      (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
 - [ ] Parser class subclasses `apollo.parser.base.BaseParser`.
 - [ ] `can_parse()` returns `True` only for files this plugin handles.
 - [ ] `parse_file()` returns the standard dict (or `None`).
@@ -429,3 +528,5 @@ Before you commit a new plugin:
       parser class.
 - [ ] At least one smoke test under `tests/`.
 - [ ] `pytest -q` is green.
+- [ ] **Settings → Plugins** tab shows your plugin with the expected
+      description, version, URL, and author after a reload.

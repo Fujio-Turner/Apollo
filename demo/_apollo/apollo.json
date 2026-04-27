@@ -1,0 +1,50 @@
+{
+  "project_id": "ap::01KQ7KY9QJT6R8YDZ5Q9BC00FS",
+  "root_dir": "/Users/fujioturner/Documents/git_folders/fujio-turner/Apollo/demo",
+  "created_at": "2026-04-27T14:01:55.698355Z",
+  "created_by_version": "0.7.2",
+  "initial_index_completed": false,
+  "filters": {
+    "mode": "custom",
+    "include_dirs": [],
+    "exclude_dirs": [],
+    "exclude_file_globs": [
+      ".*",
+      "*.min.js",
+      "*.min.css",
+      "*.lock",
+      "package-lock.json",
+      "yarn.lock",
+      "pnpm-lock.yaml",
+      "*.pyc",
+      "*.pyo",
+      "*.map",
+      "*.log",
+      "*.tmp",
+      "*.bak",
+      "*.swp"
+    ],
+    "include_doc_types": []
+  },
+  "storage": {
+    "backend": "json",
+    "db_hash": null,
+    "db_name": null,
+    "location_mode": "project",
+    "db_relpath": null,
+    "origin_abspath": null,
+    "cblite_version": null,
+    "schema_version": 1
+  },
+  "last_opened_at": null,
+  "last_opened_by_version": null,
+  "last_indexed_at": null,
+  "last_indexed_by_version": null,
+  "stats": {
+    "files_indexed": 0,
+    "nodes": 0,
+    "edges": 0,
+    "elapsed_seconds": 0.0
+  },
+  "$schema": "https://apollo.local/schema/apollo-project.schema.json"
+}

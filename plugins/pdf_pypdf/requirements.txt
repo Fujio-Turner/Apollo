@@ -1,0 +1,3 @@
+# Runtime dependencies for the pdf_pypdf plugin.
+# Install with:  pip install -r plugins/pdf_pypdf/requirements.txt
+pypdf>=4.0

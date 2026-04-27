@@ -103,12 +103,19 @@ class FileWatcher:
         if path.suffix.lower() not in _SOURCE_EXTENSIONS:
             return
 
-        # Skip hidden dirs and __pycache__
+        # Skip hidden dirs, __pycache__, and Apollo's own state dirs.
+        # ``_apollo`` / ``_apollo_web`` do NOT start with a dot so they must
+        # be named explicitly here, otherwise the watcher would loop forever
+        # whenever Apollo writes file_hashes.json / reindex_history.json.
         try:
             rel_parts = path.relative_to(self.root).parts
         except ValueError:
             return
-        if any(p.startswith(".") or p == "__pycache__" for p in rel_parts):
+        _APOLLO_STATE_DIRS = {"_apollo", "_apollo_web", ".apollo"}
+        if any(
+            p.startswith(".") or p == "__pycache__" or p in _APOLLO_STATE_DIRS
+            for p in rel_parts
+        ):
             return
 
         rel_path = str(path.relative_to(self.root))

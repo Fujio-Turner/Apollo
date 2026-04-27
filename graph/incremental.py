@@ -767,11 +767,17 @@ class FullBuildStrategy:
         root = Path(root_dir).resolve()
         new_hashes: dict[str, dict] = {}
         for dirpath, dirnames, filenames in os.walk(root):
+            # Hard skip Apollo's own state dirs (``_apollo`` / ``_apollo_web``
+            # — the per-project store and web-UI state — plus legacy
+            # ``.apollo``) and VCS metadata, plus the usual dependency /
+            # build directories. ``_apollo*`` does NOT start with a dot, so
+            # it must be named explicitly here.
             dirnames[:] = [
                 d for d in dirnames
                 if not d.startswith(".")
                 and d != "__pycache__"
-                and d not in {"venv", ".venv", "node_modules", "build", "dist"}
+                and d not in {"_apollo", "_apollo_web", ".apollo", ".git",
+                              "venv", ".venv", "node_modules", "build", "dist"}
             ]
             
             for fname in filenames:
