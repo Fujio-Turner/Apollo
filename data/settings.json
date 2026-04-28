@@ -6,6 +6,14 @@
   "cblite_storage_root": null,
   "recent_projects": [],
   "plugins": {
+    "html5": {
+      "installed": true,
+      "description": "HTML5 plugin for Apollo. Uses the Python standard library `html.parser` (zero third-party deps) to extract `<title>`, h1\u2013h6 sections with parent/child hierarchy, anchor and image links, inline `<script>` / `<style>` code blocks, and `<meta>` tags from `.html` / `.htm` / `.xhtml` files.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/html5",
+      "author": "Fujio Turner",
+      "sha256": "a582d458c78333549ca1022299c88db11c1db902f380cc38adff44ff6d1abd68"
+    },
     "markdown_gfm": {
       "installed": true,
       "description": "GitHub Flavored Markdown plugin for Apollo. Uses `mistune` (with the `table` and `task_lists` extensions) plus `python-frontmatter` to extract sections, code blocks, links, tables, task items, and YAML/TOML frontmatter.",

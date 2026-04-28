@@ -553,6 +553,24 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 n_files, n_nodes, n_edges, total,
             )
 
+            # Persist final stats to the project manifest so the bootstrap
+            # wizard's "Project ready!" page (and /api/projects/current)
+            # reports accurate counts instead of the zero defaults.
+            try:
+                if (
+                    project_manager.manifest is not None
+                    and project_manager.root_dir is not None
+                    and os.path.abspath(str(project_manager.root_dir)) == os.path.abspath(target)
+                ):
+                    project_manager.mark_index_complete(
+                        files_indexed=n_files,
+                        nodes=n_nodes,
+                        edges=n_edges,
+                        elapsed_seconds=total,
+                    )
+            except Exception:
+                logger.exception("failed to persist project index stats")
+
             _indexing_status.update(
                 active=False, step=4, step_label="Complete",
                 detail=f"{n_files} files, {n_nodes} nodes, {n_edges} edges in {total:.1f}s",

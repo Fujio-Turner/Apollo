@@ -55,7 +55,10 @@ to support multiple, ship multiple plugin folders.
 4. Inside it, create `plugin.md` — the **plugin manifest** with a
    YAML front-matter block declaring `description`, `version`, `url`,
    and `author` (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
-5. Done. `plugins.discover_plugins()` will pick it up automatically
+5. Inside it, create `test_parser.py` — the **per-plugin smoke test**
+   covering discovery, extension matching, and one happy-path parse
+   (see [§ 6](#6-testing-your-plugin)).
+6. Done. `plugins.discover_plugins()` will pick it up automatically
    and Apollo's **Settings → Plugins** tab will show the manifest
    metadata alongside a SHA-256 hash of `parser.py`.
 
@@ -72,15 +75,18 @@ plugins/
 ├── markdown_gfm/          # built-in: GitHub Flavored Markdown
 │   ├── __init__.py        #   exports PLUGIN
 │   ├── parser.py          #   the BaseParser implementation
-│   └── plugin.md          #   manifest (description / version / url / author)
+│   ├── plugin.md          #   manifest (description / version / url / author)
+│   └── test_parser.py     #   per-plugin smoke test (pytest)
 ├── python3/               # built-in: Python 3 (AST)
 │   ├── __init__.py
 │   ├── parser.py
-│   └── plugin.md
+│   ├── plugin.md
+│   └── test_parser.py
 └── <your_language>/       # ← your new plugin goes here
     ├── __init__.py
     ├── parser.py
-    └── plugin.md
+    ├── plugin.md
+    └── test_parser.py
 ```
 
 Each plugin is a **self-contained subpackage**. Everything one plugin
@@ -463,34 +469,107 @@ Read whichever one is closer to what you're building, then adapt it.
 
 ## 6. Testing your plugin
 
-Add a quick smoke test under `tests/`:
+Every plugin **must** ship a `test_parser.py` **inside its own folder**.
+This keeps tests self-contained alongside the code they exercise:
+deleting the plugin (``rm -rf plugins/<name>/``) deletes its tests in
+the same step, and third-party plugin authors don't have to know about
+a separate `tests/` directory.
+
+### Required: `plugins/<name>/test_parser.py`
+
+At minimum the file should cover three things:
+
+1. **Discovery** — the plugin is picked up by
+   ``apollo.plugins.discover_plugins()``.
+2. **Extension matching** — ``can_parse()`` accepts the right
+   extensions and rejects everything else.
+3. **One happy-path parse** — a small inline fixture file is parsed
+   into a result dict with the standard shape.
+
+Example (`plugins/go1/test_parser.py`):
 
 ```python
-# tests/test_go1_parser.py
+"""Self-contained smoke tests for the go1 plugin."""
+from __future__ import annotations
+
 from apollo.plugins import discover_plugins
 from plugins.go1 import GoParser  # re-exported by plugins/go1/__init__.py
 
 
-def test_go_plugin_is_discovered():
-    plugins = discover_plugins()
-    assert any(isinstance(p, GoParser) for p in plugins)
+class TestGo1PluginDiscovery:
+    def test_plugin_is_discovered(self):
+        plugins = discover_plugins()
+        assert any(isinstance(p, GoParser) for p in plugins)
 
 
-def test_go_plugin_recognises_extension(tmp_path):
-    f = tmp_path / "main.go"
-    f.write_text("package main\n")
-    parser = GoParser()
-    assert parser.can_parse(str(f))
-    result = parser.parse_file(str(f))
-    assert result is not None
-    assert result["file"] == str(f)
+class TestGo1PluginRecognisesExtension:
+    def test_recognises_go_extension(self, tmp_path):
+        f = tmp_path / "main.go"
+        f.write_text("package main\n")
+        assert GoParser().can_parse(str(f))
+
+    def test_rejects_non_go_extension(self, tmp_path):
+        f = tmp_path / "doc.txt"
+        f.write_text("hi")
+        assert not GoParser().can_parse(str(f))
+
+
+class TestGo1PluginParsesRealGo:
+    def test_parses_minimal_module(self, tmp_path):
+        path = tmp_path / "main.go"
+        path.write_text("package main\n\nfunc main() {}\n")
+        result = GoParser().parse_file(str(path))
+
+        assert result is not None
+        assert result["file"] == str(path)
+        # All five required keys must be present.
+        for key in ("functions", "classes", "imports", "variables"):
+            assert key in result
 ```
 
-Run the suite:
+> **Per-plugin fixtures.** Inline the data your tests need (small
+> strings, ``tmp_path.write_text(...)``). Don't depend on
+> ``tests/conftest.py`` fixtures — pytest's `conftest.py` discovery is
+> directory-scoped, and your goal is a plugin folder that works
+> standalone. If a plugin really needs shared fixtures, add a
+> ``plugins/<name>/conftest.py`` next to ``test_parser.py``.
+
+### Discovery
+
+`pytest.ini` lists both `tests` and `plugins` under `testpaths`, so a
+plain `pytest` run finds plugin tests automatically. To run **only**
+your plugin's tests:
 
 ```bash
-pytest tests/test_go1_parser.py -q
+pytest plugins/go1/ -q
 ```
+
+To run all plugin tests:
+
+```bash
+pytest plugins/ -q
+```
+
+### Why not `tests/`?
+
+Keeping plugin tests in a separate top-level directory leaks plugin
+concerns into the rest of the repo:
+
+- Removing a plugin leaves dead test files behind in `tests/`.
+- Third-party plugin authors have to ship two folders.
+- Browsing `plugins/<name>/` doesn't show how the plugin is verified.
+
+Cross-cutting tests that span multiple plugins / the graph builder /
+the API still belong in `tests/` — that's where the shared
+`conftest.py` lives. The rule of thumb: **tests that exercise
+exactly one plugin go in that plugin's folder; tests that exercise
+multiple components go in `tests/`.**
+
+### Tests do **not** run at app runtime
+
+`test_parser.py` is a pytest-only file — Apollo never imports it when
+the app starts, when you index a folder, or when you run the API. It
+only runs in development / CI when you invoke `pytest` explicitly.
 
 ---
 
@@ -518,6 +597,9 @@ Before you commit a new plugin:
 - [ ] Folder contains `plugin.md` with a valid YAML front-matter block
       providing **`description`, `version`, `url`, `author`**
       (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
+- [ ] Folder contains `test_parser.py` covering discovery, extension
+      matching, and one happy-path parse
+      (see [§ 6](#6-testing-your-plugin)).
 - [ ] Parser class subclasses `apollo.parser.base.BaseParser`.
 - [ ] `can_parse()` returns `True` only for files this plugin handles.
 - [ ] `parse_file()` returns the standard dict (or `None`).
@@ -526,7 +608,7 @@ Before you commit a new plugin:
 - [ ] Any third-party deps are in
       `plugins/<name>/requirements.txt` and imported lazily inside the
       parser class.
-- [ ] At least one smoke test under `tests/`.
-- [ ] `pytest -q` is green.
+- [ ] `pytest plugins/<name>/ -q` is green.
+- [ ] `pytest -q` (full suite) is green.
 - [ ] **Settings → Plugins** tab shows your plugin with the expected
       description, version, URL, and author after a reload.
