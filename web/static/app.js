@@ -1564,7 +1564,10 @@ async function showDetail(data) {
     title: data.name || 'Node',
     tooltip: tabTooltip,
     closable: true,
-    onActivate: () => { if (data.id) applyPersistentFocus(data.id); },
+    onActivate: () => {
+      if (data.id) applyPersistentFocus(data.id);
+      if (data.id) requestAnimationFrame(() => Annotations.applyToDetail(data.id));
+    },
   });
   const typeColor = NODE_COLORS[data.type] || '#888';
   const lang = guessLang(data.type, data.path);
@@ -1619,15 +1622,18 @@ async function showDetail(data) {
 
   const isDir = data.type === 'directory';
 
+  const bookmarkBtn = data.id ? bookmarkButtonHtml(data.id, data.name) : '';
   const headerHtml = isDir
     ? `<div class="flex items-center gap-2 flex-wrap mb-3">
         <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        ${bookmarkBtn}
       </div>`
     : `<div class="flex items-center gap-2 flex-wrap mb-3">
         <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
         ${lang ? `<span class="badge badge-sm badge-outline font-mono">${lang}</span>` : ''}
         ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1" title="${escapeHtml(data.path)}">${fileIcon} ${escapeHtml(relativePath(data.path))}</span>` : ''}
         ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
+        ${bookmarkBtn}
       </div>`;
 
   const sourceSectionHtml = isDir
@@ -1658,6 +1664,11 @@ async function showDetail(data) {
       const target = body && body.querySelector('.code-line.hl-start');
       if (target) target.scrollIntoView({ block: 'center' });
     });
+  }
+
+  // Apply user annotations (highlights, notes, bookmark state).
+  if (data.id && Tabs.isActive(tabId)) {
+    requestAnimationFrame(() => { Annotations.applyToDetail(data.id); });
   }
 }
 
@@ -1980,7 +1991,7 @@ async function loadStats() {
 async function showWelcomePanel() {
   Tabs.open({
     id: 'welcome',
-    title: 'Welcome',
+    title: 'My Hub',
     closable: false,
     onActivate: () => {
       // Drop any node selection in the graph; do NOT call clearFocus()
@@ -1989,6 +2000,10 @@ async function showWelcomePanel() {
         selectedNode = null;
         renderGraph(currentGraph);
       }
+      // Re-render whichever sub-tab is active so dynamic event listeners
+      // (lost when Tabs.activate caches the body as innerHTML) get rebound.
+      const subTab = document.querySelector('#hub-pane-annotations:not(.hidden)') ? 'annotations' : 'main';
+      if (subTab === 'annotations') Annotations.openTab(Annotations.currentSubFilter() || 'notes');
     },
   });
   const stats = await loadStats();
@@ -2014,28 +2029,49 @@ async function showWelcomePanel() {
   }
 
   Tabs.setBody('welcome', `
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="md-content">
-        <h2>Welcome</h2>
-        <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
-        <h3>Quick Start</h3>
-        <ul>
-          <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
-          <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
-          <li><strong>Click a node</strong> &mdash; view source and connections</li>
-          <li><strong>Click empty space</strong> &mdash; reset the view</li>
-          <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
-        </ul>
-      </div>
-      <div>
-        <div class="md-content"><h3>Recent</h3></div>
-        <div class="bg-base-200 rounded-lg p-4 text-xs opacity-70 italic">
-          No recent operations yet. Previously completed indexing, searches, and chats will appear here.
+    <div role="tablist" class="tabs tabs-bordered tabs-sm mb-3" id="hub-tabs">
+      <button role="tab" class="tab tab-active" data-hub-tab="main" onclick="switchHubTab('main')">Main</button>
+      <button role="tab" class="tab" data-hub-tab="annotations" onclick="switchHubTab('annotations')">Notes &amp; Bookmarks</button>
+    </div>
+
+    <div id="hub-pane-main" data-hub-pane="main">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="md-content">
+          <h2>My Hub</h2>
+          <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
+          <h3>Quick Start</h3>
+          <ul>
+            <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
+            <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
+            <li><strong>Click a node</strong> &mdash; view source and connections</li>
+            <li><strong>Click empty space</strong> &mdash; reset the view</li>
+            <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
+            <li><strong>Highlight text</strong> in a node detail panel to save a highlight or note; click ★ to bookmark a node</li>
+          </ul>
+        </div>
+        <div>
+          <div class="md-content"><h3>Recent</h3></div>
+          <div class="bg-base-200 rounded-lg p-4 text-xs opacity-70 italic">
+            No recent operations yet. Previously completed indexing, searches, and chats will appear here.
+          </div>
         </div>
       </div>
+      ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
+      ${statsHtml}
     </div>
-    ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
-    ${statsHtml}
+
+    <div id="hub-pane-annotations" data-hub-pane="annotations" class="hidden">
+      <div class="ann-toolbar" style="border-radius:6px;border:1px solid oklch(var(--b3));margin-bottom:10px;padding:8px 10px;display:flex;align-items:center;gap:8px;background:oklch(var(--b2))">
+        <button type="button" class="ann-tab active" data-ann-tab="notes" onclick="Annotations.openTab('notes')">📝 Notes</button>
+        <button type="button" class="ann-tab" data-ann-tab="bookmarks" onclick="Annotations.openTab('bookmarks')">⭐ Bookmarks</button>
+        <button type="button" class="ann-tab" data-ann-tab="highlights" onclick="Annotations.openTab('highlights')">🖍️ Highlights</button>
+        <span class="flex-1"></span>
+        <button type="button" class="btn btn-ghost btn-xs btn-square" onclick="Annotations.refreshList()" title="Refresh">↻</button>
+      </div>
+      <div id="annotations-list" class="ann-list" style="padding:0">
+        <div class="ann-empty">Click a tab above to load…</div>
+      </div>
+    </div>
   `);
 
   if (stats) {
@@ -2073,6 +2109,20 @@ async function showWelcomePanel() {
         });
       }
     }
+  }
+}
+
+/* Switch between sub-tabs inside the My Hub panel. */
+function switchHubTab(tab) {
+  document.querySelectorAll('#hub-tabs [data-hub-tab]').forEach(b => {
+    b.classList.toggle('tab-active', b.dataset.hubTab === tab);
+  });
+  const main = document.getElementById('hub-pane-main');
+  const ann  = document.getElementById('hub-pane-annotations');
+  if (main) main.classList.toggle('hidden', tab !== 'main');
+  if (ann)  ann.classList.toggle('hidden',  tab !== 'annotations');
+  if (tab === 'annotations') {
+    Annotations.openTab(Annotations.currentSubFilter() || 'notes');
   }
 }
 
@@ -3197,6 +3247,455 @@ async function deleteIndex() {
   finally { btn.disabled = false; }
 }
 
+/* ══════════════════════════════════════════════════════════════
+   Annotations: text highlights, notes, bookmarks (Phase 11 UI)
+   ────────────────────────────────────────────────────────────
+   Backend storage lives in `_apollo/annotations.json` and is exposed
+   via /api/annotations*. This module wires up:
+     - text-selection toolbar inside #left-detail-content
+     - color highlights + note popover
+     - bookmark toggle on the active node
+     - sidebar list view (Notes / Bookmarks / Highlights)
+   ══════════════════════════════════════════════════════════════ */
+const Annotations = (function () {
+  let toolbar, editor, editorQuote, editorTextarea;
+  let pendingSel = null;          // {text, node_id, rect}
+  let editingNoteId = null;       // when set, save updates instead of creates
+  let _byNodeCache = {};          // node_id -> annotations[]
+  let currentTab = 'notes';
+
+  function init() {
+    toolbar = document.getElementById('selection-toolbar');
+    editor = document.getElementById('note-editor');
+    editorQuote = document.getElementById('note-editor-quote');
+    editorTextarea = document.getElementById('note-editor-textarea');
+    const detail = document.getElementById('left-detail-content');
+    if (!toolbar || !editor || !detail) return;
+
+    detail.addEventListener('mouseup', () => setTimeout(onSelection, 0));
+    detail.addEventListener('keyup', () => setTimeout(onSelection, 0));
+    document.addEventListener('mousedown', onDocMouseDown, true);
+    document.addEventListener('keydown', onDocKeyDown);
+    document.addEventListener('scroll', () => { hideToolbar(); }, true);
+
+    toolbar.querySelectorAll('.color-swatch').forEach(b => {
+      b.addEventListener('mousedown', e => e.preventDefault());
+      b.addEventListener('click', () => createHighlight(b.dataset.color));
+    });
+    toolbar.querySelector('[data-action="note"]').addEventListener('mousedown', e => e.preventDefault());
+    toolbar.querySelector('[data-action="note"]').addEventListener('click', openNoteEditor);
+    toolbar.querySelector('[data-action="close"]').addEventListener('click', () => {
+      hideToolbar();
+      window.getSelection().removeAllRanges();
+    });
+
+    editor.querySelector('[data-action="save"]').addEventListener('click', saveNote);
+    editor.querySelector('[data-action="cancel"]').addEventListener('click', hideEditor);
+  }
+
+  function onSelection() {
+    if (editor.classList.contains('visible')) return; // editor open: ignore new selections
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hideToolbar(); return; }
+    const text = sel.toString().trim();
+    if (!text || text.length < 2) { hideToolbar(); return; }
+    if (!selectedNode) return;
+    const detail = document.getElementById('left-detail-content');
+    const range = sel.getRangeAt(0);
+    if (!detail.contains(range.commonAncestorContainer)) { hideToolbar(); return; }
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+    pendingSel = { text, node_id: selectedNode };
+    showToolbar(rect);
+  }
+
+  function showToolbar(rect) {
+    // Position above the selection if room, else below
+    toolbar.classList.add('visible');
+    const tbRect = toolbar.getBoundingClientRect();
+    let top = window.scrollY + rect.top - tbRect.height - 8;
+    if (top < window.scrollY + 4) top = window.scrollY + rect.bottom + 8;
+    let left = window.scrollX + rect.left + (rect.width / 2) - (tbRect.width / 2);
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth - tbRect.width - 8));
+    toolbar.style.left = left + 'px';
+    toolbar.style.top = top + 'px';
+  }
+
+  function hideToolbar() {
+    toolbar && toolbar.classList.remove('visible');
+  }
+
+  function hideEditor() {
+    editor && editor.classList.remove('visible');
+    editingNoteId = null;
+  }
+
+  function onDocMouseDown(e) {
+    if (toolbar && toolbar.classList.contains('visible')) {
+      if (toolbar.contains(e.target) || editor.contains(e.target)) return;
+      // If user clicks anywhere else, hide toolbar
+      hideToolbar();
+    }
+    if (editor && editor.classList.contains('visible')) {
+      if (editor.contains(e.target)) return;
+      // click outside editor: keep open if clicking inside toolbar; else close
+      if (toolbar.contains(e.target)) return;
+      hideEditor();
+    }
+  }
+
+  function onDocKeyDown(e) {
+    if (e.key === 'Escape') {
+      if (editor.classList.contains('visible')) hideEditor();
+      else if (toolbar.classList.contains('visible')) hideToolbar();
+    }
+  }
+
+  async function createHighlight(color) {
+    if (!pendingSel) return;
+    try {
+      await apiFetch('/api/annotations/create', {
+        method: 'POST',
+        body: {
+          type: 'highlight',
+          target: { type: 'node', node_id: pendingSel.node_id },
+          content: pendingSel.text,
+          color,
+        },
+      });
+      _byNodeCache[pendingSel.node_id] = null;
+      hideToolbar();
+      window.getSelection().removeAllRanges();
+      showToast('Highlight saved', 'success');
+      await applyToDetail(pendingSel.node_id);
+      pendingSel = null;
+    } catch (e) {
+      showToast('Failed to save highlight: ' + (e.message || e), 'error');
+    }
+  }
+
+  function openNoteEditor() {
+    if (!pendingSel) return;
+    editorQuote.textContent = pendingSel.text.length > 280 ? pendingSel.text.slice(0, 280) + '…' : pendingSel.text;
+    editorTextarea.value = '';
+    editingNoteId = null;
+    // Position the editor near the toolbar
+    const tbRect = toolbar.getBoundingClientRect();
+    editor.classList.add('visible');
+    let top = window.scrollY + tbRect.bottom + 6;
+    let left = window.scrollX + tbRect.left;
+    const eRect = editor.getBoundingClientRect();
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth - eRect.width - 8));
+    editor.style.top = top + 'px';
+    editor.style.left = left + 'px';
+    hideToolbar();
+    setTimeout(() => editorTextarea.focus(), 30);
+  }
+
+  async function saveNote() {
+    const body = (editorTextarea.value || '').trim();
+    if (!body) { showToast('Note is empty', 'info'); return; }
+    try {
+      if (editingNoteId) {
+        await apiFetch(`/api/annotations/${encodeURIComponent(editingNoteId)}`, {
+          method: 'PUT', body: { content: body },
+        });
+        showToast('Note updated', 'success');
+      } else {
+        if (!pendingSel) return;
+        // Save the selected text in the note body as a Markdown blockquote
+        const fullContent = `> ${pendingSel.text.replace(/\n/g, '\n> ')}\n\n${body}`;
+        await apiFetch('/api/annotations/create', {
+          method: 'POST',
+          body: {
+            type: 'note',
+            target: { type: 'node', node_id: pendingSel.node_id },
+            content: fullContent,
+            color: 'yellow',
+          },
+        });
+        _byNodeCache[pendingSel.node_id] = null;
+        showToast('Note saved', 'success');
+      }
+      hideEditor();
+      window.getSelection().removeAllRanges();
+      const nid = pendingSel ? pendingSel.node_id : null;
+      pendingSel = null;
+      // Refresh detail panel if visible
+      if (nid && selectedNode === nid) await applyToDetail(nid);
+      // Refresh list view if open
+      if (isHubAnnotationsVisible()) refreshList();
+    } catch (e) {
+      showToast('Failed to save note: ' + (e.message || e), 'error');
+    }
+  }
+
+  // ── Bookmark toggle ────────────────────────────────────────────
+  async function toggleBookmark(nodeId, nodeName) {
+    try {
+      const ann = await getForNode(nodeId, false);
+      const existing = ann.find(a => a.type === 'bookmark');
+      if (existing) {
+        await apiFetch(`/api/annotations/${encodeURIComponent(existing.id)}`, { method: 'DELETE' });
+        showToast('Bookmark removed', 'success');
+      } else {
+        await apiFetch('/api/annotations/create', {
+          method: 'POST',
+          body: {
+            type: 'bookmark',
+            target: { type: 'node', node_id: nodeId },
+            content: nodeName || nodeId,
+          },
+        });
+        showToast('Bookmark added', 'success');
+      }
+      _byNodeCache[nodeId] = null;
+      await applyToDetail(nodeId);
+      if (isHubAnnotationsVisible()) refreshList();
+    } catch (e) {
+      showToast('Failed to toggle bookmark: ' + (e.message || e), 'error');
+    }
+  }
+
+  // ── Read annotations for a node ───────────────────────────────
+  async function getForNode(nodeId, useCache = true) {
+    if (!nodeId) return [];
+    if (useCache && _byNodeCache[nodeId]) return _byNodeCache[nodeId];
+    try {
+      const data = await apiFetch(`/api/annotations/by-target?node=${encodeURIComponent(nodeId)}`);
+      _byNodeCache[nodeId] = data.annotations || [];
+      return _byNodeCache[nodeId];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ── Render highlights + bookmark state into #left-detail-content
+  async function applyToDetail(nodeId) {
+    if (!nodeId) return;
+    const annotations = await getForNode(nodeId, false);
+    const detail = document.getElementById('left-detail-content');
+    if (!detail) return;
+
+    // Strip previously applied highlight wraps
+    detail.querySelectorAll('.user-highlight').forEach(el => {
+      const parent = el.parentNode;
+      while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      parent.removeChild(el);
+      parent.normalize();
+    });
+
+    // Refresh bookmark toggle button state
+    const bm = detail.querySelector('.bookmark-toggle');
+    if (bm) {
+      const has = annotations.some(a => a.type === 'bookmark');
+      bm.classList.toggle('active', has);
+      bm.setAttribute('aria-pressed', has ? 'true' : 'false');
+    }
+
+    // Apply visual highlights for highlight + note types
+    for (const a of annotations) {
+      if (a.type === 'highlight' && a.content) {
+        wrapTextInElement(detail, a.content, a.color || 'yellow', a.id, false);
+      } else if (a.type === 'note' && a.content) {
+        // Pull the quoted selection from the front of the note body
+        const m = a.content.match(/^>\s?([\s\S]+?)\n\n/);
+        if (m) wrapTextInElement(detail, m[1].replace(/\n>\s?/g, '\n'), a.color || 'yellow', a.id, true);
+      }
+    }
+  }
+
+  // Walk text nodes, find the FIRST occurrence of `text` that lives entirely
+  // within a single text node, and wrap it. Cross-node selections silently
+  // skip the visual wrap (the annotation still exists in storage).
+  function wrapTextInElement(root, text, color, annId, isNote) {
+    if (!text || text.length < 2) return false;
+    const target = text;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.parentElement) return NodeFilter.FILTER_REJECT;
+        if (n.parentElement.closest('.user-highlight')) return NodeFilter.FILTER_REJECT;
+        if (n.parentElement.closest('script,style')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    let node;
+    while ((node = walker.nextNode())) {
+      const idx = node.nodeValue.indexOf(target);
+      if (idx === -1) continue;
+      const range = document.createRange();
+      range.setStart(node, idx);
+      range.setEnd(node, idx + target.length);
+      const span = document.createElement('span');
+      span.className = 'user-highlight' + (isNote ? ' is-note' : '');
+      span.dataset.color = color;
+      span.dataset.annId = annId;
+      span.title = isNote ? 'Note · click to view' : 'Highlight · click to remove';
+      span.addEventListener('click', e => onHighlightClick(e, annId, isNote));
+      try {
+        range.surroundContents(span);
+      } catch (e) {
+        // Selection crossed element boundary; abort this wrap silently.
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  async function onHighlightClick(e, annId, isNote) {
+    e.stopPropagation();
+    if (isNote) {
+      try {
+        const ann = await apiFetch(`/api/annotations/${encodeURIComponent(annId)}`);
+        showNoteViewer(ann, e.clientX, e.clientY);
+      } catch (err) {
+        showToast('Failed to load note', 'error');
+      }
+    } else {
+      if (!confirm('Remove this highlight?')) return;
+      try {
+        await apiFetch(`/api/annotations/${encodeURIComponent(annId)}`, { method: 'DELETE' });
+        if (selectedNode) _byNodeCache[selectedNode] = null;
+        showToast('Highlight removed', 'success');
+        if (selectedNode) await applyToDetail(selectedNode);
+        if (isHubAnnotationsVisible()) refreshList();
+      } catch (err) {
+        showToast('Failed: ' + (err.message || err), 'error');
+      }
+    }
+  }
+
+  // Reuse the editor as a viewer/editor for an existing note
+  function showNoteViewer(ann, x, y) {
+    editingNoteId = ann.id;
+    pendingSel = null;
+    const m = (ann.content || '').match(/^>\s?([\s\S]+?)\n\n([\s\S]*)$/);
+    const quote = m ? m[1].replace(/\n>\s?/g, '\n') : '';
+    const body = m ? m[2] : (ann.content || '');
+    editorQuote.textContent = quote;
+    editorTextarea.value = body;
+    editor.classList.add('visible');
+    const eRect = editor.getBoundingClientRect();
+    let left = window.scrollX + (x || window.innerWidth / 2) - 20;
+    let top  = window.scrollY + (y || window.innerHeight / 2) + 12;
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth  - eRect.width  - 8));
+    top  = Math.max(8, Math.min(top,  window.scrollY + window.innerHeight - eRect.height - 8));
+    editor.style.left = left + 'px';
+    editor.style.top  = top  + 'px';
+    setTimeout(() => editorTextarea.focus(), 30);
+  }
+
+  // ── Annotations sub-tab inside My Hub ─────────────────────────
+  function openTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('#hub-pane-annotations .ann-tab').forEach(b => {
+      b.classList.toggle('active', b.dataset.annTab === tab);
+    });
+    refreshList();
+  }
+
+  function currentSubFilter() { return currentTab; }
+
+  function isHubAnnotationsVisible() {
+    const pane = document.getElementById('hub-pane-annotations');
+    return !!(pane && !pane.classList.contains('hidden'));
+  }
+
+  async function refreshList() {
+    const list = document.getElementById('annotations-list');
+    if (!list) return;
+    list.innerHTML = '<div class="ann-empty">Loading…</div>';
+    let typeFilter = currentTab === 'notes' ? 'note' : currentTab === 'bookmarks' ? 'bookmark' : 'highlight';
+    try {
+      const data = await apiFetch(`/api/annotations?type=${encodeURIComponent(typeFilter)}`);
+      const items = data.annotations || [];
+      if (!items.length) {
+        list.innerHTML = `<div class="ann-empty">No ${currentTab} yet.<br>Select text in a node detail panel to create one.</div>`;
+        return;
+      }
+      list.innerHTML = items.map(renderRow).join('');
+      list.querySelectorAll('[data-go-node]').forEach(el => {
+        el.addEventListener('click', () => {
+          const nid = el.dataset.goNode;
+          switchView('graph');
+          setTimeout(() => { focusNodeInGraph(nid); selectNode(nid); }, 80);
+        });
+      });
+      list.querySelectorAll('[data-delete-id]').forEach(el => {
+        el.addEventListener('click', async () => {
+          const id = el.dataset.deleteId;
+          if (!confirm('Delete this annotation?')) return;
+          try {
+            await apiFetch(`/api/annotations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            const nid = el.dataset.deleteNode;
+            if (nid) _byNodeCache[nid] = null;
+            if (nid && selectedNode === nid) await applyToDetail(nid);
+            refreshList();
+          } catch (e) {
+            showToast('Failed to delete', 'error');
+          }
+        });
+      });
+    } catch (e) {
+      list.innerHTML = `<div class="ann-empty">Failed to load annotations.<br>${escapeHtml(e.message || String(e))}</div>`;
+    }
+  }
+
+  function renderRow(a) {
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const when = (a.created_at || '').split('T')[0] || '';
+    const colorDot = a.color
+      ? `<span class="ann-row-color-dot" data-color="${escapeHtml(a.color)}" title="${escapeHtml(a.color)}"></span>`
+      : '';
+    const stale = a.stale ? `<span class="badge badge-xs badge-warning">stale</span>` : '';
+    let body = '';
+    if (a.type === 'note' && a.content) {
+      const m = a.content.match(/^>\s?([\s\S]+?)\n\n([\s\S]*)$/);
+      const quote = m ? m[1].replace(/\n>\s?/g, '\n') : '';
+      const note = m ? m[2] : a.content;
+      body = `${quote ? `<div class="ann-row-content" style="opacity:0.7;border-left:3px solid oklch(var(--p));padding-left:8px;margin-bottom:4px">${escapeHtml(quote)}</div>` : ''}<div class="ann-row-content">${escapeHtml(note)}</div>`;
+    } else if (a.content) {
+      body = `<div class="ann-row-content">${escapeHtml(a.content)}</div>`;
+    }
+    const goAttr = tgt.type === 'node' && tgt.node_id ? `data-go-node="${escapeHtml(tgt.node_id)}"` : '';
+    return `
+      <div class="ann-row">
+        <div class="ann-row-head">
+          <span class="ann-row-type">${escapeHtml(a.type)}</span>
+          ${colorDot}
+          <span class="ann-row-target" ${goAttr} title="${escapeHtml(tgtLabel)}">${escapeHtml(tgtLabel)}</span>
+          ${stale}
+          <span class="ann-row-time">${escapeHtml(when)}</span>
+        </div>
+        ${body}
+        <div class="ann-row-actions">
+          ${tgt.type === 'node' && tgt.node_id ? `<button type="button" class="ann-action" ${goAttr}>Open</button>` : ''}
+          <button type="button" class="ann-action danger" data-delete-id="${escapeHtml(a.id)}" data-delete-node="${escapeHtml(tgt.node_id || '')}">Delete</button>
+        </div>
+      </div>
+    `;
+  }
+
+  return {
+    init,
+    applyToDetail,
+    toggleBookmark,
+    getForNode,
+    openTab,
+    refreshList,
+    currentSubFilter,
+  };
+})();
+
+/* Build the bookmark-star button HTML for a node detail header. */
+function bookmarkButtonHtml(nodeId, nodeName) {
+  const safeId = String(nodeId || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  const safeName = String(nodeName || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  return `<button type="button" class="bookmark-toggle" title="Toggle bookmark" aria-pressed="false" onclick="Annotations.toggleBookmark('${safeId}', '${safeName}')">★</button>`;
+}
+
 /* ── Init ──────────────────────────────────────────────────────── */
 const IS_DEV_MODE = new URLSearchParams(location.search).get('dev') === 'true';
 if (IS_DEV_MODE) {
@@ -3205,7 +3704,7 @@ if (IS_DEV_MODE) {
 fetchIndexCount(); checkChatStatus(); loadFolderTree();
 // Load the graph on startup, but show the Welcome tab by default
 // (no auto-selection of the largest node).
-const _boot = () => { showWelcomePanel(); loadGraph(); };
+const _boot = () => { showWelcomePanel(); loadGraph(); Annotations.init(); };
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', _boot);
 } else {
