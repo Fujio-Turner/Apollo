@@ -699,7 +699,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
         cat_index = {name: idx for idx, name in enumerate(category_set)}
 
-        max_deg = max(degree[n] for n in node_ids) if node_ids else 1
+        max_deg = max((degree[n] for n in node_ids), default=1) or 1
 
         nodes_out = []
         for nid in node_ids:

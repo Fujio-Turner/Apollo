@@ -615,6 +615,30 @@ tailwind.config = {
   </div>
 </dialog>
 
+<!-- ═══ FLOATING SELECTION TOOLBAR (highlights & notes) ═══ -->
+<div id="selection-toolbar" role="toolbar" aria-label="Highlight selection">
+  <button type="button" class="color-swatch" data-color="yellow" title="Yellow"></button>
+  <button type="button" class="color-swatch" data-color="green"  title="Green"></button>
+  <button type="button" class="color-swatch" data-color="blue"   title="Blue"></button>
+  <button type="button" class="color-swatch" data-color="red"    title="Red"></button>
+  <button type="button" class="color-swatch" data-color="purple" title="Purple"></button>
+  <button type="button" class="color-swatch" data-color="gray"   title="Gray"></button>
+  <span class="sel-divider"></span>
+  <button type="button" class="sel-btn" data-action="note" title="Add Note">📝 Note</button>
+  <button type="button" class="sel-btn" data-action="close" title="Close" aria-label="Close">✕</button>
+</div>
+
+<!-- ═══ NOTE EDITOR POPOVER ═══ -->
+<div id="note-editor" role="dialog" aria-label="Add note">
+  <div class="text-xs opacity-60 font-semibold uppercase tracking-wider">Note</div>
+  <div class="note-quote" id="note-editor-quote"></div>
+  <textarea id="note-editor-textarea" placeholder="Write your note in Markdown…"></textarea>
+  <div class="editor-actions">
+    <button type="button" class="sel-btn" data-action="cancel">Cancel</button>
+    <button type="button" class="sel-btn btn btn-primary btn-xs" data-action="save">Save</button>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>

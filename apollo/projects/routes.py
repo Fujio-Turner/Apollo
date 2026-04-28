@@ -312,6 +312,17 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/api/annotations")
+    def list_annotations(type: Optional[str] = None):
+        """List all annotations, optionally filtered by type."""
+        mgr = _get_annotation_manager(project_manager)
+        items = mgr.list_all()
+        if type:
+            items = [a for a in items if a.type == type]
+        # newest first
+        items = sorted(items, key=lambda a: a.created_at, reverse=True)
+        return {"annotations": [a.to_dict() for a in items]}
+
     @app.get("/api/annotations/by-target")
     def annotations_by_target(file: Optional[str] = None, node: Optional[str] = None):
         """Find annotations for a file path or graph node ID."""
