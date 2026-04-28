@@ -614,6 +614,9 @@ function listenBootstrapIndexing() {
         graphCacheClear();
         fetchIndexCount();
         loadGraph();
+        // Refresh the sidebar folder tree so newly indexed files/folders
+        // appear without requiring a manual page refresh.
+        loadFolderTree();
       }
     } catch (e) {
       clearInterval(pollInterval);
