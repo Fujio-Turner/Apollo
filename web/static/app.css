@@ -270,8 +270,32 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 
 /* ── Graph / Charts ──────────────────────────────────────────── */
 #graph-chart { width: 100%; height: 100%; }
+#graph-chart-2 { width: 100%; height: 100%; }
+#graph-chart-2.hidden { display: none; }
 #loading-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 5; }
 #loading-overlay.hidden { display: none; }
+
+/* ── Dev-mode Graph Variant Tabs ─────────────────────────────── */
+.graph-variant-tabs {
+  position: absolute;
+  top: 6px;
+  left: 44px;          /* sits right of .pane-expand-btn (top:6px,left:6px) */
+  z-index: 11;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  opacity: 0.85;
+  transition: opacity 0.15s;
+}
+.graph-variant-tabs:hover { opacity: 1; }
+.graph-variant-tabs.hidden { display: none; }
+.graph-variant-tab.active {
+  background: oklch(var(--p));
+  color: oklch(var(--pc));
+}
 
 /* ── Markdown Content ────────────────────────────────────────── */
 .md-content { font-size: 13px; line-height: 1.7; }
@@ -737,3 +761,19 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 .ann-row-actions .ann-action:hover { background: oklch(var(--b2)); }
 .ann-row-actions .ann-action.danger:hover { background: rgba(239,68,68,0.15); border-color: #ef4444; color: #ef4444; }
 .ann-empty { text-align: center; padding: 60px 20px; opacity: 0.55; font-size: 12px; }
+
+/* ── My Hub: Recent activity list ──────────────────────────────── */
+#hub-recent { display: flex; flex-direction: column; gap: 6px; }
+.recent-item { padding: 8px 10px; border-radius: 6px; border: 1px solid oklch(var(--b3) / 0.5); cursor: pointer; transition: background 0.12s, border-color 0.12s; }
+.recent-item:hover { border-color: oklch(var(--p) / 0.6); }
+.recent-item.recent-chat { background: oklch(var(--p) / 0.08); }
+.recent-item.recent-chat:hover { background: oklch(var(--p) / 0.16); }
+.recent-item.recent-note { background: oklch(var(--wa, var(--p)) / 0.18); }
+.recent-item.recent-note:hover { background: oklch(var(--wa, var(--p)) / 0.28); }
+.recent-row { display: flex; align-items: center; gap: 8px; }
+.recent-tag { font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 3px; letter-spacing: 0.06em; flex-shrink: 0; }
+.recent-chat .recent-tag { background: oklch(var(--p) / 0.35); color: oklch(var(--pc)); }
+.recent-note .recent-tag { background: oklch(var(--wa, var(--p)) / 0.5); color: oklch(var(--bc)); }
+.recent-title { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-time { font-size: 10px; opacity: 0.55; flex-shrink: 0; }
+.recent-sub { font-size: 10px; opacity: 0.6; font-family: ui-monospace, SFMono-Regular, monospace; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
