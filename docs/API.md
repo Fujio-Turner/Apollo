@@ -302,6 +302,135 @@ Run multiple graph searches in parallel and merge them into a single deduped, sc
 
 ---
 
+## Annotations (Notes & Bookmarks)
+
+User-authored **highlights**, **notes**, **bookmarks**, and **tags**, stored
+in `<project>/_apollo/annotations.json`. Each annotation is anchored to either
+a file path **or** a graph node ID, so an AI assistant can pull the user's own
+notes alongside graph context — e.g. fetch every note attached to a node, then
+follow up with `/api/node/{node_id}` or `/api/neighbors/{node_id}` to see how
+the noted entity relates to the rest of the codebase.
+
+Powers the **Notes & Bookmarks** tab in the *My Hub Content* panel.
+
+### `GET /api/annotations`
+
+List all annotations in the active project, newest first.
+
+| Param  | Type   | Description                                              |
+|--------|--------|----------------------------------------------------------|
+| `type` | string | Filter: `highlight`, `bookmark`, `note`, or `tag`        |
+
+**Response**
+```json
+{
+  "annotations": [
+    {
+      "id": "an::a1b2c3d4e5f60718",
+      "type": "note",
+      "target": { "type": "node", "node_id": "func::src/main.py::main" },
+      "created_at": "2026-04-28T22:11:03.482Z",
+      "content": "Entry point — refactor candidate, see issue #42.",
+      "tags": ["refactor", "entrypoint"],
+      "color": "yellow",
+      "stale": false,
+      "last_modified_at": null
+    }
+  ]
+}
+```
+
+### `POST /api/annotations/create`
+
+Create a new annotation.
+
+**Request Body**
+
+| Field             | Type   | Required | Description                                                       |
+|-------------------|--------|----------|-------------------------------------------------------------------|
+| `type`            | string | yes      | `highlight` \| `bookmark` \| `note` \| `tag`                      |
+| `target`          | object | yes      | `{type:"file", file_path}` or `{type:"node", node_id}`            |
+| `content`         | string | no       | Free-form text (markdown allowed)                                 |
+| `tags`            | array  | no       | Tag strings                                                       |
+| `color`           | string | no       | `red`, `yellow`, `green`, `blue`, `purple`, `gray`                |
+| `highlight_range` | object | no       | `{start_line, end_line, start_col?, end_col?}` (file targets)     |
+
+**Response** — the created [`Annotation`](#get-apiannotations).
+
+### `GET /api/annotations/by-target`
+
+Find every annotation attached to a single file or graph node. Provide
+exactly one of `file` or `node`.
+
+| Param  | Type   | Description                                |
+|--------|--------|--------------------------------------------|
+| `file` | string | Project-relative file path                 |
+| `node` | string | Graph node ID, e.g. `func::main.py::main`  |
+
+### `GET /api/annotations/by-tag`
+
+Find every annotation carrying a given tag.
+
+| Param | Type   | Required | Description |
+|-------|--------|----------|-------------|
+| `tag` | string | yes      | Tag value   |
+
+### `GET /api/annotations/{annotation_id}`
+
+Return a single annotation by ID.
+
+### `PUT /api/annotations/{annotation_id}`
+
+Update any subset of an annotation's fields. Body fields match
+`POST /api/annotations/create`; omit fields you don't want to change.
+You may also set `stale: true|false`.
+
+### `DELETE /api/annotations/{annotation_id}`
+
+Delete an annotation. Also drops it from any collection that referenced it.
+
+**Response**
+```json
+{ "deleted": "an::a1b2c3d4e5f60718" }
+```
+
+### `GET /api/annotations/collections`
+
+List all annotation collections.
+
+**Response**
+```json
+{
+  "collections": [
+    {
+      "id": "coll::3344aabbccdd0011",
+      "name": "Refactor backlog",
+      "description": null,
+      "annotation_ids": ["an::a1b2c3d4e5f60718"],
+      "created_at": "2026-04-28T22:00:00Z"
+    }
+  ]
+}
+```
+
+### `POST /api/annotations/collections`
+
+Create a collection grouping related annotations.
+
+**Request Body**
+
+| Field            | Type   | Required | Description                  |
+|------------------|--------|----------|------------------------------|
+| `name`           | string | yes      | Display name                 |
+| `description`    | string | no       | Optional description         |
+| `annotation_ids` | array  | no       | Annotation IDs to include    |
+
+### `DELETE /api/annotations/collections/{collection_id}`
+
+Delete a collection. Annotations inside the collection are **not** deleted.
+
+---
+
 ## Settings
 
 ### `GET /api/settings`
