@@ -16,17 +16,25 @@ title: Apollo Markdown Test
 tags: [demo, plugin]
 ---
 
+<!-- TODO: replace placeholder copy before launch -->
+
 # Top Heading
 
-Intro paragraph with an [external link](https://example.com) and an
-[anchor link](#sub-a).
+Intro paragraph with an [external link](https://example.com), an
+[anchor link](#sub-a), a cross-doc link to [the guide](./guide.md),
+and a wiki-link to [[Other Page]] plus [[Aliased|nice name]].
 
-## Sub A
+## Sub A {#explicit-id}
 
 Some text and an image: ![logo](/img/logo.png)
 
+> [!WARNING] Heads up
+> This is a GFM callout. Be careful.
+
 ```python
 print("hi")
+# TODO: this is inside a code block, should NOT be a comment
+[[not a wikilink either]]
 ```
 
 | Col 1 | Col 2 |
@@ -73,29 +81,65 @@ class TestMarkdownGfmPluginParsesRealMarkdown:
         assert result is not None
         assert result["file"] == str(path)
 
-        # Required code-shape keys are present and empty.
-        for key in ("functions", "classes", "imports", "variables"):
+        # Code-shape keys we don't populate stay empty.
+        for key in ("functions", "classes", "variables"):
             assert result[key] == []
 
         # Frontmatter / title.
         assert result["title"] == "Apollo Markdown Test"
         assert result["frontmatter"]["tags"] == ["demo", "plugin"]
 
-        # Sections.
+        # Sections — "Sub A {#explicit-id}" should NOT keep the suffix
+        # in its name; the anchor should be on its own field.
         names = [s["name"] for s in result["sections"]]
         assert names == ["Top Heading", "Sub A", "Sub B"]
         levels = [s["level"] for s in result["sections"]]
         assert levels == [1, 2, 2]
 
+        anchors = {s["name"]: s["anchor"] for s in result["sections"]}
+        assert anchors["Top Heading"] == "top-heading"  # auto-slug
+        assert anchors["Sub A"] == "explicit-id"        # explicit kramdown
+        assert anchors["Sub B"] == "sub-b"              # auto-slug
+
         # Code blocks.
         langs = [b["language"] for b in result["code_blocks"]]
         assert "python" in langs
 
-        # Links — external + anchor + image.
+        # Links — external + anchor + image + cross-doc.
         urls = {l["url"] for l in result["links"]}
         assert "https://example.com" in urls
         assert "#sub-a" in urls
         assert "/img/logo.png" in urls
+        assert "./guide.md" in urls
+
+        # Wikilinks — both plain and aliased forms.
+        wl_targets = {(w["target"], w["alias"]) for w in result["wikilinks"]}
+        assert ("Other Page", None) in wl_targets
+        assert ("Aliased", "nice name") in wl_targets
+        # Wikilink syntax inside a code fence must NOT be picked up.
+        assert all(w["target"] != "not a wikilink either" for w in result["wikilinks"])
+
+        # Imports — typed edges for the doc graph.
+        imps = {(i["module"], i["kind"]) for i in result["imports"]}
+        assert ("./guide.md", "doc") in imps
+        assert ("/img/logo.png", "image") in imps
+        assert ("Other Page", "wikilink") in imps
+        assert ("Aliased", "wikilink") in imps
+        # External and anchor links must NOT be promoted to imports.
+        assert all(i["module"] != "https://example.com" for i in result["imports"])
+        assert all(i["module"] != "#sub-a" for i in result["imports"])
+
+        # Comments — HTML comment with TODO surfaces; the in-fence one does NOT.
+        todos = [c for c in result["comments"] if c["tag"] == "TODO"]
+        assert any("placeholder" in c["content"] for c in todos)
+        assert all("inside a code block" not in c["content"] for c in todos)
+
+        # Callouts — GFM `> [!WARNING]` block.
+        assert len(result["callouts"]) >= 1
+        co = result["callouts"][0]
+        assert co["kind"] == "WARNING"
+        assert co["title"] == "Heads up"
+        assert "Be careful" in co["content"]
 
         # Tables and tasks.
         assert len(result["tables"]) == 1

@@ -173,7 +173,23 @@ async function apiFetch(url, opts = {}) {
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('application/json')) {
         const j = await r.json();
-        detail = j.detail || j.error || j.message || detail;
+        // Server's structured shape: { status_code, error: { code, message, details? } }
+        // Legacy shapes: { detail }, { error: "msg" }, { message }
+        const structuredMsg =
+          j && j.error && typeof j.error === 'object' ? j.error.message : null;
+        const legacyError =
+          typeof j.error === 'string' ? j.error : null;
+        const candidate =
+          (typeof j.detail === 'string' ? j.detail : null) ||
+          structuredMsg ||
+          legacyError ||
+          (typeof j.message === 'string' ? j.message : null);
+        if (candidate) {
+          detail = candidate;
+        } else if (j && typeof j === 'object') {
+          // Last resort: stringify so we never show "[object Object]"
+          try { detail = JSON.stringify(j).slice(0, 500); } catch { /* keep default */ }
+        }
       } else {
         const t = await r.text();
         if (t) detail = t.slice(0, 500);
@@ -816,6 +832,10 @@ async function loadFolderTree() {
     treeEl.innerHTML = '';
     const children = root.type === 'directory' && root.children ? root.children : [root];
     treeEl.appendChild(renderTreeChildren(children, 0));
+    // Decorate file rows with note-indicator dots (daisyUI indicator).
+    if (typeof Annotations !== 'undefined' && Annotations.refreshIndicators) {
+      Annotations.refreshIndicators();
+    }
   } catch (e) {
     treeEl.innerHTML = '<div class="folder-tree-empty">No folder indexed.</div>';
     titleEl.textContent = 'FOLDER';
@@ -917,6 +937,9 @@ function renderTreeNode(node, depth) {
   row.className = 'tree-row' + (isDir ? '' : ' is-file');
   row.style.paddingLeft = (4 + depth * 12) + 'px';
   row.title = node.path || node.name || '';
+  // Stash the node id so Annotations.applyTreeIndicators() can map a row
+  // back to its graph node without re-walking the tree.
+  if (node.id) row.dataset.nodeId = node.id;
   row.innerHTML = (isDir ? _CHEVRON_SVG : '<span class="tree-chevron-spacer"></span>')
     + (isDir ? _FOLDER_SVG : fileBadgeHtml(node.name))
     + `<span class="tree-label">${escapeHtml(node.name || '')}</span>`;
@@ -1077,7 +1100,12 @@ async function showFileContent(data) {
     title: data.name || data.path || 'File',
     tooltip: relativePath(data.path) || data.path || data.name || '',
     closable: true,
-    onActivate: () => { if (nodeId) applyPersistentFocus(nodeId); },
+    onActivate: () => {
+      if (nodeId) applyPersistentFocus(nodeId);
+      // Re-apply highlights + margin notes whenever this file's tab is
+      // re-activated (e.g. after switching tabs).
+      if (nodeId) requestAnimationFrame(() => Annotations.applyToDetail(nodeId));
+    },
   });
 
   // Brief loading state.
@@ -1229,6 +1257,13 @@ async function showFileContent(data) {
   }
 
   Tabs.setBody(tabId, header + body);
+
+  // Apply user annotations (highlights, notes, margin cards). Has to run
+  // *after* the file body is in the DOM so wrapTextInElement can find the
+  // anchor text inside the rendered markdown / HTML / code view.
+  if (nodeId && Tabs.isActive(tabId)) {
+    requestAnimationFrame(() => Annotations.applyToDetail(nodeId));
+  }
 }
 
 /* Full select: detail panel + ring + adjacency focus */
@@ -1626,10 +1661,12 @@ async function showDetail(data) {
   const isDir = data.type === 'directory';
 
   const bookmarkBtn = data.id ? bookmarkButtonHtml(data.id, data.name) : '';
+  const noteIndicator = data.id ? noteIndicatorHtml(data.id) : '';
   const headerHtml = isDir
     ? `<div class="flex items-center gap-2 flex-wrap mb-3">
         <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
         ${bookmarkBtn}
+        ${noteIndicator}
       </div>`
     : `<div class="flex items-center gap-2 flex-wrap mb-3">
         <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
@@ -1637,6 +1674,7 @@ async function showDetail(data) {
         ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1" title="${escapeHtml(data.path)}">${fileIcon} ${escapeHtml(relativePath(data.path))}</span>` : ''}
         ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
         ${bookmarkBtn}
+        ${noteIndicator}
       </div>`;
 
   const sourceSectionHtml = isDir
@@ -3267,6 +3305,13 @@ const Annotations = (function () {
   let _byNodeCache = {};          // node_id -> annotations[]
   let currentTab = 'notes';
 
+  // Per-node note counts, fetched once via /api/annotations?type=note and used
+  // to render the daisyUI indicator dots on the file-tree sidebar and the
+  // node-detail page header.
+  let _noteCountsByNodeId = {};
+  let _noteCountsByFilePath = {};
+  let _noteIndexLoaded = false;
+
   function init() {
     toolbar = document.getElementById('selection-toolbar');
     editor = document.getElementById('note-editor');
@@ -3428,6 +3473,8 @@ const Annotations = (function () {
       if (nid && selectedNode === nid) await applyToDetail(nid);
       // Refresh list view if open
       if (isHubAnnotationsVisible()) refreshList();
+      // Refresh sidebar dots and detail-header indicator
+      refreshIndicators();
     } catch (e) {
       showToast('Failed to save note: ' + (e.message || e), 'error');
     }
@@ -3496,6 +3543,9 @@ const Annotations = (function () {
       bm.setAttribute('aria-pressed', has ? 'true' : 'false');
     }
 
+    // Track {annId -> note body} for the per-line dot popovers below.
+    const noteBodyById = {};
+
     // Apply visual highlights for highlight + note types
     for (const a of annotations) {
       if (a.type === 'highlight' && a.content) {
@@ -3503,47 +3553,296 @@ const Annotations = (function () {
       } else if (a.type === 'note' && a.content) {
         // Pull the quoted selection from the front of the note body
         const m = a.content.match(/^>\s?([\s\S]+?)\n\n/);
-        if (m) wrapTextInElement(detail, m[1].replace(/\n>\s?/g, '\n'), a.color || 'yellow', a.id, true);
+        if (m) {
+          wrapTextInElement(detail, m[1].replace(/\n>\s?/g, '\n'), a.color || 'yellow', a.id, true);
+          noteBodyById[a.id] = m[2] || '';
+        } else {
+          noteBodyById[a.id] = a.content;
+        }
       }
     }
+
+    // Drop any line-note markers from a previous render, then add a dot
+    // marker for every note highlight. Code views (.code-line rows) get a
+    // right-margin dot per line; rendered prose (Markdown / HTML viewers
+    // under .md-content) gets an inline dot rendered immediately after
+    // the highlighted span. Either form shows a hover popover with the
+    // note body so the user can read a saved note in place.
+    detail.querySelectorAll('.line-note-marker').forEach(el => el.remove());
+    detail.querySelectorAll('.code-line').forEach(line => line.classList.remove('has-note'));
+    const seenAnnIds = new Set();
+    const buildMarker = (annId) => {
+      const body = noteBodyById[annId] || '';
+      const marker = document.createElement('span');
+      marker.className = 'line-note-marker';
+      marker.dataset.annId = annId;
+      marker.title = 'Note · click to view';
+      marker.innerHTML = `<span class="line-note-popover">${escapeHtml(body)}</span>`;
+      marker.addEventListener('click', e => onHighlightClick(e, annId, true));
+      return marker;
+    };
+    detail.querySelectorAll('.user-highlight.is-note').forEach(span => {
+      const annId = span.dataset.annId || '';
+      if (seenAnnIds.has(annId)) return;
+      seenAnnIds.add(annId);
+      const line = span.closest('.code-line');
+      if (line) {
+        if (line.querySelector('.line-note-marker')) return;
+        line.classList.add('has-note');
+        line.appendChild(buildMarker(annId));
+      } else {
+        // Inline placement for markdown / HTML viewers without code rows.
+        const marker = buildMarker(annId);
+        marker.classList.add('inline');
+        span.insertAdjacentElement('afterend', marker);
+      }
+    });
+
+    // Fallback for notes whose quote text couldn't be wrapped (e.g. the
+    // selection crossed nested elements in the markdown render).  Drop a
+    // single inline marker at the top of the detail body so the user can
+    // still see + open the note from the page.
+    for (const a of annotations) {
+      if (a.type !== 'note' || seenAnnIds.has(a.id)) continue;
+      seenAnnIds.add(a.id);
+      const marker = buildMarker(a.id);
+      marker.classList.add('inline', 'orphan');
+      detail.insertBefore(marker, detail.firstChild);
+    }
+
+    // Refresh the daisyUI note indicator in the detail header. Recompute the
+    // count from the per-node fetch so it stays in sync even before the
+    // global note index has refreshed.
+    const noteCount = annotations.filter(a => a.type === 'note').length;
+    _noteCountsByNodeId[nodeId] = noteCount;
+    updateDetailNoteIndicator(nodeId);
+
+    // Render the Google-Docs-style margin column with one card per note
+    // (anchored vertically next to the highlighted text).
+    renderMarginNotes(detail, annotations, noteBodyById, seenAnnIds);
   }
 
-  // Walk text nodes, find the FIRST occurrence of `text` that lives entirely
-  // within a single text node, and wrap it. Cross-node selections silently
-  // skip the visual wrap (the annotation still exists in storage).
+  // Build / update the right-margin notes column inside the detail panel.
+  // Each note gets a card whose top is aligned with its anchor span (or
+  // pinned to the top of the panel for "orphan" notes whose quote could
+  // not be located in the rendered DOM).
+  function renderMarginNotes(detail, annotations, noteBodyById, _seenAnnIds) {
+    if (!detail) return;
+    const notes = (annotations || []).filter(a => a.type === 'note');
+
+    // Tear down any previous margin column.
+    detail.querySelectorAll('.notes-margin').forEach(el => el.remove());
+    detail.classList.toggle('has-margin-notes', notes.length > 0);
+    if (!notes.length) return;
+
+    const margin = document.createElement('aside');
+    margin.className = 'notes-margin';
+    margin.setAttribute('aria-label', 'Notes for this view');
+
+    // Sort notes by vertical anchor position so they read top-to-bottom.
+    const detailRect = detail.getBoundingClientRect();
+    const placed = notes.map(a => {
+      const anchor = detail.querySelector(`.user-highlight.is-note[data-ann-id="${cssEscape(a.id)}"]`);
+      let top = 0;
+      let orphan = false;
+      if (anchor) {
+        const r = anchor.getBoundingClientRect();
+        top = (r.top - detailRect.top) + detail.scrollTop;
+      } else {
+        orphan = true;
+        top = detail.scrollTop + 4;
+      }
+      return { ann: a, anchor, top, orphan };
+    }).sort((x, y) => x.top - y.top);
+
+    // Render cards into the margin (initial top will be re-laid out).
+    placed.forEach(p => {
+      const a = p.ann;
+      const body = noteBodyById && noteBodyById[a.id] != null
+        ? noteBodyById[a.id]
+        : extractNoteBody(a.content || '');
+      const quote = extractNoteQuote(a.content || '');
+      const card = document.createElement('div');
+      card.className = 'notes-margin-card' + (p.orphan ? ' orphan' : '');
+      card.dataset.annId = a.id;
+      const colorAttr = a.color ? ` data-color="${escapeHtml(a.color)}"` : '';
+      card.innerHTML = `
+        <div class="nm-card-head">
+          <span class="nm-dot"${colorAttr}></span>
+          <span class="nm-time">${escapeHtml((a.created_at || '').split('T')[0] || '')}</span>
+          ${p.orphan ? '<span class="nm-orphan-tag" title="Original anchor not found in current view">orphan</span>' : ''}
+          <button type="button" class="nm-card-delete" title="Delete note" aria-label="Delete note">✕</button>
+        </div>
+        ${quote ? `<div class="nm-quote">${escapeHtml(quote)}</div>` : ''}
+        <div class="nm-body">${escapeHtml(body)}</div>
+      `;
+      card.addEventListener('click', e => {
+        if (e.target.closest('.nm-card-delete')) return;
+        if (p.anchor) {
+          p.anchor.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          flashAnchor(p.anchor);
+        }
+        // Open editor on click of body so the user can edit the note in place.
+        showNoteViewer(a, e.clientX, e.clientY);
+      });
+      card.querySelector('.nm-card-delete').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm('Delete this note?')) return;
+        try {
+          await apiFetch(`/api/annotations/${encodeURIComponent(a.id)}`, { method: 'DELETE' });
+          if (selectedNode) _byNodeCache[selectedNode] = null;
+          showToast('Note deleted', 'success');
+          if (selectedNode) await applyToDetail(selectedNode);
+          if (isHubAnnotationsVisible()) refreshList();
+          refreshIndicators();
+        } catch (err) {
+          showToast('Failed to delete note', 'error');
+        }
+      });
+      margin.appendChild(card);
+    });
+
+    detail.appendChild(margin);
+
+    // After cards are in the DOM we know their heights, so do a second
+    // pass to vertically stack them without overlapping.  Each card is
+    // pulled toward its anchor `top` but pushed down past the previous
+    // card if needed (Google-Docs-style "comment column").
+    requestAnimationFrame(() => layoutMarginCards(detail, margin, placed));
+  }
+
+  function layoutMarginCards(detail, margin, placed) {
+    const cards = Array.from(margin.querySelectorAll('.notes-margin-card'));
+    if (!cards.length) return;
+    const GAP = 8;
+    let cursor = 0;
+    cards.forEach((card, i) => {
+      const wanted = Math.max(placed[i] ? placed[i].top : 0, cursor);
+      card.style.top = wanted + 'px';
+      cursor = wanted + card.getBoundingClientRect().height + GAP;
+    });
+  }
+
+  function extractNoteQuote(content) {
+    const m = (content || '').match(/^>\s?([\s\S]+?)\n\n/);
+    return m ? m[1].replace(/\n>\s?/g, '\n') : '';
+  }
+  function extractNoteBody(content) {
+    const m = (content || '').match(/^>\s?[\s\S]+?\n\n([\s\S]*)$/);
+    return m ? m[1] : (content || '');
+  }
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  }
+  function flashAnchor(el) {
+    if (!el) return;
+    el.classList.remove('nm-flash');
+    // force reflow so the animation restarts
+    void el.offsetWidth;
+    el.classList.add('nm-flash');
+    setTimeout(() => el.classList.remove('nm-flash'), 1400);
+  }
+
+  // Walk text nodes building a flat character index, find the first
+  // occurrence of `text` (whitespace-normalised), and wrap each text-node
+  // fragment that participates in the match with a `.user-highlight` span
+  // sharing the same data-ann-id. Works across element boundaries (e.g.
+  // markdown <strong>, syntax-highlighted hljs spans).
   function wrapTextInElement(root, text, color, annId, isNote) {
-    if (!text || text.length < 2) return false;
-    const target = text;
+    if (!text || text.trim().length < 2) return false;
+
+    // Collect candidate text nodes in document order, skipping nodes that
+    // already live inside a user-highlight / script / style block.
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(n) {
+        if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
         if (!n.parentElement) return NodeFilter.FILTER_REJECT;
         if (n.parentElement.closest('.user-highlight')) return NodeFilter.FILTER_REJECT;
         if (n.parentElement.closest('script,style')) return NodeFilter.FILTER_REJECT;
+        // Skip our own gutter / line-number cells so we never highlight the
+        // line numbers in lined code blocks.
+        if (n.parentElement.closest('.ln,.line-note-marker,.notes-margin')) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
+
+    // Build a normalised string + offset map.  Every run of whitespace
+    // (including line breaks coming from <br>/markdown re-flow) collapses
+    // to a single space so the match survives wrapping differences.
+    const segments = [];           // {node, start, end} into normalized string
+    let normalized = '';
+    let prevWasSpace = true;       // collapse leading whitespace
     let node;
     while ((node = walker.nextNode())) {
-      const idx = node.nodeValue.indexOf(target);
-      if (idx === -1) continue;
-      const range = document.createRange();
-      range.setStart(node, idx);
-      range.setEnd(node, idx + target.length);
-      const span = document.createElement('span');
-      span.className = 'user-highlight' + (isNote ? ' is-note' : '');
-      span.dataset.color = color;
-      span.dataset.annId = annId;
-      span.title = isNote ? 'Note · click to view' : 'Highlight · click to remove';
-      span.addEventListener('click', e => onHighlightClick(e, annId, isNote));
-      try {
-        range.surroundContents(span);
-      } catch (e) {
-        // Selection crossed element boundary; abort this wrap silently.
-        return false;
+      const raw = node.nodeValue;
+      const segStart = normalized.length;
+      // Track per-character mapping back to the original node index.
+      const charMap = [];
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        const isWs = /\s/.test(ch);
+        if (isWs) {
+          if (prevWasSpace) continue;
+          normalized += ' ';
+          charMap.push(i);
+          prevWasSpace = true;
+        } else {
+          normalized += ch;
+          charMap.push(i);
+          prevWasSpace = false;
+        }
       }
-      return true;
+      const segEnd = normalized.length;
+      segments.push({ node, start: segStart, end: segEnd, charMap });
     }
-    return false;
+
+    const needle = text.replace(/\s+/g, ' ').trim();
+    if (!needle) return false;
+
+    // Strip leading whitespace from the normalized haystack for search but
+    // keep it for offset lookups.
+    const idx = normalized.indexOf(needle);
+    if (idx === -1) return false;
+    const matchStart = idx;
+    const matchEnd = idx + needle.length;
+
+    // Walk the segments, splitting and wrapping the slice that overlaps
+    // [matchStart, matchEnd).  Multiple spans share the same annId so the
+    // margin panel can find every fragment.
+    let wrappedAny = false;
+    for (const seg of segments) {
+      if (seg.end <= matchStart || seg.start >= matchEnd) continue;
+      const localFrom = Math.max(matchStart, seg.start) - seg.start;
+      const localTo   = Math.min(matchEnd,   seg.end)   - seg.start;
+      // Map from normalized-local offsets back to raw text-node offsets.
+      const rawFrom = seg.charMap[localFrom] != null ? seg.charMap[localFrom] : seg.node.nodeValue.length;
+      // localTo is exclusive; charMap[localTo-1]+1 is the right edge.
+      let rawTo;
+      if (localTo <= 0) continue;
+      if (localTo - 1 >= seg.charMap.length) {
+        rawTo = seg.node.nodeValue.length;
+      } else {
+        rawTo = seg.charMap[localTo - 1] + 1;
+      }
+      if (rawTo <= rawFrom) continue;
+      try {
+        const range = document.createRange();
+        range.setStart(seg.node, rawFrom);
+        range.setEnd(seg.node, rawTo);
+        const span = document.createElement('span');
+        span.className = 'user-highlight' + (isNote ? ' is-note' : '');
+        span.dataset.color = color;
+        span.dataset.annId = annId;
+        span.title = isNote ? 'Note · click to view' : 'Highlight · click to remove';
+        span.addEventListener('click', e => onHighlightClick(e, annId, isNote));
+        range.surroundContents(span);
+        wrappedAny = true;
+      } catch (e) {
+        // Boundary collision (rare here since we operate on a single text
+        // node at a time); skip this fragment but keep going.
+      }
+    }
+    return wrappedAny;
   }
 
   async function onHighlightClick(e, annId, isNote) {
@@ -3635,6 +3934,7 @@ const Annotations = (function () {
             if (nid) _byNodeCache[nid] = null;
             if (nid && selectedNode === nid) await applyToDetail(nid);
             refreshList();
+            refreshIndicators();
           } catch (e) {
             showToast('Failed to delete', 'error');
           }
@@ -3681,6 +3981,97 @@ const Annotations = (function () {
     `;
   }
 
+  // ── Note index (powers tree dots + detail-header indicator) ─────
+  async function loadNoteIndex() {
+    try {
+      const data = await apiFetch('/api/annotations?type=note');
+      const items = data.annotations || [];
+      const byNode = {};
+      const byFile = {};
+      for (const a of items) {
+        const t = a.target || {};
+        if (t.type === 'node' && t.node_id) {
+          byNode[t.node_id] = (byNode[t.node_id] || 0) + 1;
+        } else if (t.type === 'file' && t.file_path) {
+          byFile[t.file_path] = (byFile[t.file_path] || 0) + 1;
+        }
+      }
+      _noteCountsByNodeId = byNode;
+      _noteCountsByFilePath = byFile;
+      _noteIndexLoaded = true;
+    } catch (e) {
+      _noteCountsByNodeId = {};
+      _noteCountsByFilePath = {};
+      _noteIndexLoaded = true;
+    }
+  }
+
+  function noteCountForNode(nodeId) {
+    return _noteCountsByNodeId[nodeId] || 0;
+  }
+
+  // Decorate every file row in the sidebar tree with a daisyUI indicator dot
+  // when the corresponding node has at least one saved note.
+  function applyTreeIndicators() {
+    const rows = document.querySelectorAll('#folder-tree .tree-row.is-file');
+    rows.forEach(row => {
+      // The node id was stashed on the row's click handler; we need a stable
+      // way to recover it, so we re-derive from the title (full path) instead.
+      // The renderer doesn't put node-id on the DOM, so we tag it via a
+      // dataset attribute below.
+      const nid = row.dataset.nodeId;
+      const existing = row.querySelector('.tree-row-note-dot');
+      const count = nid ? noteCountForNode(nid) : 0;
+      if (count > 0) {
+        if (!existing) {
+          const dot = document.createElement('span');
+          dot.className = 'tree-row-note-dot';
+          dot.title = count === 1 ? '1 note' : `${count} notes`;
+          dot.setAttribute('aria-label', dot.title);
+          row.appendChild(dot);
+        } else {
+          existing.title = count === 1 ? '1 note' : `${count} notes`;
+        }
+      } else if (existing) {
+        existing.remove();
+      }
+    });
+  }
+
+  async function refreshIndicators() {
+    await loadNoteIndex();
+    applyTreeIndicators();
+    if (selectedNode) updateDetailNoteIndicator(selectedNode);
+  }
+
+  // Toggle the visibility of per-line note markers + the inline note
+  // highlights inside the detail panel so the user can read the source
+  // unobstructed and bring the notes back with a single click.
+  function toggleNotesVisibility() {
+    const detail = document.getElementById('left-detail-content');
+    if (!detail) return;
+    const hidden = detail.classList.toggle('notes-hidden');
+    const label = document.querySelector('#detail-note-indicator .notes-toggle-label');
+    if (label) label.textContent = hidden ? 'show notes' : 'notes';
+  }
+
+  // Update / inject the indicator badge in the detail header. The header is
+  // re-rendered on every showDetail() call, so this just patches the count
+  // when notes change without rerendering everything else.
+  function updateDetailNoteIndicator(nodeId) {
+    if (!nodeId) return;
+    const wrap = document.getElementById('detail-note-indicator');
+    if (!wrap) return;
+    const count = noteCountForNode(nodeId);
+    const badge = wrap.querySelector('.indicator-item');
+    if (count > 0) {
+      wrap.classList.remove('hidden');
+      if (badge) badge.textContent = String(count);
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }
+
   return {
     init,
     applyToDetail,
@@ -3689,6 +4080,12 @@ const Annotations = (function () {
     openTab,
     refreshList,
     currentSubFilter,
+    loadNoteIndex,
+    noteCountForNode,
+    applyTreeIndicators,
+    refreshIndicators,
+    updateDetailNoteIndicator,
+    toggleNotesVisibility,
   };
 })();
 
@@ -3697,6 +4094,22 @@ function bookmarkButtonHtml(nodeId, nodeName) {
   const safeId = String(nodeId || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
   const safeName = String(nodeName || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
   return `<button type="button" class="bookmark-toggle" title="Toggle bookmark" aria-pressed="false" onclick="Annotations.toggleBookmark('${safeId}', '${safeName}')">★</button>`;
+}
+
+/* Build the daisyUI indicator showing how many notes target this node.
+   Hidden by default; populated lazily by Annotations.updateDetailNoteIndicator()
+   so we don't have to await the index before rendering the header.
+   Clicking it toggles the visibility of the per-line note dots / popovers. */
+function noteIndicatorHtml(nodeId) {
+  const count = (typeof Annotations !== 'undefined' && Annotations.noteCountForNode)
+    ? Annotations.noteCountForNode(nodeId) : 0;
+  const hidden = count > 0 ? '' : ' hidden';
+  const noteIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3 h-3"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" /></svg>';
+  return `
+    <div id="detail-note-indicator" class="indicator${hidden}" title="Click to show/hide notes on this page">
+      <span class="indicator-item badge badge-primary badge-xs">${count}</span>
+      <button type="button" class="badge badge-sm badge-ghost gap-1" onclick="Annotations.toggleNotesVisibility()">${noteIcon} <span class="notes-toggle-label">notes</span></button>
+    </div>`;
 }
 
 /* ── Init ──────────────────────────────────────────────────────── */

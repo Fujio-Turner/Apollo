@@ -22,8 +22,33 @@ def _get_annotation_manager(project_manager) -> AnnotationManager:
     )
 
 
-def register_project_routes(app: FastAPI, project_manager, store, backend: str):
-    """Register all /api/projects/* endpoints."""
+def _get_annotation_manager_optional(project_manager):
+    """Like `_get_annotation_manager` but returns None instead of raising
+    when no project is open. Read-only endpoints use this so that polling
+    the annotations API on a fresh server (before a project has been
+    opened) returns an empty list rather than a noisy 400."""
+    if not project_manager.manifest or not project_manager.root_dir:
+        return None
+    return AnnotationManager(
+        project_root=project_manager.root_dir,
+        project_id=project_manager.manifest.project_id,
+    )
+
+
+def register_project_routes(app: FastAPI, project_manager, store, backend: str, on_project_open=None):
+    """Register all /api/projects/* endpoints.
+
+    `on_project_open(path)` is invoked (best-effort) every time a project
+    is successfully opened so callers can persist the last-opened path
+    and auto-restore it on the next server start.
+    """
+    def _notify_open(path):
+        if on_project_open is None:
+            return
+        try:
+            on_project_open(path)
+        except Exception:
+            pass
     
     # ────────────────────────────────────────────────────────────────
     # POST /api/projects/open
@@ -61,6 +86,7 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
             
             # Open via project manager
             project_info = project_manager.open(str(path))
+            _notify_open(str(path))
             return project_info.to_dict()
             
         except HTTPException:
@@ -90,7 +116,8 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
             
             # Initialize with filters
             project_info = project_manager.init(str(path), filters)
-            
+            _notify_open(str(path))
+
             # TODO: Enqueue indexing job (Phase 8 integration)
             # For now, just return the ProjectInfo
             
@@ -315,7 +342,9 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
     @app.get("/api/annotations")
     def list_annotations(type: Optional[str] = None):
         """List all annotations, optionally filtered by type."""
-        mgr = _get_annotation_manager(project_manager)
+        mgr = _get_annotation_manager_optional(project_manager)
+        if mgr is None:
+            return {"annotations": []}
         items = mgr.list_all()
         if type:
             items = [a for a in items if a.type == type]
@@ -328,7 +357,9 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
         """Find annotations for a file path or graph node ID."""
         if not file and not node:
             raise HTTPException(status_code=400, detail="Provide ?file= or ?node=")
-        mgr = _get_annotation_manager(project_manager)
+        mgr = _get_annotation_manager_optional(project_manager)
+        if mgr is None:
+            return {"annotations": []}
         if file:
             results = mgr.find_by_target_file(file)
         else:
@@ -340,12 +371,16 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
         """Find annotations carrying the given tag."""
         if not tag:
             raise HTTPException(status_code=400, detail="Missing tag")
-        mgr = _get_annotation_manager(project_manager)
+        mgr = _get_annotation_manager_optional(project_manager)
+        if mgr is None:
+            return {"annotations": []}
         return {"annotations": [a.to_dict() for a in mgr.find_by_tag(tag)]}
 
     @app.get("/api/annotations/collections")
     def list_annotation_collections():
-        mgr = _get_annotation_manager(project_manager)
+        mgr = _get_annotation_manager_optional(project_manager)
+        if mgr is None:
+            return {"collections": []}
         return {"collections": [c.to_dict() for c in mgr.list_collections()]}
 
     @app.post("/api/annotations/collections")
@@ -377,7 +412,9 @@ def register_project_routes(app: FastAPI, project_manager, store, backend: str):
 
     @app.get("/api/annotations/{annotation_id}")
     def get_annotation(annotation_id: str):
-        mgr = _get_annotation_manager(project_manager)
+        mgr = _get_annotation_manager_optional(project_manager)
+        if mgr is None:
+            raise HTTPException(status_code=404, detail="Annotation not found")
         ann = mgr.get(annotation_id)
         if not ann:
             raise HTTPException(status_code=404, detail="Annotation not found")
