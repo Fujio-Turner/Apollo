@@ -335,6 +335,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         chat_service = ChatService(
             graph, search=search, embedder=embedder, root_dir=root_dir,
             settings_provider=_load_settings,
+            project_manager=project_manager,
         )
     except Exception:
         chat_service = None
@@ -649,7 +650,11 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
        if chat_service is not None:
            try:
                from apollo.chat.service import ChatService
-               chat_service = ChatService(graph, search=None, embedder=embedder, root_dir=root_dir)
+               chat_service = ChatService(
+                   graph, search=None, embedder=embedder, root_dir=root_dir,
+                   settings_provider=_load_settings,
+                   project_manager=project_manager,
+               )
            except Exception:
                chat_service = None
        return {"status": "deleted", "total_nodes": 0, "total_edges": 0}
@@ -1089,7 +1094,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         node_id: str,
         depth: int = Query(1, ge=1, le=5),
         edge_types: Optional[str] = Query(None, description="Comma-separated edge types"),
-        direction: str = Query("both", regex="^(in|out|both)$"),
+        direction: str = Query("both", pattern="^(in|out|both)$"),
     ):
         """BFS-walk the graph from `node_id`. Mirrors the AI's `get_neighbors` tool.
 

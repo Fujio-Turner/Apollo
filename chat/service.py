@@ -42,6 +42,17 @@ Workflow when the user asks a multi-file/multi-symbol question:
    - Pass file paths in `files` and node IDs in `node_refs` — the UI renders them as clickable chips, so do NOT also list them inline in the summary.
    - Set `confidence` to "high", "med", or "low" so the UI can show a status dot.
 
+Workflow when the user asks about THEIR notes, bookmarks, highlights, or
+"what did I save / annotate":
+1. Call `list_notes` (optionally with `type="note"` or `type="bookmark"`).
+   This returns the user's own annotations with their `target` (file path or
+   graph node ID), `content`, `tags`, and `created_at`.
+2. For each annotation pointing at a graph node, you may call `get_node` or
+   `get_neighbors` to bring in relationship context (callers, callees,
+   imports, defining file). For file targets, use `get_file_section`.
+3. Cite annotation IDs (e.g. `an::a1b2c3...`) and the target node IDs in
+   your final `return_result` so the UI can chip them.
+
 Workflow when debugging a specific file or unfamiliar source:
 1. Call `file_stats(path)` first — it's cheap and tells you size, line count, md5, function/class counts, and top-level imports.
 2. If the user is unsure which file is involved, use `project_search(pattern)` to grep across the indexed project. Default context is 5 lines before/after each match.
@@ -249,6 +260,61 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_notes",
+            "description": "List the user's own annotations (highlights, NOTES, BOOKMARKS, tags) attached to files or graph nodes in the current project. Use this any time the user asks about THEIR notes, bookmarks, highlights, recent annotations, or 'what did I save'. Newest first. Each item has a `target` linking to either a file path or a graph node ID, which can then be expanded with `get_node` / `get_neighbors` for relationship context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["highlight", "bookmark", "note", "tag"],
+                        "description": "Optional type filter. Omit to list all annotations.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max items to return (default 25).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notes_by_target",
+            "description": "Find every annotation attached to a single file or graph node. Useful for joining the user's notes/bookmarks to graph context — e.g. fetch every note attached to a node returned by `search_graph`. Provide exactly one of `file` or `node`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Project-relative file path.",
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Graph node ID, e.g. `func::src/main.py::main`.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notes_by_tag",
+            "description": "Find every annotation carrying a given tag.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string"},
+                },
+                "required": ["tag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "return_result",
             "description": "FINAL ANSWER. Call this exactly once when you have enough information to answer the user. Bounds the tool-call loop and supplies structured citations the UI renders as clickable chips. After calling this, do NOT emit any further prose.",
             "parameters": {
@@ -301,6 +367,7 @@ class ChatService:
         model: str | None = None,
         root_dir: str | None = None,
         settings_provider=None,
+        project_manager=None,
     ):
         from apollo.chat.providers import get_provider, DEFAULT_PROVIDER
 
@@ -308,6 +375,10 @@ class ChatService:
         self.search = search
         self.embedder = embedder
         self.root_dir = root_dir
+        # Optional ProjectManager — used to resolve the AnnotationManager
+        # for the user's notes / bookmarks tools. May be None when chat is
+        # constructed before a project is open.
+        self._project_manager = project_manager
         # `settings_provider` is a zero-arg callable returning the parsed
         # settings dict. Injected by web.server.create_app so the service
         # always sees the latest active_provider / model selection.
@@ -396,6 +467,26 @@ class ChatService:
             from apollo.graph.query import GraphQuery
             self._query = GraphQuery(self.graph)
         return self._query
+
+    def _get_annotation_manager(self):
+        """Return an `AnnotationManager` for the active project, or None.
+
+        Returns None when there is no project open or no project_manager
+        was injected — caller should treat that as "no annotations".
+        """
+        pm = self._project_manager
+        if pm is None:
+            return None
+        if not getattr(pm, "manifest", None) or not getattr(pm, "root_dir", None):
+            return None
+        try:
+            from apollo.projects.annotations import AnnotationManager
+            return AnnotationManager(
+                project_root=pm.root_dir,
+                project_id=pm.manifest.project_id,
+            )
+        except Exception:
+            return None
 
     # ── Tool execution ─────────────────────────────────────────────
 
@@ -552,6 +643,40 @@ class ChatService:
                 return json.dumps({"error": str(e), "expected_md5": e.expected, "actual_md5": e.actual, "status": 409})
             except file_inspect.FileAccessError as e:
                 return json.dumps({"error": str(e), "status": e.status_code})
+
+        elif name in ("list_notes", "notes_by_target", "notes_by_tag"):
+            mgr = self._get_annotation_manager()
+            if mgr is None:
+                return json.dumps({
+                    "annotations": [],
+                    "note": "No project is open; the user has no annotations yet.",
+                })
+            try:
+                if name == "list_notes":
+                    items = mgr.list_all()
+                    type_filter = args.get("type")
+                    if type_filter:
+                        items = [a for a in items if a.type == type_filter]
+                    items = sorted(items, key=lambda a: a.created_at, reverse=True)
+                    limit = int(args.get("limit", 25) or 25)
+                    items = items[:limit]
+                elif name == "notes_by_target":
+                    file = args.get("file")
+                    node = args.get("node")
+                    if not file and not node:
+                        return json.dumps({"error": "Provide either `file` or `node`."})
+                    items = mgr.find_by_target_file(file) if file else mgr.find_by_target_node(node)
+                else:  # notes_by_tag
+                    tag = args.get("tag")
+                    if not tag:
+                        return json.dumps({"error": "`tag` is required."})
+                    items = mgr.find_by_tag(tag)
+                return json.dumps(
+                    {"annotations": [a.to_dict() for a in items]},
+                    default=str,
+                )
+            except Exception as e:
+                return json.dumps({"error": f"annotation lookup failed: {e}"})
 
         elif name == "get_wordcloud":
             from collections import defaultdict

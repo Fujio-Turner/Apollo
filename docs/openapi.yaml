@@ -19,6 +19,12 @@ tags:
   - name: Search
   - name: Files
     description: Read-only file inspection (Phase 12.3a)
+  - name: Annotations
+    description: >
+      User-authored highlights, **notes**, **bookmarks**, and tags attached
+      to either a file range or a graph node. Backed by
+      `<project>/_apollo/annotations.json`. Powers the **Notes & Bookmarks**
+      tab in the My Hub Content panel.
   - name: Settings
   - name: Chat
   - name: Images
@@ -893,6 +899,275 @@ paths:
                     type: string
                     enum: [stopped, not_running]
 
+  # ── Annotations (Notes & Bookmarks) ─────────────────────────────────
+  /api/annotations:
+    get:
+      operationId: listAnnotations
+      tags: [Annotations]
+      summary: List all annotations (highlights, notes, bookmarks, tags)
+      description: >
+        Returns every annotation in the active project, newest first.
+        Use this to give an AI assistant the user's own **notes** and
+        **bookmarks** alongside graph data — each annotation's
+        `target` field links it to either a file path or a graph node ID,
+        which can then be expanded with `/api/node/{node_id}` or
+        `/api/neighbors/{node_id}` for relationship context.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: Optional type filter.
+          schema:
+            type: string
+            enum: [highlight, bookmark, note, tag]
+      responses:
+        "200":
+          description: List of annotations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [annotations]
+                properties:
+                  annotations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Annotation"
+
+  /api/annotations/create:
+    post:
+      operationId: createAnnotation
+      tags: [Annotations]
+      summary: Create a new annotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnnotationCreate"
+      responses:
+        "200":
+          description: Created annotation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Annotation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /api/annotations/by-target:
+    get:
+      operationId: annotationsByTarget
+      tags: [Annotations]
+      summary: Find annotations attached to a file path or graph node
+      description: >
+        Provide exactly one of `file` or `node`. Useful for joining
+        notes to graph context — e.g. fetch every note attached to
+        a node returned by `search_graph`.
+      parameters:
+        - name: file
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Project-relative file path.
+        - name: node
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Graph node ID, e.g. `func::src/main.py::main`.
+      responses:
+        "200":
+          description: Matching annotations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [annotations]
+                properties:
+                  annotations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Annotation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/annotations/by-tag:
+    get:
+      operationId: annotationsByTag
+      tags: [Annotations]
+      summary: Find annotations carrying a given tag
+      parameters:
+        - name: tag
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matching annotations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [annotations]
+                properties:
+                  annotations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Annotation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/annotations/collections:
+    get:
+      operationId: listAnnotationCollections
+      tags: [Annotations]
+      summary: List annotation collections
+      responses:
+        "200":
+          description: All collections in the active project
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [collections]
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AnnotationCollection"
+    post:
+      operationId: createAnnotationCollection
+      tags: [Annotations]
+      summary: Create an annotation collection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                annotation_ids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Created collection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnnotationCollection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /api/annotations/collections/{collection_id}:
+    delete:
+      operationId: deleteAnnotationCollection
+      tags: [Annotations]
+      summary: Delete an annotation collection
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deletion confirmation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/annotations/{annotation_id}:
+    get:
+      operationId: getAnnotation
+      tags: [Annotations]
+      summary: Get a single annotation
+      parameters:
+        - name: annotation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Annotation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Annotation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateAnnotation
+      tags: [Annotations]
+      summary: Update an annotation
+      parameters:
+        - name: annotation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnnotationUpdate"
+      responses:
+        "200":
+          description: Updated annotation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Annotation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteAnnotation
+      tags: [Annotations]
+      summary: Delete an annotation
+      parameters:
+        - name: annotation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deletion confirmation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
 # ════════════════════════════════════════════════════════════════════════
 components:
   schemas:
@@ -1404,6 +1679,148 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ChatMessage"
+
+    # ── Annotations (Notes & Bookmarks) ───────────────────────────────
+    AnnotationTarget:
+      type: object
+      description: >
+        Where the annotation is anchored. Either a project-relative file
+        path or a graph node ID.
+      required: [type]
+      oneOf:
+        - required: [type, file_path]
+          properties:
+            type:
+              type: string
+              enum: [file]
+            file_path:
+              type: string
+              description: Project-relative path.
+        - required: [type, node_id]
+          properties:
+            type:
+              type: string
+              enum: [node]
+            node_id:
+              type: string
+              description: Graph node ID, e.g. `func::src/main.py::main`.
+
+    HighlightRange:
+      type: object
+      required: [start_line, end_line]
+      properties:
+        start_line:
+          type: integer
+        end_line:
+          type: integer
+        start_col:
+          type: integer
+        end_col:
+          type: integer
+
+    Annotation:
+      type: object
+      required: [id, type, target, created_at]
+      properties:
+        id:
+          type: string
+          description: Unique annotation ID, e.g. `an::a1b2c3d4e5f60718`.
+        type:
+          type: string
+          enum: [highlight, bookmark, note, tag]
+        target:
+          $ref: "#/components/schemas/AnnotationTarget"
+        created_at:
+          type: string
+          format: date-time
+        content:
+          type:
+            - string
+            - "null"
+          description: Free-form note text (markdown allowed).
+        tags:
+          type: array
+          items:
+            type: string
+        color:
+          type:
+            - string
+            - "null"
+          enum: [red, yellow, green, blue, purple, gray, null]
+        highlight_range:
+          $ref: "#/components/schemas/HighlightRange"
+        stale:
+          type: boolean
+          description: True if the target file or node no longer exists in the index.
+        last_modified_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+
+    AnnotationCreate:
+      type: object
+      required: [type, target]
+      properties:
+        type:
+          type: string
+          enum: [highlight, bookmark, note, tag]
+        target:
+          $ref: "#/components/schemas/AnnotationTarget"
+        content:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        color:
+          type: string
+          enum: [red, yellow, green, blue, purple, gray]
+        highlight_range:
+          $ref: "#/components/schemas/HighlightRange"
+
+    AnnotationUpdate:
+      type: object
+      description: Any subset of fields. Omitted fields are left unchanged.
+      properties:
+        type:
+          type: string
+          enum: [highlight, bookmark, note, tag]
+        target:
+          $ref: "#/components/schemas/AnnotationTarget"
+        content:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        color:
+          type: string
+          enum: [red, yellow, green, blue, purple, gray]
+        highlight_range:
+          $ref: "#/components/schemas/HighlightRange"
+        stale:
+          type: boolean
+
+    AnnotationCollection:
+      type: object
+      required: [id, name, annotation_ids, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type:
+            - string
+            - "null"
+        annotation_ids:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
 
   responses:
     BadRequest:

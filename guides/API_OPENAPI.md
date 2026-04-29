@@ -117,6 +117,8 @@ Every endpoint belongs to exactly one tag. Tags group endpoints in the docs UI a
 | Indexing | `/api/index*` | Create, delete, monitor indexes |
 | Graph | `/api/graph`, `/api/node`, `/api/wordcloud`, `/api/stats` | Graph data retrieval |
 | Search | `/api/search` | Semantic and keyword search |
+| Files | `/api/file/*`, `/api/project/search` | Read-only file inspection |
+| Annotations | `/api/annotations*` | User-authored highlights, **notes**, **bookmarks**, tags & collections (Notes & Bookmarks tab) |
 | Settings | `/api/settings` | API keys and chat config |
 | Chat | `/api/chat*` | AI chat, threads, history |
 | Images | `/api/image/*` | Image generation |
