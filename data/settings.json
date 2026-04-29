@@ -1,6 +1,26 @@
 {
   "chat": {
-    "default_model": "grok-4-1-fast-non-reasoning"
+    "default_model": "grok-4-1-fast-non-reasoning",
+    "active_provider": "xai",
+    "providers": {
+      "xai": {
+        "model": "grok-4-1-fast-non-reasoning"
+      },
+      "openai": {
+        "model": "gpt-4o-mini"
+      },
+      "gemini": {
+        "model": "gemini-2.5-flash"
+      },
+      "anthropic": {
+        "model": "claude-3-5-sonnet-latest"
+      },
+      "llama": {
+        "model": "llama-3.3-70b-versatile"
+      }
+    },
+    "max_tool_rounds": 5,
+    "streaming": true
   },
   "default_backend": "json",
   "cblite_storage_root": null,
@@ -8,19 +28,19 @@
   "plugins": {
     "html5": {
       "installed": true,
-      "description": "HTML5 plugin for Apollo. Uses the Python standard library `html.parser` (zero third-party deps) to extract `<title>`, h1\u2013h6 sections with parent/child hierarchy, anchor and image links, inline `<script>` / `<style>` code blocks, and `<meta>` tags from `.html` / `.htm` / `.xhtml` files.",
-      "version": "1.0.0",
+      "description": "HTML5 plugin for Apollo. Uses the Python standard library `html.parser` (zero third-party deps) to extract `<title>`, h1\u2013h6 sections with body text and parent/child hierarchy, asset import edges (`<script src>`, `<link rel=stylesheet>`, `<img>`, `<iframe>`, `<source>`), inline `<script>` / `<style>` / `<pre><code class=\"language-\u2026\">` code blocks, anchor + image links, `<meta>` tags, and tagged `<!-- TODO/FIXME -->` HTML comments from `.html` / `.htm` / `.xhtml` files.",
+      "version": "1.1.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/html5",
       "author": "Fujio Turner",
-      "sha256": "a582d458c78333549ca1022299c88db11c1db902f380cc38adff44ff6d1abd68"
+      "sha256": "0c1441d8b6cccf085821d3de626ae12f99786a3ffd60488dd041d2e46d163646"
     },
     "markdown_gfm": {
       "installed": true,
-      "description": "GitHub Flavored Markdown plugin for Apollo. Uses `mistune` (with the `table` and `task_lists` extensions) plus `python-frontmatter` to extract sections, code blocks, links, tables, task items, and YAML/TOML frontmatter.",
-      "version": "1.0.0",
+      "description": "GitHub Flavored Markdown plugin for Apollo. Uses `mistune` (with the `table` and `task_lists` extensions) plus `python-frontmatter` to extract sections (with body content, parent/child hierarchy, and anchor ids), code blocks, links, cross-doc imports, `[[wikilinks]]`, GFM/MkDocs/Pandoc callouts, tagged TODO/FIXME comments, tables, task items, and YAML/TOML frontmatter from `.md` / `.markdown` files.",
+      "version": "1.1.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/markdown_gfm",
       "author": "Fujio Turner",
-      "sha256": "116c8d0932313cc0fc48df05af85844fc3b9a0921c04d2ec67615642d70ddeee"
+      "sha256": "b789a01c51d6d40ea75897bbb50e5faceedda1dffde1552e75730250bd2b3bd1"
     },
     "pdf_pypdf": {
       "installed": true,
@@ -38,5 +58,38 @@
       "author": "Fujio Turner",
       "sha256": "c9a2bdca3a7229c6046b5223a02bba41fe4d675057dadd7f99450bd726519aa7"
     }
-  }
+  },
+  "appearance": {
+    "theme": "dark"
+  },
+  "graph": {
+    "default_depth": 20,
+    "edge_cap_multiplier": 3,
+    "animation_threshold": 500
+  },
+  "indexing": {
+    "exclude_globs": [],
+    "extra_skip_dirs": [],
+    "embedding_batch_size": 256,
+    "embedding_min_text_length": 40
+  },
+  "reindex": {
+    "strategy": "auto",
+    "sweep_interval_minutes": 30,
+    "sweep_on_session_start": true,
+    "local_max_hops": 1,
+    "force_full_after_runs": 50
+  },
+  "captures": {
+    "folder": "_apollo_web"
+  },
+  "logging": {
+    "path": "",
+    "level": "INFO",
+    "json_mode": false,
+    "max_size_mb": 100,
+    "max_age_days": 7,
+    "rotated_total_mb": 1024
+  },
+  "last_open_project": "/Users/fujioturner/Documents/git_folders/fujio-turner/sg-log-reader-demo"
 }

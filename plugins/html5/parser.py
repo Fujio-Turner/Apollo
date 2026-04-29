@@ -2,10 +2,10 @@
 plugins.html5 — HTML5 plugin for Apollo
 =======================================
 
-This plugin parses HTML5 documents (``.html`` / ``.htm``) into Apollo's
-structured result dictionary so that web pages, generated docs, and
-static-site output can be indexed, searched, and visualized alongside
-source code, Markdown, and PDFs.
+This plugin parses HTML5 documents (``.html`` / ``.htm`` / ``.xhtml``)
+into Apollo's structured result dictionary so that web pages, generated
+docs, and static-site output can be indexed, searched, and visualized
+alongside source code, Markdown, and PDFs.
 
 It uses the **standard library's** :mod:`html.parser` so the plugin has
 zero third-party dependencies and works out of the box on any Python
@@ -20,17 +20,17 @@ For every parseable HTML file, :meth:`HtmlParser.parse_source` returns a
 
     {
         "file":         str,
-        # Required "code-shape" keys are kept empty so the result plugs
-        # cleanly into pipelines that expect them.
+        # Code-shape keys (matches python3 / markdown_gfm schema):
         "functions":    [],
         "classes":      [],
-        "imports":      [],
+        "imports":      [ {module, alias, line, kind} ],
         "variables":    [],
+        "comments":     [ {tag, content, line} ],
         # HTML-specific keys:
         "documents":    [ {name, doc_type, content,
                            line_start, line_end} ],
         "sections":     [ {name, level, line_start, line_end,
-                           parent_section} ],
+                           content, parent_section} ],
         "code_blocks":  [ {language, content,
                            line_start, line_end} ],
         "links":        [ {url, text, is_image, line, link_type} ],
@@ -40,17 +40,27 @@ For every parseable HTML file, :meth:`HtmlParser.parse_source` returns a
 
 Design notes
 ------------
-* **Whole document for embeddings.** Like the Markdown and PDF plugins,
-  we always emit a single ``documents`` entry containing the full raw
-  HTML so the embedding pipeline gets something to index. The
-  structured fields above are what the graph and UI consume.
-* **Section hierarchy.** ``h1``–``h6`` headings are treated as sections
-  with parent/child nesting computed via a stack-based walk, mirroring
-  the Markdown plugin's behaviour.
-* **Code blocks.** ``<script>`` and ``<style>`` blocks are emitted as
-  ``code_blocks`` with ``language`` set to the inferred MIME / language
-  (``"javascript"``, ``"css"``, …) so a web page's inline assets are
-  searchable too.
+* **Document content is visible text, not raw HTML.** The embedding
+  pipeline indexes ``documents[0].content``. Indexing tag soup wastes
+  tokens on ``<div class="...">`` boilerplate, so we strip scripts,
+  styles, and tags and keep the user-visible text instead.
+* **Section content carries real text.** ``h1``–``h6`` headings are
+  treated as sections with parent/child nesting computed via a
+  stack-based walk. Each section's ``content`` is the visible text
+  between that heading and the next same-or-shallower heading — making
+  per-section search and embeddings actually useful.
+* **Imports = the asset graph.** ``<script src>``, ``<link rel=stylesheet>``,
+  ``<img src>``, ``<iframe src>``, and ``<source src>`` are emitted as
+  ``imports`` so the graph builder can draw HTML→CSS / HTML→JS /
+  HTML→image edges the same way it draws Python imports.
+* **Code blocks cover docs too.** ``<script>`` and ``<style>`` are
+  emitted as ``code_blocks`` (as before) and so are ``<pre><code class="language-…">``
+  blocks — the convention used by virtually every static-site generator,
+  rustdoc, sphinx, and friends — so embedded examples in API docs are
+  indexed with the right language.
+* **Comments mirror python3.** ``<!-- TODO: … -->`` / ``FIXME`` /
+  ``NOTE`` / ``HACK`` / ``XXX`` HTML comments are picked up by the same
+  regex pattern python3 uses, into the same ``comments`` shape.
 * **Failure mode is silent.** Files larger than ``_MAX_FILE_SIZE`` and
   unreadable files return ``None`` — the caller falls back to the
   generic text indexer.
@@ -58,6 +68,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+import re
 from html.parser import HTMLParser as _StdlibHTMLParser
 from pathlib import Path
 
@@ -83,7 +94,36 @@ _HEADING_TAGS: frozenset[str] = frozenset(
 )
 
 # Tags whose textual content we want to surface as code blocks.
-_CODE_TAGS: frozenset[str] = frozenset({"script", "style"})
+# ``pre`` is added so ``<pre><code class="language-…">`` blocks (the
+# convention used by static-site generators) are indexed too.
+_CODE_TAGS: frozenset[str] = frozenset({"script", "style", "pre"})
+
+# Same TODO/FIXME pattern as the python3 plugin so consumers can match
+# tagged HTML comments and tagged Python comments uniformly.
+_HTML_COMMENT_TAG_RE = re.compile(
+    r"\b(TODO|FIXME|NOTE|HACK|XXX)\b[:\s]*(.*)", re.IGNORECASE
+)
+
+# Pulls "rust" out of class="language-rust foo" / "lang-rust" / etc.
+# Used for ``<pre><code class="language-…">`` blocks.
+_CODE_LANG_CLASS_RE = re.compile(r"\b(?:language|lang)-([\w+\-]+)")
+
+# Tags whose raw contents must NOT bleed into per-section ``content`` or
+# the visible-text ``documents`` body. Script and style are code, not
+# prose; including their bodies would pollute embeddings.
+_NON_TEXT_TAGS: frozenset[str] = frozenset({"script", "style"})
+
+# Asset-bearing tags whose URL attribute creates a file-graph edge. The
+# value is the attribute name to read for the URL.
+_ASSET_TAGS: dict[str, str] = {
+    "script": "src",
+    "link": "href",
+    "img": "src",
+    "iframe": "src",
+    "source": "src",
+    "video": "src",
+    "audio": "src",
+}
 
 
 class HtmlParser(BaseParser):
@@ -105,12 +145,14 @@ class HtmlParser(BaseParser):
     -----------------------------------------------
     1. **Walk** — :class:`_HtmlCollector` (a small subclass of the
        stdlib HTML parser) feeds tokens to a single pass that records
-       headings, links, images, scripts/styles, meta tags, and the
-       ``<title>``.
-    2. **Section hierarchy** — headings are post-processed with a stack
-       walk so each section knows its ``parent_section``.
+       headings, links, images, scripts/styles/pres, asset references,
+       meta tags, HTML comments, and the ``<title>``.
+    2. **Section hierarchy & content** — sections are opened/closed by
+       the heading stack; visible text accumulates into every open
+       section so per-section search has real text to match on.
     3. **Document entry** — a whole-file ``documents`` entry is emitted
-       for the embeddings pipeline.
+       holding the *visible text* (not raw HTML) for the embeddings
+       pipeline.
     """
 
     # ------------------------------------------------------------------
@@ -165,18 +207,23 @@ class HtmlParser(BaseParser):
             logger.debug("html.parser raised on %s; skipping", filepath)
             return None
 
-        sections = _attach_parents(collector.headings)
+        sections = collector.sections
         code_blocks = collector.code_blocks
         links = collector.links
         meta = collector.meta
         title = collector.title
+        imports = collector.imports
+        comments = collector.comments
+        visible_text = _normalize_whitespace("".join(collector.text_chunks))
 
         total_lines = raw.count("\n") + 1
         documents = [
             {
                 "name": Path(filepath).name,
                 "doc_type": "html",
-                "content": raw,
+                # Visible text, not raw HTML — embeddings benefit hugely
+                # from not seeing tag soup. Raw HTML is still on disk.
+                "content": visible_text or raw,
                 "line_start": 1,
                 "line_end": total_lines,
             }
@@ -186,8 +233,9 @@ class HtmlParser(BaseParser):
             "file": filepath,
             "functions": [],
             "classes": [],
-            "imports": [],
+            "imports": imports,
             "variables": [],
+            "comments": comments,
             "documents": documents,
             "sections": sections,
             "code_blocks": code_blocks,
@@ -214,10 +262,13 @@ class _HtmlCollector(_StdlibHTMLParser):
         super().__init__(convert_charrefs=True)
 
         self.title: str | None = None
-        self.headings: list[dict] = []
+        self.sections: list[dict] = []
         self.links: list[dict] = []
         self.code_blocks: list[dict] = []
         self.meta: list[dict] = []
+        self.imports: list[dict] = []
+        self.comments: list[dict] = []
+        self.text_chunks: list[str] = []
 
         # Mutable state for nested tag tracking.
         self._in_title = False
@@ -228,7 +279,7 @@ class _HtmlCollector(_StdlibHTMLParser):
         self._heading_line: int | None = None
         self._heading_buf: list[str] = []
 
-        # When inside <script>/<style> we remember the language and line.
+        # When inside <script>/<style>/<pre> we remember language + line.
         self._code_tag: str | None = None
         self._code_lang: str | None = None
         self._code_line: int | None = None
@@ -239,6 +290,16 @@ class _HtmlCollector(_StdlibHTMLParser):
         self._anchor_line: int | None = None
         self._anchor_buf: list[str] = []
 
+        # Stack of currently-open sections; each is a *reference* into
+        # ``self.sections``. Visible text is appended to each open
+        # section's ``_buf`` so a section's content covers everything
+        # until the next same-or-shallower heading.
+        self._open_sections: list[dict] = []
+
+        # Suppression depth for "do not count this text as visible
+        # prose" — bumped while inside <script>/<style>.
+        self._non_text_depth = 0
+
     # ------------------------------------------------------------------
     # Tag handlers
     # ------------------------------------------------------------------
@@ -248,13 +309,25 @@ class _HtmlCollector(_StdlibHTMLParser):
         line, _ = self.getpos()
         attrs_dict = {k.lower(): (v or "") for k, v in attrs}
 
+        # Track suppression for visible-text accumulation.
+        if tag in _NON_TEXT_TAGS:
+            self._non_text_depth += 1
+
+        # Asset/import edges. Done first so it works regardless of any
+        # text-content state below.
+        self._maybe_emit_import(tag, attrs_dict, line)
+
         if tag == "title":
             self._in_title = True
             self._title_buf = []
             return
 
         if tag in _HEADING_TAGS:
-            self._heading_level = int(tag[1])
+            level = int(tag[1])
+            # Close any sections at this depth or deeper before the new
+            # heading opens, so their content stops at the right point.
+            self._close_sections_at_or_below(level, line - 1)
+            self._heading_level = level
             self._heading_line = line
             self._heading_buf = []
             return
@@ -272,8 +345,25 @@ class _HtmlCollector(_StdlibHTMLParser):
                     "application/javascript",
                 }:
                     self._code_lang = "javascript"
-            else:  # style
+            elif tag == "style":
                 self._code_lang = "css"
+            else:  # pre — language is not yet known; the inner <code>
+                # element's class usually carries it.
+                self._code_lang = None
+            return
+
+        # <code class="language-foo"> *inside* a <pre> we're already
+        # tracking — pick up the language hint and otherwise let the
+        # outer <pre> handle line tracking and buffering.
+        if (
+            tag == "code"
+            and self._code_tag == "pre"
+            and self._code_lang is None
+        ):
+            cls = attrs_dict.get("class", "")
+            m = _CODE_LANG_CLASS_RE.search(cls)
+            if m:
+                self._code_lang = m.group(1).lower()
             return
 
         if tag == "a":
@@ -331,15 +421,28 @@ class _HtmlCollector(_StdlibHTMLParser):
             self.title = "".join(self._title_buf).strip() or None
             self._in_title = False
             self._title_buf = []
+            # Title text is also visible text on most pages — the
+            # browser shows it in the tab. Skipping it here.
             return
 
         if tag in _HEADING_TAGS and self._heading_level is not None:
-            self.headings.append({
-                "name": "".join(self._heading_buf).strip(),
+            name = "".join(self._heading_buf).strip()
+            parent = (
+                self._open_sections[-1]["name"]
+                if self._open_sections
+                else None
+            )
+            sec = {
+                "name": name,
                 "level": self._heading_level,
                 "line_start": self._heading_line or line,
                 "line_end": line,
-            })
+                "content": "",
+                "parent_section": parent,
+                "_buf": [],
+            }
+            self.sections.append(sec)
+            self._open_sections.append(sec)
             self._heading_level = None
             self._heading_line = None
             self._heading_buf = []
@@ -347,17 +450,31 @@ class _HtmlCollector(_StdlibHTMLParser):
 
         if tag == self._code_tag and self._code_tag is not None:
             content = "".join(self._code_buf)
-            self.code_blocks.append({
-                "language": self._code_lang,
-                "content": content,
-                "line_start": self._code_line or line,
-                "line_end": line,
-            })
+            # Default <pre> with no language hint to "text" so the
+            # downstream consumer can still distinguish from prose.
+            language = self._code_lang or ("text" if tag == "pre" else None)
+            # External scripts (``<script src=...></script>``) have no
+            # inline content; skip them — they're already captured as
+            # an ``imports`` entry and an empty code block adds noise.
+            if content.strip():
+                self.code_blocks.append({
+                    "language": language,
+                    "content": content,
+                    "line_start": self._code_line or line,
+                    "line_end": line,
+                })
             self._code_tag = None
             self._code_lang = None
             self._code_line = None
             self._code_buf = []
+            if tag in _NON_TEXT_TAGS:
+                self._non_text_depth = max(0, self._non_text_depth - 1)
             return
+
+        # Close suppression for non-code non-text tags (e.g. </style>
+        # without a matching open — defensive).
+        if tag in _NON_TEXT_TAGS:
+            self._non_text_depth = max(0, self._non_text_depth - 1)
 
         if tag == "a" and self._anchor_href is not None:
             text = "".join(self._anchor_buf).strip()
@@ -380,8 +497,90 @@ class _HtmlCollector(_StdlibHTMLParser):
             self._heading_buf.append(data)
         if self._code_tag is not None:
             self._code_buf.append(data)
+            return  # don't double-count code body as section text
         if self._anchor_href is not None:
             self._anchor_buf.append(data)
+        # Visible-text accumulation: skip while inside <script>/<style>.
+        if self._non_text_depth == 0 and not self._in_title:
+            self.text_chunks.append(data)
+            # And feed every currently-open section's content buffer.
+            if self._heading_level is None:
+                for sec in self._open_sections:
+                    sec["_buf"].append(data)
+
+    def handle_comment(self, data: str) -> None:
+        line, _ = self.getpos()
+        m = _HTML_COMMENT_TAG_RE.search(data)
+        if not m:
+            return
+        self.comments.append({
+            "tag": m.group(1).upper(),
+            "content": m.group(2).strip(),
+            "line": line,
+        })
+
+    def close(self) -> None:
+        super().close()
+        # Flush any sections still open at EOF.
+        # Use a generous "line at EOF" so line_end is preserved as the
+        # last real heading-end line.
+        self._close_sections_at_or_below(0, line=None, eof=True)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _close_sections_at_or_below(
+        self, level: int, line: int | None, *, eof: bool = False
+    ) -> None:
+        """Pop sections whose level is ``>= level`` and finalise content."""
+        while self._open_sections and self._open_sections[-1]["level"] >= level:
+            sec = self._open_sections.pop()
+            sec["content"] = _normalize_whitespace(
+                "".join(sec.pop("_buf", []))
+            )
+            if not eof and line is not None and line > sec["line_end"]:
+                sec["line_end"] = line
+        # When called with level=0 at EOF, this empties the stack.
+        if eof:
+            while self._open_sections:
+                sec = self._open_sections.pop()
+                sec["content"] = _normalize_whitespace(
+                    "".join(sec.pop("_buf", []))
+                )
+
+    def _maybe_emit_import(
+        self, tag: str, attrs: dict[str, str], line: int
+    ) -> None:
+        """Record an asset reference as an ``imports`` entry, if any."""
+        attr = _ASSET_TAGS.get(tag)
+        if not attr:
+            return
+        url = attrs.get(attr, "").strip()
+        if not url:
+            return
+        # For <link> only treat real "asset"-y rels as imports — feeds,
+        # canonicals, alternates, etc. would be noisy edges.
+        if tag == "link":
+            rel = attrs.get("rel", "").lower()
+            if not any(r in rel for r in ("stylesheet", "preload", "modulepreload", "icon")):
+                return
+            kind = "stylesheet" if "stylesheet" in rel else rel.split()[0] if rel else "link"
+        elif tag == "script":
+            kind = "script"
+        elif tag == "img":
+            kind = "image"
+        elif tag == "iframe":
+            kind = "iframe"
+        else:  # source / video / audio
+            kind = "media"
+
+        self.imports.append({
+            "module": url,
+            "alias": None,
+            "line": line,
+            "kind": kind,
+        })
 
 
 # ======================================================================
@@ -404,29 +603,14 @@ def _classify_link(url: str) -> str:
     return "internal"
 
 
-def _attach_parents(headings: list[dict]) -> list[dict]:
-    """Stack-walk headings to populate each section's ``parent_section``.
+_WS_RE = re.compile(r"\s+")
 
-    A level-3 heading nests under the most recent shallower-level (e.g.
-    level-2 or level-1) heading, mirroring the Markdown plugin's
-    behaviour so the rest of Apollo can treat both the same way.
+
+def _normalize_whitespace(text: str) -> str:
+    """Collapse runs of whitespace to single spaces and strip ends.
+
+    HTML rendering treats most whitespace as collapsible; doing the same
+    here keeps section ``content`` and the visible-text ``documents``
+    body compact for embeddings.
     """
-    sections: list[dict] = []
-    parent_stack: list[tuple[int, str]] = []  # (level, name)
-
-    for h in headings:
-        while parent_stack and parent_stack[-1][0] >= h["level"]:
-            parent_stack.pop()
-        parent_section = parent_stack[-1][1] if parent_stack else None
-
-        sections.append({
-            "name": h["name"],
-            "level": h["level"],
-            "line_start": h["line_start"],
-            "line_end": h["line_end"],
-            "content": h["name"],
-            "parent_section": parent_section,
-        })
-        parent_stack.append((h["level"], h["name"]))
-
-    return sections
+    return _WS_RE.sub(" ", text).strip()

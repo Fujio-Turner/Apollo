@@ -21,23 +21,34 @@ returns a ``dict`` shaped like this::
 
     {
         "file":         str,
-        # The required "code-shape" keys are kept empty so the result
-        # plugs cleanly into pipelines that expect them.
+        # Code-shape keys (matches python3 / html5 schema):
         "functions":    [],
         "classes":      [],
-        "imports":      [],
+        "imports":      [ {module, alias, line, kind} ],
         "variables":    [],
+        "comments":     [ {tag, content, line} ],
         # Markdown-specific keys:
         "documents":    [ {name, doc_type, content, line_start, line_end} ],
         "sections":     [ {name, level, line_start, line_end, content,
-                           parent_section} ],
+                           parent_section, anchor} ],
         "code_blocks":  [ {language, content, line_start, line_end} ],
         "links":        [ {url, text, is_image, line, link_type} ],
+        "wikilinks":    [ {target, alias, line} ],
+        "callouts":     [ {kind, title, content,
+                           line_start, line_end} ],
         "tables":       [ {headers, rows, line_start, line_end} ],
         "task_items":   [ {text, checked, line} ],
         "frontmatter":  dict | None,   # YAML/TOML metadata block
         "title":        str | None,    # frontmatter "title" or first H1
     }
+
+Imports & the doc graph
+-----------------------
+Markdown's ``imports`` are the *cross-document graph*: relative links
+to ``other.md``, image/asset references, and ``[[wikilinks]]`` are all
+turned into ``imports`` entries with a ``kind`` ("doc", "image",
+"asset", "wikilink") so the graph builder draws doc→doc and doc→asset
+edges the same way it draws Python ``import`` edges.
 
 Design notes
 ------------
@@ -93,6 +104,53 @@ _MAX_FILE_SIZE = 1_048_576
 # Regex for locating a markdown heading line (used for line-number
 # recovery when mistune's AST doesn't carry line info).
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+
+# Wikilinks: ``[[target]]`` or ``[[target|alias]]``. Used by Obsidian,
+# Foam, GitHub wikis, and many other personal-knowledge-base systems.
+_WIKILINK_RE = re.compile(
+    r"\[\[([^\[\]|]+?)(?:\|([^\[\]]+?))?\]\]"
+)
+
+# Trailing ``{#anchor}`` on a heading line (kramdown / pandoc).
+_HEADING_ANCHOR_RE = re.compile(r"\s*\{#([\w\-]+)\}\s*$")
+
+# HTML comments — used for ``<!-- TODO: ... -->`` markers in prose.
+_HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
+
+# Same TODO/FIXME pattern as the python3 / html5 plugins so consumers
+# can find tagged comments uniformly across languages.
+_COMMENT_TAG_RE = re.compile(
+    r"\b(TODO|FIXME|NOTE|HACK|XXX)\b[:\s]*(.*)", re.IGNORECASE
+)
+_BLOCKQUOTE_TAG_RE = re.compile(
+    r"^\s*>\s*(TODO|FIXME|NOTE|HACK|XXX)\b[:\s]*(.*)$", re.IGNORECASE
+)
+
+# Callout / admonition flavours we recognise. All are case-insensitive.
+# GFM:    ``> [!NOTE] Optional title\n> body``
+# MkDocs: ``!!! warning "Optional title"\n    body``
+# Pandoc: ``:::note Optional title\nbody\n:::``
+_GFM_CALLOUT_RE = re.compile(
+    r"^\s*>\s*\[!(?P<kind>NOTE|TIP|WARNING|IMPORTANT|CAUTION|DANGER)\]"
+    r"(?:\s+(?P<title>.*))?$",
+    re.IGNORECASE,
+)
+_GFM_CALLOUT_BODY_RE = re.compile(r"^\s*>\s?(.*)$")
+_MKDOCS_CALLOUT_RE = re.compile(
+    r'^\s*!!!\s+(?P<kind>[\w\-]+)(?:\s+"(?P<title>[^"]*)")?\s*$'
+)
+_PANDOC_FENCE_OPEN_RE = re.compile(
+    r"^\s*:::\s*(?P<kind>[\w\-]+)(?:\s+(?P<title>.*))?$"
+)
+_PANDOC_FENCE_CLOSE_RE = re.compile(r"^\s*:::\s*$")
+
+# Extensions that map to typed import kinds for the graph layer.
+_IMPORT_DOC_EXTS: frozenset[str] = frozenset({".md", ".markdown"})
+_IMPORT_IMAGE_EXTS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp"}
+)
+_IMPORT_STYLE_EXTS: frozenset[str] = frozenset({".css", ".scss", ".less"})
+_IMPORT_SCRIPT_EXTS: frozenset[str] = frozenset({".js", ".mjs", ".ts", ".tsx"})
 
 
 class MarkdownParser(BaseParser):
@@ -212,6 +270,12 @@ class MarkdownParser(BaseParser):
         tables = self._extract_tables(ast_nodes, body, lines)
         task_items = self._extract_task_items(ast_nodes, body, lines)
 
+        # 4b. Markdown-native extras (regex-based, ignore code fences) ----
+        wikilinks = _extract_wikilinks(lines)
+        callouts = _extract_callouts(lines)
+        comments = _extract_comments(body, lines)
+        imports = _build_imports(links, wikilinks)
+
         # 5. Title --------------------------------------------------------
         title = self._derive_title(fm, sections)
 
@@ -231,12 +295,15 @@ class MarkdownParser(BaseParser):
             "file": filepath,
             "functions": [],
             "classes": [],
-            "imports": [],
+            "imports": imports,
             "variables": [],
+            "comments": comments,
             "documents": documents,
             "sections": sections,
             "code_blocks": code_blocks,
             "links": links,
+            "wikilinks": wikilinks,
+            "callouts": callouts,
             "tables": tables,
             "task_items": task_items,
             "frontmatter": fm,
@@ -257,10 +324,16 @@ class MarkdownParser(BaseParser):
             text = _collect_text(node)
             level = node["attrs"]["level"]
             line_start = _find_heading_line(lines, level, text)
+            # Strip an explicit ``{#anchor}`` suffix from the heading
+            # name (kramdown / pandoc style) and remember it; otherwise
+            # auto-slug the heading text the way GitHub does so anchor
+            # links resolve against the same id either way.
+            name, anchor = _split_heading_anchor(text)
             headings.append({
-                "name": text,
+                "name": name,
                 "level": level,
                 "line_start": line_start,
+                "anchor": anchor,
             })
 
         if not headings:
@@ -301,6 +374,7 @@ class MarkdownParser(BaseParser):
                 "line_end": line_end,
                 "content": content,
                 "parent_section": parent_section,
+                "anchor": h["anchor"],
             })
 
         return sections
@@ -510,6 +584,290 @@ def _find_text_line(lines: list[str], text: str) -> int:
         if text in line:
             return idx + 1
     return 1
+
+
+def _iter_non_code_lines(lines: list[str]):
+    """Yield ``(idx, line)`` for lines that are *not* inside a fenced
+    code block.
+
+    All the regex-based extractors below skip code fences so a
+    ``[[wikilink]]`` example in a code block doesn't get mistaken for
+    a real link, etc.
+    """
+    in_code = False
+    fence: str | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not in_code:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_code = True
+                fence = stripped[:3]
+                continue
+            yield idx, line
+        else:
+            if fence is not None and stripped.startswith(fence):
+                in_code = False
+                fence = None
+            continue
+
+
+def _extract_wikilinks(lines: list[str]) -> list[dict]:
+    """Find ``[[target]]`` / ``[[target|alias]]`` outside code fences."""
+    out: list[dict] = []
+    for idx, line in _iter_non_code_lines(lines):
+        for m in _WIKILINK_RE.finditer(line):
+            target = m.group(1).strip()
+            alias = (m.group(2) or "").strip() or None
+            out.append({
+                "target": target,
+                "alias": alias,
+                "line": idx + 1,
+            })
+    return out
+
+
+def _extract_comments(body: str, lines: list[str]) -> list[dict]:
+    """Find tagged comments — ``<!-- TODO: … -->`` and ``> TODO:`` —
+    using the same tag set as the python3 / html5 plugins.
+    """
+    out: list[dict] = []
+
+    # 1. HTML comments anywhere in the body.
+    for m in _HTML_COMMENT_RE.finditer(body):
+        inner = m.group(1)
+        line = body[: m.start()].count("\n") + 1
+        tag_m = _COMMENT_TAG_RE.search(inner)
+        if tag_m:
+            out.append({
+                "tag": tag_m.group(1).upper(),
+                "content": tag_m.group(2).strip(),
+                "line": line,
+            })
+
+    # 2. Tagged blockquote lines (``> TODO: …``) outside code fences.
+    for idx, line in _iter_non_code_lines(lines):
+        m = _BLOCKQUOTE_TAG_RE.match(line)
+        if m:
+            out.append({
+                "tag": m.group(1).upper(),
+                "content": m.group(2).strip(),
+                "line": idx + 1,
+            })
+
+    return out
+
+
+def _extract_callouts(lines: list[str]) -> list[dict]:
+    """Find admonition / callout blocks in three common flavours.
+
+    Recognised flavours:
+
+    * **GFM** — ``> [!NOTE] Optional title`` followed by ``> body``
+      lines (GitHub, Obsidian).
+    * **MkDocs** — ``!!! warning "Optional title"`` followed by
+      4-space-indented body lines.
+    * **Pandoc** — ``:::note Optional title`` … ``:::`` fenced block.
+
+    Each entry carries ``kind`` (upper-cased), an optional ``title``,
+    the inner ``content`` as plain text, and ``line_start`` / ``line_end``.
+    """
+    out: list[dict] = []
+
+    # We want to skip code-fence regions but still need indices, so
+    # walk manually and track fence state.
+    in_code = False
+    fence: str | None = None
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        if not in_code and (stripped.startswith("```") or stripped.startswith("~~~")):
+            in_code = True
+            fence = stripped[:3]
+            i += 1
+            continue
+        if in_code:
+            if fence is not None and stripped.startswith(fence):
+                in_code = False
+                fence = None
+            i += 1
+            continue
+
+        # ---- GFM: > [!NOTE] ... -------------------------------------
+        m = _GFM_CALLOUT_RE.match(line)
+        if m:
+            kind = m.group("kind").upper()
+            title = (m.group("title") or "").strip() or None
+            line_start = i + 1
+            j = i + 1
+            content_lines: list[str] = []
+            while j < len(lines):
+                bq = _GFM_CALLOUT_BODY_RE.match(lines[j])
+                if not bq:
+                    break
+                content_lines.append(bq.group(1))
+                j += 1
+            out.append({
+                "kind": kind,
+                "title": title,
+                "content": "\n".join(content_lines).strip(),
+                "line_start": line_start,
+                "line_end": j,
+            })
+            i = j
+            continue
+
+        # ---- MkDocs: !!! kind "title" -------------------------------
+        m = _MKDOCS_CALLOUT_RE.match(line)
+        if m:
+            kind = m.group("kind").upper()
+            title = (m.group("title") or "").strip() or None
+            line_start = i + 1
+            j = i + 1
+            content_lines = []
+            while j < len(lines):
+                ln = lines[j]
+                if not ln.strip():
+                    content_lines.append("")
+                    j += 1
+                    continue
+                if ln.startswith("    "):
+                    content_lines.append(ln[4:])
+                    j += 1
+                elif ln.startswith("\t"):
+                    content_lines.append(ln[1:])
+                    j += 1
+                else:
+                    break
+            while content_lines and not content_lines[-1].strip():
+                content_lines.pop()
+            out.append({
+                "kind": kind,
+                "title": title,
+                "content": "\n".join(content_lines).strip(),
+                "line_start": line_start,
+                "line_end": j,
+            })
+            i = j
+            continue
+
+        # ---- Pandoc-fenced: :::kind ... ::: -------------------------
+        if not _PANDOC_FENCE_CLOSE_RE.match(line):
+            m = _PANDOC_FENCE_OPEN_RE.match(line)
+            if m:
+                kind = m.group("kind").upper()
+                title = (m.group("title") or "").strip() or None
+                line_start = i + 1
+                j = i + 1
+                content_lines = []
+                while j < len(lines):
+                    if _PANDOC_FENCE_CLOSE_RE.match(lines[j]):
+                        j += 1
+                        break
+                    content_lines.append(lines[j])
+                    j += 1
+                out.append({
+                    "kind": kind,
+                    "title": title,
+                    "content": "\n".join(content_lines).strip(),
+                    "line_start": line_start,
+                    "line_end": j,
+                })
+                i = j
+                continue
+
+        i += 1
+
+    return out
+
+
+def _split_heading_anchor(text: str) -> tuple[str, str]:
+    """Return ``(clean_name, anchor_id)`` for a heading.
+
+    If the heading text ends in ``{#explicit-id}`` (kramdown / pandoc),
+    that id is used and stripped from the name. Otherwise the anchor
+    is the GitHub-style auto-slug of the cleaned name.
+    """
+    m = _HEADING_ANCHOR_RE.search(text)
+    if m:
+        clean = text[: m.start()].rstrip()
+        return clean, m.group(1)
+    return text, _slugify(text)
+
+
+def _slugify(text: str) -> str:
+    """GitHub-style slug: lowercase, drop punctuation, spaces → hyphens.
+
+    Not a perfect match for GitHub's algorithm in every edge case (which
+    is itself underspecified), but it is good enough that round-tripping
+    a heading through this function produces stable ids for the common
+    cases.
+    """
+    s = text.strip().lower()
+    # Drop everything that isn't word-char, whitespace, or hyphen.
+    s = re.sub(r"[^\w\s\-]", "", s, flags=re.UNICODE)
+    # Whitespace runs → single hyphen.
+    s = re.sub(r"\s+", "-", s)
+    # Collapse repeated hyphens.
+    s = re.sub(r"-+", "-", s)
+    return s.strip("-")
+
+
+def _classify_import(url: str, is_image: bool) -> str | None:
+    """Decide whether *url* is an import edge, and what kind.
+
+    Returns one of ``"doc"``, ``"image"``, ``"stylesheet"``,
+    ``"script"``, ``"asset"``, or ``None`` when the link should *not*
+    be promoted to ``imports`` (external URLs, anchors, mail links).
+    """
+    if not url:
+        return None
+    lower = url.lower()
+    if lower.startswith(("http://", "https://", "//", "mailto:", "tel:", "#")):
+        return None
+    # Strip a query/fragment before extension matching.
+    path_part = url.split("#", 1)[0].split("?", 1)[0].lower()
+    ext = ""
+    dot = path_part.rfind(".")
+    slash = max(path_part.rfind("/"), path_part.rfind("\\"))
+    if dot > slash:
+        ext = path_part[dot:]
+    if ext in _IMPORT_DOC_EXTS:
+        return "doc"
+    if is_image or ext in _IMPORT_IMAGE_EXTS:
+        return "image"
+    if ext in _IMPORT_STYLE_EXTS:
+        return "stylesheet"
+    if ext in _IMPORT_SCRIPT_EXTS:
+        return "script"
+    return "asset"
+
+
+def _build_imports(
+    links: list[dict], wikilinks: list[dict],
+) -> list[dict]:
+    """Promote relative links + wikilinks to typed import edges."""
+    out: list[dict] = []
+    for link in links:
+        kind = _classify_import(link.get("url", ""), link.get("is_image", False))
+        if kind is None:
+            continue
+        out.append({
+            "module": link["url"],
+            "alias": None,
+            "line": link["line"],
+            "kind": kind,
+        })
+    for wl in wikilinks:
+        out.append({
+            "module": wl["target"],
+            "alias": wl["alias"],
+            "line": wl["line"],
+            "kind": "wikilink",
+        })
+    return out
 
 
 def _find_block_lines(

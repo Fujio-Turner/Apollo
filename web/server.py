@@ -148,6 +148,27 @@ def _save_settings(settings):
         json_mod.dump(settings, f, indent=2)
 
 
+def _record_last_project(path):
+    """Persist the absolute path of the most recently opened project so we
+    can auto-restore it on server restart. Used to keep project-scoped
+    features (annotations, etc.) working without forcing the user to
+    re-open the folder via the UI after every restart."""
+    try:
+        settings = _load_settings()
+        settings["last_open_project"] = str(path)
+        _save_settings(settings)
+    except Exception:
+        # Best-effort; never block project open on a settings write failure.
+        pass
+
+
+def _get_last_project():
+    try:
+        return _load_settings().get("last_open_project") or None
+    except Exception:
+        return None
+
+
 def _mask_key(key: str) -> str:
     if not key or len(key) < 8:
         return "***" if key else ""
@@ -203,7 +224,24 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     
     # Initialize ProjectManager for project lifecycle management
     project_manager = ProjectManager(version=version)
-    
+
+    # Auto-open the project on startup so project-scoped features
+    # (annotations, etc.) work without forcing the user to re-open the
+    # folder via the UI after every restart. We try, in order:
+    #   1) the directory the server was launched against (--watch-dir)
+    #   2) the path recorded in settings.json by the previous session
+    # Either path needs an `_apollo/apollo.json` manifest to count.
+    from pathlib import Path as _Path
+    _candidates = [p for p in (root_dir, _get_last_project()) if p]
+    for _candidate in _candidates:
+        try:
+            if (_Path(_candidate) / "_apollo" / "apollo.json").exists():
+                project_manager.open(_candidate)
+                _record_last_project(_candidate)
+                break
+        except Exception:
+            logger.exception("failed to auto-open project at startup for %s", _candidate)
+
     # Initialize ReindexService for background graph freshness
     reindex_service: Optional[ReindexService] = None
     if root_dir:
@@ -358,7 +396,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logging.warning(f"Failed to start reindex service: {e}")
 
     # ── Register project management routes ────────────────────────
-    register_project_routes(app, project_manager, store, backend)
+    register_project_routes(app, project_manager, store, backend, on_project_open=_record_last_project)
 
     # ------------------------------------------------------------------ API --
 
@@ -439,6 +477,21 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         # build relative paths (e.g. "graph/query.py" instead of the full
         # absolute path) regardless of which directory nodes were indexed.
         root_dir = target
+
+        # Ensure a project manifest is bound to this target so project-scoped
+        # endpoints (annotations, etc.) work even when /api/index is called
+        # without going through /api/projects/open first.
+        try:
+            already_open = (
+                project_manager.manifest is not None
+                and project_manager.root_dir is not None
+                and os.path.abspath(str(project_manager.root_dir)) == os.path.abspath(target)
+            )
+            if not already_open:
+                project_manager.open(target)
+            _record_last_project(target)
+        except Exception:
+            logger.exception("failed to auto-open project for %s", target)
 
         _indexing_status = {
             "active": True,
