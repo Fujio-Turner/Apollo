@@ -33,10 +33,14 @@ an explicit list to ``GraphBuilder`` instead.
 from __future__ import annotations
 
 import importlib
+import inspect
+import logging
 import pkgutil
 from typing import Iterator
 
 from apollo.parser.base import BaseParser
+
+logger = logging.getLogger(__name__)
 
 # Names that look like plugins to ``pkgutil.iter_modules`` but aren't.
 _NON_PLUGIN_NAMES: frozenset[str] = frozenset()
@@ -58,24 +62,73 @@ def iter_plugin_modules() -> Iterator[str]:
         yield f"{__name__}.{info.name}"
 
 
+def _accepts_config_kwarg(plugin_cls: type) -> bool:
+    """Return ``True`` if ``plugin_cls.__init__`` accepts a ``config`` kwarg.
+
+    We use this so old plugins (whose ``__init__`` takes no arguments)
+    keep working without modification, while new plugins can opt in to
+    receiving their merged config dict.
+    """
+    try:
+        sig = inspect.signature(plugin_cls.__init__)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "config" in params:
+        return True
+    # ``**kwargs`` is also acceptable since the plugin can pluck config out.
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def discover_plugins() -> list[BaseParser]:
     """Import every plugin module and instantiate its ``PLUGIN`` class.
 
     Returns a list of fresh ``BaseParser`` instances, one per plugin.
     Modules without a valid ``PLUGIN`` attribute are skipped silently.
+
+    Each plugin is given its **merged config** (see
+    :func:`apollo.projects.settings.load_plugin_config`) at construction
+    time when the constructor accepts a ``config`` kwarg. Plugins
+    whose merged config has ``"enabled": False`` are skipped entirely
+    so they never appear in the parser list and their ignore set is
+    not contributed to the indexer.
     """
+    # Local import to avoid a circular dependency: apollo.projects depends
+    # on this package being importable.
+    from apollo.projects.settings import load_plugin_config
+
     parsers: list[BaseParser] = []
     for module_name in iter_plugin_modules():
         try:
             mod = importlib.import_module(module_name)
         except Exception:
+            logger.exception("failed to import plugin module %s", module_name)
             continue
         plugin_cls = getattr(mod, "PLUGIN", None)
         if plugin_cls is None:
             continue
+
+        # Plugin name is the last component of the module path.
+        short_name = module_name.rsplit(".", 1)[-1]
+
         try:
-            instance = plugin_cls()
+            merged_config = load_plugin_config(short_name)
         except Exception:
+            logger.exception("failed to load config for plugin %s", short_name)
+            merged_config = {}
+
+        # Skip plugins explicitly disabled in config or user overrides.
+        if merged_config.get("enabled") is False:
+            logger.info("plugin %r disabled via config; skipping", short_name)
+            continue
+
+        try:
+            if _accepts_config_kwarg(plugin_cls):
+                instance = plugin_cls(config=merged_config)
+            else:
+                instance = plugin_cls()
+        except Exception:
+            logger.exception("failed to instantiate plugin %s", short_name)
             continue
         if isinstance(instance, BaseParser):
             parsers.append(instance)

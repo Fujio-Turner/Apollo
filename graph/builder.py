@@ -55,24 +55,13 @@ _ALWAYS_SKIP_DIRS: frozenset[str] = frozenset({
     ".git",          # Git metadata.
 })
 
-# Directories that are also skipped by default — dependency/vendored/build/
-# generated code. These contain third-party or generated code, not the user's
-# own source. Unlike ``_ALWAYS_SKIP_DIRS`` above, advanced users could in
-# principle override these via custom include filters; the dot-prefix rule in
-# ``_discover_files`` is what enforces them today.
-_SKIP_DIRS: frozenset[str] = _ALWAYS_SKIP_DIRS | frozenset({
-    # Python
-    "venv", ".venv", "env", ".env", "virtualenv",
-    "site-packages", "dist-packages",
-    ".eggs", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", "__pypackages__",
-    # JavaScript / TypeScript
-    "node_modules", "bower_components",
-    # Go
-    "vendor",
-    # Rust
-    "target",
-    # Build / dist / generated
+# **Core** skip list — language-agnostic build/IDE noise that no plugin
+# would reasonably want indexed. Per-language entries (``venv``,
+# ``node_modules``, ``__pycache__`` …) live in each plugin's
+# ``config.json`` under ``ignore_dirs`` and are merged at index time
+# from the *enabled* plugins; see :func:`_compose_ignore_set`.
+_CORE_SKIP_DIRS: frozenset[str] = _ALWAYS_SKIP_DIRS | frozenset({
+    # Build / dist / generated (cross-language)
     "build", "dist", "_build", ".build",
     # Coverage / profiling
     "htmlcov", ".coverage",
@@ -80,13 +69,72 @@ _SKIP_DIRS: frozenset[str] = _ALWAYS_SKIP_DIRS | frozenset({
     ".idea", ".vscode",
 })
 
-# Sentinel files that mark a directory as a Python virtual environment.
+# Backward-compat alias — older code (and some tests) still reference
+# ``_SKIP_DIRS`` directly. Keep it pointing at the broad legacy union so
+# anything that imports it gets at least the historical coverage. Plugin
+# discovery will *additively* contribute on top of it via the merged
+# ignore set computed in ``GraphBuilder``.
+_SKIP_DIRS: frozenset[str] = _CORE_SKIP_DIRS | frozenset({
+    # Python (kept here for back-compat — primary source is python3 plugin)
+    "venv", ".venv", "env", ".env", "virtualenv",
+    "site-packages", "dist-packages",
+    ".eggs", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", "__pypackages__", "__pycache__",
+    # JavaScript / TypeScript
+    "node_modules", "bower_components",
+    # Go
+    "vendor",
+    # Rust
+    "target",
+})
+
+# Default sentinel files that mark a directory as a Python virtual
+# environment. Kept for back-compat; the python3 plugin's
+# ``ignore_dir_markers`` is the authoritative source.
 _VENV_MARKERS: tuple[str, ...] = ("pyvenv.cfg", "conda-meta")
 
 
-def _is_venv_dir(dirpath: str) -> bool:
-    """Detect virtualenvs that don't use a standard name (e.g. 'my_env/')."""
-    for marker in _VENV_MARKERS:
+def _compose_ignore_set(parsers: list[BaseParser] | None) -> tuple[
+    frozenset[str], list[str], tuple[str, ...]
+]:
+    """Compose the (ignore_dirs, ignore_files, ignore_dir_markers) triple.
+
+    Walks each enabled parser's ``self.config`` (when it has one) and
+    unions its ``ignore_dirs`` / ``ignore_files`` / ``ignore_dir_markers``
+    on top of the language-agnostic :data:`_CORE_SKIP_DIRS` baseline.
+
+    Parsers without a ``config`` attribute (older plugins, the bundled
+    text parser) contribute nothing — the core baseline still applies,
+    so back-compat is preserved.
+    """
+    dirs: set[str] = set(_CORE_SKIP_DIRS)
+    files: list[str] = []
+    markers: list[str] = []
+    for p in parsers or []:
+        cfg = getattr(p, "config", None)
+        if not isinstance(cfg, dict):
+            continue
+        for d in cfg.get("ignore_dirs") or []:
+            if isinstance(d, str) and d:
+                dirs.add(d)
+        for f in cfg.get("ignore_files") or []:
+            if isinstance(f, str) and f:
+                files.append(f)
+        for m in cfg.get("ignore_dir_markers") or []:
+            if isinstance(m, str) and m:
+                markers.append(m)
+    return frozenset(dirs), files, tuple(markers)
+
+
+def _is_venv_dir(dirpath: str, markers: tuple[str, ...] = _VENV_MARKERS) -> bool:
+    """Detect virtualenv-style dirs by sentinel file (e.g. ``pyvenv.cfg``).
+
+    The ``markers`` tuple is composed from each enabled plugin's
+    ``ignore_dir_markers`` config key — see :func:`_compose_ignore_set`.
+    The default value is kept for backward-compatibility with any caller
+    that doesn't pass an explicit value.
+    """
+    for marker in markers:
         if os.path.exists(os.path.join(dirpath, marker)):
             return True
     return False
@@ -133,8 +181,15 @@ class GraphBuilder:
         self._file_imports: dict[str, list[dict]] = {}  # file -> imports
         self._root: Path | None = None
         # User-defined filters from ProjectManifest.filters (apollo.json).
-        # When None or mode=="all", only built-in _SKIP_DIRS apply.
+        # When None or mode=="all", only built-in core + plugin ignores apply.
         self._filters = self._normalize_filters(filters)
+        # Compose the indexer's ignore set from the enabled plugins'
+        # ``config.json``. Each plugin contributes its language-specific
+        # entries (e.g. python3 → ``venv``, ``__pycache__``); the
+        # core list (``.git``, ``build`` …) is always included.
+        self._skip_dirs, self._ignore_file_globs, self._venv_markers = (
+            _compose_ignore_set(self._parsers)
+        )
 
     @staticmethod
     def _normalize_filters(filters: dict | None) -> dict | None:
@@ -331,14 +386,15 @@ class GraphBuilder:
         dir_set.add("")  # root directory
 
         for dirpath, dirnames, filenames in os.walk(root):
-            # Prune hidden dirs, __pycache__, dependency dirs, and venvs
+            # Prune hidden dirs, plugin-contributed skip dirs, and
+            # virtualenv-style directories (sentinel files come from each
+            # enabled plugin's ``ignore_dir_markers``).
             kept = []
             for d in dirnames:
                 if (
                     d.startswith(".")
-                    or d == "__pycache__"
-                    or d in _SKIP_DIRS
-                    or _is_venv_dir(os.path.join(dirpath, d))
+                    or d in self._skip_dirs
+                    or _is_venv_dir(os.path.join(dirpath, d), self._venv_markers)
                 ):
                     continue
                 # Compute the dir's path relative to root and consult user filters.
@@ -354,6 +410,11 @@ class GraphBuilder:
 
             for fname in sorted(filenames):
                 if fname.startswith("."):
+                    continue
+                # Plugin-contributed file globs (e.g. python3 → ``*.pyc``).
+                if self._ignore_file_globs and any(
+                    fnmatch.fnmatch(fname, pat) for pat in self._ignore_file_globs
+                ):
                     continue
 
                 src_file = Path(dirpath) / fname

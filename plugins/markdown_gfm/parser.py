@@ -183,7 +183,38 @@ class MarkdownParser(BaseParser):
     can replace one without touching the others.
     """
 
-    def __init__(self) -> None:
+    #: Source-of-truth defaults for this plugin's runtime knobs. Mirrors
+    #: ``plugins/markdown_gfm/config.json``. The merged config (defaults
+    #: ⊕ user override) is stored on ``self.config`` after construction.
+    DEFAULT_CONFIG: dict = {
+        "enabled": True,
+        "extensions": [".md", ".markdown"],
+        "max_file_size_bytes": _MAX_FILE_SIZE,
+        "extract_frontmatter": True,
+        "extract_sections": True,
+        "extract_code_blocks": True,
+        "extract_links": True,
+        "extract_wikilinks": True,
+        "extract_callouts": True,
+        "extract_tables": True,
+        "extract_task_items": True,
+        "extract_comments": True,
+        "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+        "ignore_dirs": [".obsidian", ".trash"],
+        "ignore_files": [],
+        "ignore_dir_markers": [],
+    }
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialise the parser with its merged config dict."""
+        merged = dict(self.DEFAULT_CONFIG)
+        if config:
+            merged.update(config)
+        self.config: dict = merged
+        self._extensions = frozenset(
+            ext.lower() for ext in (self.config.get("extensions") or _MD_EXTENSIONS)
+        )
+
         # Build the AST renderer once per parser instance. ``table`` and
         # ``task_lists`` are mistune plugins (not Apollo plugins!) that
         # add GFM-style support for ``| col |`` tables and ``- [ ]``
@@ -197,23 +228,33 @@ class MarkdownParser(BaseParser):
     # BaseParser interface
     # ------------------------------------------------------------------
 
+    @property
+    def _max_size(self) -> int:
+        """Effective ``max_file_size_bytes`` from config (with default)."""
+        return int(self.config.get("max_file_size_bytes") or _MAX_FILE_SIZE)
+
     def can_parse(self, filepath: str) -> bool:
-        """Return True for ``.md`` / ``.markdown`` files (case-insensitive)."""
-        return Path(filepath).suffix.lower() in _MD_EXTENSIONS
+        """Return True for configured Markdown extensions (case-insensitive).
+
+        Returns ``False`` when the plugin has been disabled via config.
+        """
+        if not self.config.get("enabled", True):
+            return False
+        return Path(filepath).suffix.lower() in self._extensions
 
     def parse_file(self, filepath: str) -> dict | None:
         """Read *filepath* from disk and delegate to :meth:`_parse_raw`.
 
         Returns ``None`` for the wrong extension, files larger than
-        :data:`_MAX_FILE_SIZE`, or any I/O error.
+        ``self.config["max_file_size_bytes"]``, or any I/O error.
         """
         path = Path(filepath)
-        if path.suffix.lower() not in _MD_EXTENSIONS:
+        if path.suffix.lower() not in self._extensions:
             return None
 
         try:
             size = path.stat().st_size
-            if size > _MAX_FILE_SIZE:
+            if size > self._max_size:
                 logger.debug("skipping %s: %d bytes exceeds limit", path, size)
                 return None
             raw = path.read_text(encoding="utf-8", errors="replace")
@@ -227,11 +268,11 @@ class MarkdownParser(BaseParser):
         """Parse from an already-loaded source string.
 
         Skipped when the path's extension isn't markdown, or the source
-        exceeds :data:`_MAX_FILE_SIZE` characters.
+        exceeds ``self.config["max_file_size_bytes"]`` characters.
         """
-        if Path(filepath).suffix.lower() not in _MD_EXTENSIONS:
+        if Path(filepath).suffix.lower() not in self._extensions:
             return None
-        if len(source) > _MAX_FILE_SIZE:
+        if len(source) > self._max_size:
             return None
         return self._parse_raw(source, filepath)
 
@@ -248,12 +289,16 @@ class MarkdownParser(BaseParser):
             return None
 
         # 1. Frontmatter -------------------------------------------------
-        try:
-            post = frontmatter.loads(raw)
-            fm = dict(post.metadata) if post.metadata else None
-            body = post.content  # content without frontmatter
-        except Exception:
-            logger.debug("frontmatter parse failed for %s; treating as no frontmatter", filepath)
+        if self.config.get("extract_frontmatter", True):
+            try:
+                post = frontmatter.loads(raw)
+                fm = dict(post.metadata) if post.metadata else None
+                body = post.content  # content without frontmatter
+            except Exception:
+                logger.debug("frontmatter parse failed for %s; treating as no frontmatter", filepath)
+                fm = None
+                body = raw
+        else:
             fm = None
             body = raw
 
@@ -263,17 +308,50 @@ class MarkdownParser(BaseParser):
         # 3. Line lookup helpers ------------------------------------------
         lines = body.split("\n")
 
-        # 4. Walk the AST once and extract everything ---------------------
-        sections = self._extract_sections(ast_nodes, body, lines)
-        code_blocks = self._extract_code_blocks(ast_nodes, body, lines)
-        links = self._extract_links(ast_nodes, body, lines)
-        tables = self._extract_tables(ast_nodes, body, lines)
-        task_items = self._extract_task_items(ast_nodes, body, lines)
+        # 4. Walk the AST once and extract everything (each extractor is
+        #    independently gated by its ``extract_<thing>`` config key).
+        sections = (
+            self._extract_sections(ast_nodes, body, lines)
+            if self.config.get("extract_sections", True)
+            else []
+        )
+        code_blocks = (
+            self._extract_code_blocks(ast_nodes, body, lines)
+            if self.config.get("extract_code_blocks", True)
+            else []
+        )
+        links = (
+            self._extract_links(ast_nodes, body, lines)
+            if self.config.get("extract_links", True)
+            else []
+        )
+        tables = (
+            self._extract_tables(ast_nodes, body, lines)
+            if self.config.get("extract_tables", True)
+            else []
+        )
+        task_items = (
+            self._extract_task_items(ast_nodes, body, lines)
+            if self.config.get("extract_task_items", True)
+            else []
+        )
 
         # 4b. Markdown-native extras (regex-based, ignore code fences) ----
-        wikilinks = _extract_wikilinks(lines)
-        callouts = _extract_callouts(lines)
-        comments = _extract_comments(body, lines)
+        wikilinks = (
+            _extract_wikilinks(lines)
+            if self.config.get("extract_wikilinks", True)
+            else []
+        )
+        callouts = (
+            _extract_callouts(lines)
+            if self.config.get("extract_callouts", True)
+            else []
+        )
+        comments = (
+            _extract_comments(body, lines, tags=self.config.get("comment_tags"))
+            if self.config.get("extract_comments", True)
+            else []
+        )
         imports = _build_imports(links, wikilinks)
 
         # 5. Title --------------------------------------------------------
@@ -626,17 +704,34 @@ def _extract_wikilinks(lines: list[str]) -> list[dict]:
     return out
 
 
-def _extract_comments(body: str, lines: list[str]) -> list[dict]:
+def _build_md_comment_re(tags) -> tuple[re.Pattern, re.Pattern]:
+    """Build (inline, blockquote) regexes for the configured tag set."""
+    if not tags:
+        return _COMMENT_TAG_RE, _BLOCKQUOTE_TAG_RE
+    alt = "|".join(re.escape(t) for t in tags)
+    inline = re.compile(rf"\b({alt})\b[:\s]*(.*)", re.IGNORECASE)
+    blockquote = re.compile(
+        rf"^\s*>\s*({alt})\b[:\s]*(.*)$", re.IGNORECASE
+    )
+    return inline, blockquote
+
+
+def _extract_comments(body: str, lines: list[str], tags=None) -> list[dict]:
     """Find tagged comments — ``<!-- TODO: … -->`` and ``> TODO:`` —
     using the same tag set as the python3 / html5 plugins.
+
+    *tags* is the list of tag names to recognise; ``None`` falls back to
+    the default ``TODO/FIXME/NOTE/HACK/XXX`` set so older callers keep
+    working.
     """
+    inline_re, bq_re = _build_md_comment_re(tags)
     out: list[dict] = []
 
     # 1. HTML comments anywhere in the body.
     for m in _HTML_COMMENT_RE.finditer(body):
         inner = m.group(1)
         line = body[: m.start()].count("\n") + 1
-        tag_m = _COMMENT_TAG_RE.search(inner)
+        tag_m = inline_re.search(inner)
         if tag_m:
             out.append({
                 "tag": tag_m.group(1).upper(),
@@ -646,7 +741,7 @@ def _extract_comments(body: str, lines: list[str]) -> list[dict]:
 
     # 2. Tagged blockquote lines (``> TODO: …``) outside code fences.
     for idx, line in _iter_non_code_lines(lines):
-        m = _BLOCKQUOTE_TAG_RE.match(line)
+        m = bq_re.match(line)
         if m:
             out.append({
                 "tag": m.group(1).upper(),

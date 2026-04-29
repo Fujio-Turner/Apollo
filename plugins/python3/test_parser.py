@@ -77,3 +77,28 @@ class TestPython3PluginParsesRealPython:
         f = tmp_path / "broken.py"
         f.write_text("def oops(:\n    pass\n")
         assert PythonParser().parse_file(str(f)) is None
+
+
+class TestPython3PluginConfig:
+    """Phase 2A: parser receives its merged config and respects ``enabled``."""
+
+    def test_disabled_plugin_can_parse_returns_false(self, tmp_path):
+        f = tmp_path / "m.py"
+        f.write_text("x = 1\n")
+        parser = PythonParser(config={"enabled": False})
+        assert parser.can_parse(str(f)) is False
+
+    def test_default_config_keeps_can_parse_true(self, tmp_path):
+        f = tmp_path / "m.py"
+        f.write_text("x = 1\n")
+        assert PythonParser().can_parse(str(f)) is True
+
+    def test_custom_comment_tags_are_honoured(self, tmp_path):
+        src = "# REVIEW: look me over\nx = 1\n"
+        f = tmp_path / "m.py"
+        f.write_text(src)
+        parser = PythonParser(config={"comment_tags": ["REVIEW"]})
+        result = parser.parse_file(str(f))
+        assert result is not None
+        tags = {c["tag"] for c in result["comments"]}
+        assert "REVIEW" in tags

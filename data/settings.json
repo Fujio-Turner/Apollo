@@ -32,7 +32,51 @@
       "version": "1.1.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/html5",
       "author": "Fujio Turner",
-      "sha256": "0c1441d8b6cccf085821d3de626ae12f99786a3ffd60488dd041d2e46d163646"
+      "sha256": "3e735cdda2eedcb57bcc53790ea461b34fea54c0a14edf042d1caa27b4004140",
+      "config": {
+        "enabled": true,
+        "extensions": [
+          ".html",
+          ".htm",
+          ".xhtml"
+        ],
+        "max_file_size_bytes": 5242880,
+        "extract_sections": true,
+        "extract_code_blocks": true,
+        "extract_links": true,
+        "extract_meta": true,
+        "extract_imports": true,
+        "asset_tags": {
+          "script": "src",
+          "link": "href",
+          "img": "src",
+          "iframe": "src",
+          "source": "src",
+          "video": "src",
+          "audio": "src"
+        },
+        "extract_comments": true,
+        "comment_tags": [
+          "TODO",
+          "FIXME",
+          "NOTE",
+          "HACK",
+          "XXX"
+        ],
+        "ignore_dirs": [
+          "_site",
+          "public",
+          ".jekyll-cache",
+          ".jekyll-metadata",
+          "_book",
+          ".docusaurus",
+          ".next",
+          ".nuxt",
+          ".cache"
+        ],
+        "ignore_files": [],
+        "ignore_dir_markers": []
+      }
     },
     "markdown_gfm": {
       "installed": true,
@@ -40,7 +84,37 @@
       "version": "1.1.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/markdown_gfm",
       "author": "Fujio Turner",
-      "sha256": "b789a01c51d6d40ea75897bbb50e5faceedda1dffde1552e75730250bd2b3bd1"
+      "sha256": "7ad25ade2b547abda07d12168dc47ff5b4d5f9d4af6a75624f9d8e230adc4d10",
+      "config": {
+        "enabled": true,
+        "extensions": [
+          ".md",
+          ".markdown"
+        ],
+        "max_file_size_bytes": 1048576,
+        "extract_frontmatter": true,
+        "extract_sections": true,
+        "extract_code_blocks": true,
+        "extract_links": true,
+        "extract_wikilinks": true,
+        "extract_callouts": true,
+        "extract_tables": true,
+        "extract_task_items": true,
+        "extract_comments": true,
+        "comment_tags": [
+          "TODO",
+          "FIXME",
+          "NOTE",
+          "HACK",
+          "XXX"
+        ],
+        "ignore_dirs": [
+          ".obsidian",
+          ".trash"
+        ],
+        "ignore_files": [],
+        "ignore_dir_markers": []
+      }
     },
     "pdf_pypdf": {
       "installed": true,
@@ -48,7 +122,21 @@
       "version": "1.0.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/pdf_pypdf",
       "author": "Fujio Turner",
-      "sha256": "4e86b16d7f3450661e3b1da8e07214cd95db9e953baf28cc212c4c5d550491bb"
+      "sha256": "0fb5e99578cf015f9009d80baf20bea124292b530b42de1bdf819d1f769a3ca2",
+      "config": {
+        "enabled": true,
+        "extensions": [
+          ".pdf"
+        ],
+        "max_file_size_bytes": 52428800,
+        "extract_pages": true,
+        "extract_outline": true,
+        "extract_metadata": true,
+        "decrypt_with_empty_password": true,
+        "ignore_dirs": [],
+        "ignore_files": [],
+        "ignore_dir_markers": []
+      }
     },
     "python3": {
       "installed": true,
@@ -56,7 +144,75 @@
       "version": "1.0.0",
       "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/python3",
       "author": "Fujio Turner",
-      "sha256": "c9a2bdca3a7229c6046b5223a02bba41fe4d675057dadd7f99450bd726519aa7"
+      "sha256": "fd3797cc7788d159f4806fbb37f4ceba971fa98c5fa59ba3202a425c4addd01d",
+      "config": {
+        "enabled": true,
+        "extensions": [
+          ".py"
+        ],
+        "extract_comments": true,
+        "comment_tags": [
+          "TODO",
+          "FIXME",
+          "NOTE",
+          "HACK",
+          "XXX"
+        ],
+        "extract_strings": true,
+        "extract_type_checking_imports": true,
+        "detect_patterns": true,
+        "known_patterns": {
+          "fastapi": [
+            "fastapi"
+          ],
+          "django": [
+            "django"
+          ],
+          "flask": [
+            "flask"
+          ],
+          "sqlalchemy": [
+            "sqlalchemy"
+          ],
+          "pydantic": [
+            "pydantic"
+          ],
+          "celery": [
+            "celery"
+          ],
+          "pytest": [
+            "pytest"
+          ]
+        },
+        "ignore_dirs": [
+          "venv",
+          ".venv",
+          "env",
+          ".env",
+          "virtualenv",
+          "site-packages",
+          "dist-packages",
+          ".eggs",
+          ".tox",
+          ".nox",
+          ".mypy_cache",
+          ".pytest_cache",
+          ".ruff_cache",
+          "__pypackages__",
+          "__pycache__",
+          ".pytype"
+        ],
+        "ignore_files": [
+          "*.pyc",
+          "*.pyo",
+          "*.pyd",
+          "*.egg-info"
+        ],
+        "ignore_dir_markers": [
+          "pyvenv.cfg",
+          "conda-meta"
+        ]
+      }
     }
   },
   "appearance": {

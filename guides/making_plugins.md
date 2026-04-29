@@ -55,12 +55,16 @@ to support multiple, ship multiple plugin folders.
 4. Inside it, create `plugin.md` — the **plugin manifest** with a
    YAML front-matter block declaring `description`, `version`, `url`,
    and `author` (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
-5. Inside it, create `test_parser.py` — the **per-plugin smoke test**
+5. Inside it, create `config.json` — the **plugin runtime config**
+   declaring at minimum `"enabled": true` plus any plugin-specific
+   knobs you want users to tweak from **Settings → Plugins**
+   (see [§ 2.6](#26-the-plugin-config-configjson)).
+6. Inside it, create `test_parser.py` — the **per-plugin smoke test**
    covering discovery, extension matching, and one happy-path parse
    (see [§ 6](#6-testing-your-plugin)).
-6. Done. `plugins.discover_plugins()` will pick it up automatically
+7. Done. `plugins.discover_plugins()` will pick it up automatically
    and Apollo's **Settings → Plugins** tab will show the manifest
-   metadata alongside a SHA-256 hash of `parser.py`.
+   metadata, the editable config, and a SHA-256 hash of `parser.py`.
 
 No registry to edit. No imports to add elsewhere. Drop the folder in,
 restart Apollo, and the new language is supported.
@@ -76,16 +80,19 @@ plugins/
 │   ├── __init__.py        #   exports PLUGIN
 │   ├── parser.py          #   the BaseParser implementation
 │   ├── plugin.md          #   manifest (description / version / url / author)
+│   ├── config.json        #   runtime config (enabled + knobs)
 │   └── test_parser.py     #   per-plugin smoke test (pytest)
 ├── python3/               # built-in: Python 3 (AST)
 │   ├── __init__.py
 │   ├── parser.py
 │   ├── plugin.md
+│   ├── config.json
 │   └── test_parser.py
 └── <your_language>/       # ← your new plugin goes here
     ├── __init__.py
     ├── parser.py
     ├── plugin.md
+    ├── config.json
     └── test_parser.py
 ```
 
@@ -234,6 +241,208 @@ The plugin still loads (so existing installations don't break), but
 the Plugins tab will render its description / version / url / author
 as empty / "no description". New plugins should always ship a valid
 manifest.
+
+---
+
+### 2.6. The plugin config (`config.json`)
+
+Alongside `plugin.md`, every subpackage plugin **must** ship a
+`config.json` in the same folder. This is the plugin's **runtime
+configuration**: a JSON object holding the knobs Apollo users can flip
+from **Settings → Plugins** without editing source.
+
+Single-file plugins (`plugins/foo.py`) put their config next to the
+file as `plugins/foo.config.json`.
+
+#### Required format
+
+The only required key is `enabled`, a boolean that controls whether
+the plugin participates in indexing. A newly installed plugin **must**
+default to `"enabled": true` so it works out of the box.
+
+```json
+{
+  "enabled": true
+}
+```
+
+Beyond `enabled`, you are free to add any plugin-specific options that
+make sense for your parser. Suggested conventions for built-in knobs:
+
+| Key                     | Type             | Purpose                                              |
+| ----------------------- | ---------------- | ---------------------------------------------------- |
+| `enabled`               | `bool`           | **Required.** Skip parsing entirely when `false`.    |
+| `extensions`            | `list[str]`      | File extensions this plugin claims (lower-case).     |
+| `max_file_size_bytes`   | `int`            | Skip files larger than this. `0` / absent = no cap.  |
+| `extract_<thing>`       | `bool`           | Toggle for an optional extraction pass.              |
+| `comment_tags`          | `list[str]`      | Tags surfaced from `# TODO`, `<!-- FIXME -->`, etc.  |
+| `ignore_dirs`           | `list[str]`      | **Per-language directory ignores.** Folder *names* the indexer should skip when this plugin is enabled (e.g. `venv`, `site-packages`, `node_modules`). |
+| `ignore_files`          | `list[str]`      | Glob patterns for files to skip (e.g. `"*.pyc"`).    |
+| `ignore_dir_markers`    | `list[str]`      | Marker filenames inside a directory that mark the whole directory as ignorable (e.g. `pyvenv.cfg` flags arbitrary virtualenv folders even with non-standard names). |
+
+#### Describe each knob with a `_<key>` sibling
+
+Plugins are sorta stand-alone — once installed, the only thing the user
+sees in **Settings → Plugins** is your `config.json`. To make the UI
+self-documenting, **every runtime key should ship a sibling key
+prefixed with `_` whose value is a human-readable description**. The
+Settings UI renders that description as the form field's label /
+tooltip; the loader strips all `_<key>` siblings out of the merged
+runtime dict so your parser never sees them as data.
+
+```json
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "max_file_size_bytes": 1048576,
+  "_max_file_size_bytes": "Skip files larger than this many bytes (default 1 MB)."
+}
+```
+
+Rules:
+
+- The sibling key is `_` + the runtime key (`extract_links` →
+  `_extract_links`).
+- Description values are strings.
+- Description siblings are **read-only** — `PATCH /api/settings/
+  plugins/<name>/config` rejects any body whose keys start with `_`.
+- If a description is missing, the UI falls back to showing the bare
+  key. This is fine for back-compat, but every shipped plugin in the
+  repo should provide one for every knob.
+
+#### Per-language directory ignores (very important)
+
+Different programming languages put third-party / generated code in
+different places. Indexing those folders can multiply node and edge
+counts by 100× or more without adding any signal — they are not the
+user's source code.
+
+Each plugin must declare **its own** ignore list. Apollo merges the
+union of every *enabled* plugin's `ignore_dirs` / `ignore_files` /
+`ignore_dir_markers` into the indexer's effective skip set. Disabling
+a plugin from **Settings → Plugins** also removes its ignores, so a
+project that doesn't use a given language doesn't pay for its noise
+filters.
+
+Recommended ignore lists by language:
+
+| Language     | `ignore_dirs` (typical)                                                                                    | `ignore_dir_markers`     |
+| ------------ | ---------------------------------------------------------------------------------------------------------- | ------------------------ |
+| Python 3     | `venv`, `.venv`, `env`, `.env`, `virtualenv`, `site-packages`, `dist-packages`, `.eggs`, `.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `__pypackages__`, `__pycache__` | `pyvenv.cfg`, `conda-meta` |
+| Node / TS    | `node_modules`, `bower_components`, `.next`, `.nuxt`, `.svelte-kit`                                        | —                        |
+| Go           | `vendor`                                                                                                   | `go.mod`* (only as include marker) |
+| Rust         | `target`                                                                                                   | `Cargo.lock`* (only as include marker) |
+| Java / Kotlin | `target`, `build`, `out`, `.gradle`                                                                       | —                        |
+| HTML / docs  | `_site`, `public`, `.jekyll-cache`, `_book`, `.docusaurus`                                                 | —                        |
+
+> **Apollo internals stay in the core builder.** Folders such as
+> `.git`, `_apollo`, `.apollo`, and `_apollo_web` are skipped
+> unconditionally by the graph builder regardless of which plugins
+> are enabled. Plugins should not list these.
+
+##### Example: the Python 3 plugin's ignore declaration
+
+```json
+{
+  "enabled": true,
+  "extensions": [".py"],
+  "ignore_dirs": [
+    "venv", ".venv", "env", ".env", "virtualenv",
+    "site-packages", "dist-packages",
+    ".eggs", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "__pypackages__", "__pycache__"
+  ],
+  "ignore_files": ["*.pyc", "*.pyo", "*.pyd", "*.egg-info"],
+  "ignore_dir_markers": ["pyvenv.cfg", "conda-meta"]
+}
+```
+
+When the user opens a Python project, the indexer sees the python3
+plugin is enabled, pulls its `ignore_dirs` into the skip set, and
+walks the tree without descending into any `venv/` or
+`site-packages/` it encounters. Toggling python3 *off* in **Settings →
+Plugins** removes those ignores too — useful when you do *want* to
+audit a vendored copy of `site-packages`.
+
+#### Examples from the built-in plugins
+
+`plugins/python3/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".py"],
+  "extract_comments": true,
+  "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+  "extract_strings": true,
+  "extract_type_checking_imports": true,
+  "detect_patterns": true
+}
+```
+
+`plugins/markdown_gfm/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".md", ".markdown"],
+  "max_file_size_bytes": 1048576,
+  "extract_callouts": true,
+  "extract_tables": true,
+  "extract_task_items": true,
+  "extract_wikilinks": true
+}
+```
+
+`plugins/pdf_pypdf/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".pdf"],
+  "max_file_size_bytes": 52428800,
+  "extract_outline": true,
+  "extract_metadata": true,
+  "decrypt_with_empty_password": true
+}
+```
+
+#### Reading the config from your parser
+
+Apollo loads each plugin's `config.json` at startup and merges any
+overrides from the global `data/settings.json`. The resulting dict is
+passed to the parser instance — so your `__init__` should accept (and
+default) a `config` argument:
+
+```python
+class GoParser(BaseParser):
+    DEFAULT_CONFIG = {
+        "enabled": True,
+        "extensions": [".go"],
+        "max_file_size_bytes": 5_000_000,
+    }
+
+    def __init__(self, config: dict | None = None):
+        merged = {**self.DEFAULT_CONFIG, **(config or {})}
+        self.config = merged
+
+    def can_parse(self, filepath):
+        if not self.config.get("enabled", True):
+            return False
+        ext = Path(filepath).suffix.lower()
+        return ext in self.config.get("extensions", [])
+```
+
+`enabled: false` should make `can_parse()` return `False` so the
+graph builder simply skips the plugin without re-indexing anything.
+
+#### What happens if `config.json` is missing or malformed
+
+The plugin still loads with `enabled: true` and an empty options dict
+(so existing installations don't break), but the Plugins tab won't
+expose any knobs to users. New plugins should always ship a valid
+`config.json`.
 
 ---
 
@@ -597,6 +806,9 @@ Before you commit a new plugin:
 - [ ] Folder contains `plugin.md` with a valid YAML front-matter block
       providing **`description`, `version`, `url`, `author`**
       (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
+- [ ] Folder contains `config.json` with at minimum `"enabled": true`
+      plus any plugin-specific knobs
+      (see [§ 2.6](#26-the-plugin-config-configjson)).
 - [ ] Folder contains `test_parser.py` covering discovery, extension
       matching, and one happy-path parse
       (see [§ 6](#6-testing-your-plugin)).

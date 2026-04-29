@@ -451,6 +451,42 @@ Updates settings.
 { "status": "saved" }
 ```
 
+### `PATCH /api/settings/plugins/{name}/config`
+
+Apply a partial config override for plugin `name` and hot-reload the
+active parser list. Persists the merged override into
+`data/settings.json` under `plugins[<name>].config` and re-runs
+`discover_plugins()` so the change takes effect without a server
+restart.
+
+**Path Parameters**
+
+| Field  | Type   | Required | Description                                                |
+|--------|--------|----------|------------------------------------------------------------|
+| `name` | string | yes      | Plugin folder name under `plugins/` (e.g. `markdown_gfm`). |
+
+**Request Body**
+
+A partial dict of overrides. Each key MUST exist in the plugin's
+on-disk `config.json`; each value MUST type-match the on-disk default;
+`enabled` is a strict `bool` when present. Unknown keys → `400`,
+unknown plugin → `404`, type mismatch → `400`.
+
+```json
+{ "enabled": false }
+```
+
+**Response**
+
+```json
+{
+  "status": "saved",
+  "plugin": "markdown_gfm",
+  "config": { "enabled": false },
+  "active_parsers": 4
+}
+```
+
 ---
 
 ## Chat
