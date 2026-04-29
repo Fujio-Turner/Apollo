@@ -10,9 +10,31 @@ marked.setOptions({
 /* ── Constants ─────────────────────────────────────────────────── */
 const NODE_COLORS = {
   function: '#00d9ff', class: '#ff6b6b', method: '#ffd93d',
-  variable: '#6bcb77', file: '#8b8b8b', directory: '#666666', import: '#b088f9',
+  variable: '#6bcb77', file: '#8b8b8b', directory: '#000000', import: '#b088f9',
 };
+/* Per-type border overrides for the graph nodes. We make directories
+   black-with-white-border so they're visually distinct from files
+   (which stay grey, no border) — previously both were near-identical
+   shades of grey and easy to misclick. */
+const NODE_BORDERS = {
+  directory: { borderColor: '#ffffff', borderWidth: 2 },
+};
+/* Pick black or white text for a badge whose background is `bg` (hex).
+   Avoids invisible black-on-black for the directory badge. */
+function badgeTextColor(bg) {
+  if (typeof bg !== 'string') return '#000';
+  const m = bg.match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return '#000';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 0xff, g = (n >> 8) & 0xff, b = n & 0xff;
+  // Standard relative-luminance threshold; below ~0.5 use white text.
+  return (0.2126*r + 0.7152*g + 0.0722*b) / 255 < 0.5 ? '#fff' : '#000';
+}
 let graphChart = null, wordCloudChart = null, currentGraph = null, selectedNode = null, currentView = 'graph';
+/* Dev-mode (?dev=true) graph variant. '1' = current force-directed render,
+   '2' = stable circular-layout render with hideOverlap labels (mirrors the
+   ECharts "graph-label-overlap" example). Hidden in normal mode. */
+let graphChart2 = null, currentGraphVariant = '1';
 let wordCloudAllData = [], wordCloudExpanded = false;
 const WORDCLOUD_DEFAULT_LIMIT = 30;
 
@@ -66,7 +88,9 @@ function toggleTheme() {
   document.getElementById('theme-icon-sun').classList.toggle('hidden', isDark);
   const label = document.querySelector('#theme-btn .nav-label');
   if (label) label.textContent = isDark ? 'Light Mode' : 'Dark Mode';
-  if (graphChart) { graphChart.dispose(); graphChart = null; loadGraph(); }
+  if (graphChart) { graphChart.dispose(); graphChart = null; }
+  if (graphChart2) { graphChart2.dispose(); graphChart2 = null; }
+  loadGraph();
   if (wordCloudChart) { wordCloudChart.dispose(); wordCloudChart = null; }
 }
 
@@ -78,7 +102,11 @@ function toggleNav() {
   icon.innerHTML = nav.classList.contains('collapsed')
     ? '<path stroke-linecap="round" stroke-linejoin="round" d="M11.25 4.5l7.5 7.5-7.5 7.5m-6-15l7.5 7.5-7.5 7.5" />'
     : '<path stroke-linecap="round" stroke-linejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" />';
-  setTimeout(() => { if (graphChart) graphChart.resize(); if (wordCloudChart) wordCloudChart.resize(); }, 300);
+  setTimeout(() => {
+    if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
+    if (wordCloudChart) wordCloudChart.resize();
+  }, 300);
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -222,6 +250,7 @@ async function apiFetch(url, opts = {}) {
     const pct = Math.min(70, Math.max(15, ((e.clientX - rect.left) / rect.width) * 100));
     left.style.width = pct + '%';
     if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
     if (wordCloudChart) wordCloudChart.resize();
   });
   document.addEventListener('mouseup', () => { dragging = false; });
@@ -241,6 +270,7 @@ async function apiFetch(url, opts = {}) {
     const pct = Math.min(85, Math.max(20, ((e.clientY - rect.top) / rect.height) * 100));
     top.style.height = pct + '%';
     if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
     if (wordCloudChart) wordCloudChart.resize();
   });
   document.addEventListener('mouseup', () => { dragging = false; });
@@ -995,7 +1025,11 @@ function switchView(view) {
     el.classList.toggle('hidden', !show);
   });
   if (view === 'settings') loadSettings();
-  if (view === 'graph') setTimeout(() => { if (graphChart) graphChart.resize(); if (wordCloudChart) wordCloudChart.resize(); }, 50);
+  if (view === 'graph') setTimeout(() => {
+    if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
+    if (wordCloudChart) wordCloudChart.resize();
+  }, 50);
 }
 
 /* ── Graph ─────────────────────────────────────────────────────── */
@@ -1030,6 +1064,13 @@ async function loadGraph() {
 }
 
 function renderGraph(data) {
+  // In dev mode the user can toggle between Graph 1 (force-directed) and
+  // Graph 2 (stable circular layout w/ hideOverlap labels — see ECharts
+  // "graph-label-overlap" example). In normal mode only Graph 1 renders.
+  if (currentGraphVariant === '2') {
+    renderGraph2(data);
+    return;
+  }
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const tc = isDark ? '#dcddde' : '#333', ec = isDark ? '#3a3a3a' : '#ccc';
   if (!graphChart) {
@@ -1044,12 +1085,27 @@ function renderGraph(data) {
   const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
   const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
   const large = (data.nodes||[]).length > 500;
+  // Dev mode: seed every node with a deterministic (x,y) derived from a
+  // hash of its id, so the same node always starts in the same spot
+  // across renders/releases. Combined with force.layoutAnimation:false
+  // the force layout converges to a stable picture instead of reshuffling
+  // every time the graph reloads. Drag still works (draggable:true).
+  const stable = IS_DEV_MODE;
+  const seedR = stable ? Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length))) : 0;
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8,Math.min(40,n.symbolSize||12));
-    return { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
-      itemStyle:{color:NODE_COLORS[t]||'#888'}, label:{show:!large&&sz>18,fontSize:10,color:tc},
+    const node = { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
+      itemStyle:{color:NODE_COLORS[t]||'#888', ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
       _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line };
+    if (stable) {
+      const h = _g2HashStr(n.id);
+      const ang = ((h % 3600) / 3600) * Math.PI * 2;
+      const rad = (((h >>> 8) % 1000) / 1000) * seedR;
+      node.x = Math.cos(ang) * rad;
+      node.y = Math.sin(ang) * rad;
+    }
+    return node;
   });
   const edges = (data.edges||[]).map(e => ({ source:e.source, target:e.target, lineStyle:{color:ec,opacity:0.5}, _rel:e.type||e.rel }));
   graphChart.setOption({
@@ -1058,15 +1114,138 @@ function renderGraph(data) {
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
     animationDurationUpdate: large ? 0 : 500,
-    animation: !large,
+    animation: !large && !stable,
     series: [{ type:'graph', layout:'force', data:nodes, links:edges, categories, roam:true, draggable:true,
       large: large,
-      force:{repulsion:large?80:120,edgeLength:large?[40,120]:[60,200],gravity:large?0.15:0.08,layoutAnimation:!large,friction:large?0.4:0.6},
+      // In dev mode disable continuous force animation so the deterministic
+      // initial positions aren't relaxed into different ones each render.
+      force:{repulsion:large?80:120,edgeLength:large?[40,120]:[60,200],gravity:large?0.15:0.08,layoutAnimation:!large && !stable,friction:large?0.4:0.6},
       emphasis:{focus:'adjacency',lineStyle:{width:3,color:'#7c3aed'}},
       select:{itemStyle:{borderColor:'#7c3aed',borderWidth:3,shadowBlur:10,shadowColor:'#7c3aed'},label:{show:true,fontSize:12,fontWeight:'bold',color:tc}},
       selectedMode:'single',
       edgeLabel:{show:false}, lineStyle:{curveness:0.1} }],
   }, true);
+}
+
+/* Graph 2 — stable, clustered layout for dev mode (?dev=true).
+   Visual target: ECharts "graph" (Les Miserables) example —
+     https://echarts.apache.org/examples/en/editor.html?c=graph
+   That example loads pre-computed (x,y) positions and uses layout:'none'
+   so the picture is reproducible. We do the same here, but generate the
+   positions deterministically from each node's id and category so the
+   same node always lands in the same place across reloads/releases —
+   solving the "Graph 1 redistributes on every render, I have to hunt
+   for the node again" problem.
+
+   - Per-category cluster centers placed evenly around a large outer
+     ring (clustered, not a single ring of nodes).
+   - Within a cluster, node offset = deterministic hash of id → angle/
+     radius. So clusters look organic but are stable.
+   - lineStyle.color:'source' + curveness:0.3 mirrors Les Miserables. */
+function _g2HashStr(s) {
+  // Simple 32-bit string hash (djb2-ish). Deterministic, no deps.
+  let h = 5381;
+  s = String(s);
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+function renderGraph2(data) {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const tc = isDark ? '#dcddde' : '#333';
+  if (!graphChart2) {
+    graphChart2 = echarts.init(document.getElementById('graph-chart-2'));
+    graphChart2.on('click', onGraphClick);
+    graphChart2.getZr().on('click', function(e) {
+      if (!e.target) clearFocus();
+    });
+  }
+  const catNames = (data.categories||[]).map(c => typeof c === 'string' ? c : c.name);
+  if (!catNames.length) catNames.push(...Object.keys(NODE_COLORS));
+  const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
+  const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
+
+  // Cluster geometry. Outer ring radius scales with node count so
+  // dense graphs don't collapse on top of each other. Each category
+  // gets one fixed cluster center on the outer ring.
+  const totalNodes = (data.nodes||[]).length;
+  const ringR = Math.max(380, 60 * Math.sqrt(Math.max(1, totalNodes)));
+  const catCount = Math.max(1, catNames.length);
+  const catCenters = catNames.map((_, i) => {
+    const a = (i / catCount) * Math.PI * 2 - Math.PI / 2;
+    return { x: Math.cos(a) * ringR, y: Math.sin(a) * ringR };
+  });
+  // Within-cluster radius scales with how many nodes share the cluster.
+  const catSize = {};
+  (data.nodes||[]).forEach(n => {
+    const t = n.value||n.type||'unknown';
+    catSize[t] = (catSize[t]||0) + 1;
+  });
+
+  const nodes = (data.nodes||[]).map(n => {
+    const t = n.value||n.type||'unknown';
+    const sz = Math.max(8, Math.min(40, n.symbolSize||12));
+    const ci = catIdx[t] ?? 0;
+    const center = catCenters[ci] || { x: 0, y: 0 };
+    const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
+    // Deterministic offset within the cluster from the node id hash.
+    const h = _g2HashStr(n.id);
+    const ang = ((h % 3600) / 3600) * Math.PI * 2;
+    const rad = ((h >>> 8) % 1000) / 1000 * inner;
+    const x = center.x + Math.cos(ang) * rad;
+    const y = center.y + Math.sin(ang) * rad;
+    return {
+      id: n.id, name: n.name||n.id, symbolSize: sz, category: ci, x, y,
+      itemStyle: { color: NODE_COLORS[t] || '#888', ...(NODE_BORDERS[t]||{}) },
+      // Match Les Mis: only label larger nodes to keep the picture readable.
+      label: { show: sz > 22, position: 'right', fontSize: 10, color: tc, formatter: '{b}' },
+      _type: t, _path: n.attributes?.path || n.path, _line: n.attributes?.line_start || n.line,
+    };
+  });
+  const edges = (data.edges||[]).map(e => ({
+    source: e.source, target: e.target,
+    lineStyle: { opacity: 0.7, width: 0.8, curveness: 0.3 },
+    _rel: e.type || e.rel,
+  }));
+  graphChart2.setOption({
+    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+      backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
+    legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
+      icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
+    animation: false,            // positions are fixed, no need to animate
+    series: [{
+      type: 'graph',
+      layout: 'none',            // use the (x,y) we computed per node
+      data: nodes, links: edges, categories,
+      roam: true, draggable: true,
+      labelLayout: { hideOverlap: true },
+      // Edge color inherits source node color, like the Les Mis example.
+      lineStyle: { color: 'source', curveness: 0.3 },
+      emphasis: { focus: 'adjacency', label: { show: true, fontSize: 11, fontWeight: 'bold' }, lineStyle: { width: 3, color: '#7c3aed' } },
+      select: { itemStyle: { borderColor: '#7c3aed', borderWidth: 3, shadowBlur: 10, shadowColor: '#7c3aed' }, label: { show: true, fontSize: 12, fontWeight: 'bold', color: tc } },
+      selectedMode: 'single',
+      edgeLabel: { show: false },
+    }],
+  }, true);
+}
+
+/* Dev-mode tab switcher: toggles which graph variant is visible and
+   re-renders the active one against the currently-loaded data. */
+function switchGraphVariant(variant) {
+  if (variant !== '1' && variant !== '2') return;
+  currentGraphVariant = variant;
+  const c1 = document.getElementById('graph-chart');
+  const c2 = document.getElementById('graph-chart-2');
+  if (c1) c1.classList.toggle('hidden', variant !== '1');
+  if (c2) c2.classList.toggle('hidden', variant !== '2');
+  document.querySelectorAll('.graph-variant-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.graphVariant === variant);
+  });
+  if (currentGraph) renderGraph(currentGraph);
+  // ECharts needs a resize after its container becomes visible.
+  setTimeout(() => {
+    if (variant === '1' && graphChart) graphChart.resize();
+    if (variant === '2' && graphChart2) graphChart2.resize();
+  }, 50);
 }
 
 async function onGraphClick(p) {
@@ -1126,7 +1305,7 @@ async function showFileContent(data) {
 
   const header = `
     <div class="flex items-center gap-2 flex-wrap mb-3">
-      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">file</span>
+      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">file</span>
       ${lang ? `<span class="badge badge-sm badge-outline font-mono">${escapeHtml(lang)}</span>` : ''}
       <span class="badge badge-sm badge-ghost font-mono" title="${escapeHtml(file.path)}">${escapeHtml(relativePath(data.path) || file.relative_path || relativePath(file.path))}</span>
       <span class="badge badge-sm badge-ghost font-mono">${sizeKb} KB</span>
@@ -1664,12 +1843,12 @@ async function showDetail(data) {
   const noteIndicator = data.id ? noteIndicatorHtml(data.id) : '';
   const headerHtml = isDir
     ? `<div class="flex items-center gap-2 flex-wrap mb-3">
-        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">${data.type}</span>
         ${bookmarkBtn}
         ${noteIndicator}
       </div>`
     : `<div class="flex items-center gap-2 flex-wrap mb-3">
-        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">${data.type}</span>
         ${lang ? `<span class="badge badge-sm badge-outline font-mono">${lang}</span>` : ''}
         ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1" title="${escapeHtml(data.path)}">${fileIcon} ${escapeHtml(relativePath(data.path))}</span>` : ''}
         ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
@@ -1909,7 +2088,7 @@ async function searchNodes(query) {
     c.innerHTML = data.results.map(r => `<div class="search-result-item p-2.5 cursor-pointer hover:bg-base-300 border-b border-base-300 last:border-0" data-id="${r.id}">
       <div class="flex items-center gap-1.5 mb-1">
         <span class="font-semibold text-sm">${r.name}</span>
-        <span class="badge badge-xs font-semibold" style="background:${NODE_COLORS[r.type]||'#444'};color:#000">${r.type}</span>
+        <span class="badge badge-xs font-semibold" style="background:${NODE_COLORS[r.type]||'#444'};color:${badgeTextColor(NODE_COLORS[r.type]||'#444')}">${r.type}</span>
         ${r.score!=null?`<span class="badge badge-xs badge-ghost font-mono ml-auto">${r.score.toFixed(2)}</span>`:''}
       </div>
       ${r.path?`<div class="text-[11px] opacity-70 font-mono truncate">${r.path}</div>`:''}</div>`).join('');
@@ -2045,6 +2224,7 @@ async function showWelcomePanel() {
       // (lost when Tabs.activate caches the body as innerHTML) get rebound.
       const subTab = document.querySelector('#hub-pane-annotations:not(.hidden)') ? 'annotations' : 'main';
       if (subTab === 'annotations') Annotations.openTab(Annotations.currentSubFilter() || 'notes');
+      else loadHubRecent();
     },
   });
   const stats = await loadStats();
@@ -2092,8 +2272,8 @@ async function showWelcomePanel() {
         </div>
         <div>
           <div class="md-content"><h3>Recent</h3></div>
-          <div class="bg-base-200 rounded-lg p-4 text-xs opacity-70 italic">
-            No recent operations yet. Previously completed indexing, searches, and chats will appear here.
+          <div id="hub-recent" class="rounded-lg text-xs">
+            <div class="opacity-60 italic p-3">Loading recent activity…</div>
           </div>
         </div>
       </div>
@@ -2114,6 +2294,8 @@ async function showWelcomePanel() {
       </div>
     </div>
   `);
+
+  loadHubRecent();
 
   if (stats) {
     if (stats.node_types && Object.keys(stats.node_types).length) {
@@ -2164,7 +2346,128 @@ function switchHubTab(tab) {
   if (ann)  ann.classList.toggle('hidden',  tab !== 'annotations');
   if (tab === 'annotations') {
     Annotations.openTab(Annotations.currentSubFilter() || 'notes');
+  } else {
+    loadHubRecent();
   }
+}
+
+/* Format an ISO timestamp into a human-friendly relative time string,
+   e.g. "5 minutes ago", "3 hours ago", "2 days ago", "4 months ago". */
+function formatTimeAgo(iso) {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return '';
+  const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (diffSec < 60) return diffSec <= 1 ? 'just now' : `${diffSec} seconds ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} ${diffMin === 1 ? 'minute' : 'minutes'} ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} ${diffHr === 1 ? 'hour' : 'hours'} ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 30) return `${diffDay} ${diffDay === 1 ? 'day' : 'days'} ago`;
+  const diffMo = Math.floor(diffDay / 30);
+  if (diffMo < 12) return `${diffMo} ${diffMo === 1 ? 'month' : 'months'} ago`;
+  const diffYr = Math.floor(diffMo / 12);
+  return `${diffYr} ${diffYr === 1 ? 'year' : 'years'} ago`;
+}
+
+/* Fetch recent chats + notes, merge sorted by timestamp, render last 10. */
+async function loadHubRecent() {
+  const host = document.getElementById('hub-recent');
+  if (!host) return;
+  host.innerHTML = '<div class="opacity-60 italic p-3">Loading recent activity…</div>';
+
+  const [threads, notes] = await Promise.all([
+    apiFetch('/api/chat/threads').catch(() => []),
+    apiFetch('/api/annotations?type=note').then(d => d.annotations || []).catch(() => []),
+  ]);
+
+  const items = [];
+  (threads || []).forEach(t => {
+    const ts = t.updated_at || t.created_at || '';
+    items.push({
+      kind: 'chat',
+      ts,
+      id: t.id,
+      title: t.title || 'Untitled chat',
+      subtitle: `${t.message_count || 0} ${t.message_count === 1 ? 'message' : 'messages'}`,
+    });
+  });
+  (notes || []).forEach(a => {
+    const ts = a.last_modified_at || a.created_at || '';
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const m = (a.content || '').match(/^>\s?[\s\S]+?\n\n([\s\S]*)$/);
+    const body = (m ? m[1] : (a.content || '')).trim();
+    const title = body ? body.split('\n')[0].slice(0, 80) : 'Note';
+    items.push({
+      kind: 'note',
+      ts,
+      id: a.id,
+      nodeId: tgt.type === 'node' ? tgt.node_id : '',
+      filePath: tgt.type === 'file' ? tgt.file_path : '',
+      title,
+      subtitle: tgtLabel,
+    });
+  });
+
+  items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  const top = items.slice(0, 10);
+
+  if (!top.length) {
+    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats or notes yet.</div>';
+    return;
+  }
+
+  host.innerHTML = top.map(it => {
+    const when = escapeHtml(formatTimeAgo(it.ts));
+    if (it.kind === 'chat') {
+      return `<div class="recent-item recent-chat" data-recent-kind="chat" data-recent-id="${escapeHtml(it.id)}" title="Resume chat">
+          <div class="recent-row">
+            <span class="recent-tag">CHAT</span>
+            <span class="recent-title">${escapeHtml(it.title)}</span>
+            <span class="recent-time">${when}</span>
+          </div>
+          <div class="recent-sub">${escapeHtml(it.subtitle)}</div>
+        </div>`;
+    }
+    return `<div class="recent-item recent-note" data-recent-kind="note" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open note">
+        <div class="recent-row">
+          <span class="recent-tag">NOTE</span>
+          <span class="recent-title">${escapeHtml(it.title)}</span>
+          <span class="recent-time">${when}</span>
+        </div>
+        ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  host.querySelectorAll('.recent-item').forEach(el => {
+    el.addEventListener('click', () => {
+      if (el.dataset.recentKind === 'chat') openRecentChat(el.dataset.recentId);
+      else openRecentNote(el.dataset.recentId, el.dataset.recentNode, el.dataset.recentFile);
+    });
+  });
+}
+
+/* Resume a chat thread in the bottom chat panel. */
+function openRecentChat(threadId) {
+  if (!threadId) return;
+  switchView('graph');
+  setTimeout(() => loadChatThread(threadId), 60);
+}
+
+/* Open the file/node a note was taken on, without deleting the note. */
+async function openRecentNote(annId, nodeId, filePath) {
+  if (nodeId) {
+    switchView('graph');
+    setTimeout(() => { focusNodeInGraph(nodeId); selectNode(nodeId); }, 80);
+    return;
+  }
+  if (filePath) {
+    showToast('Note attached to file — open it from My Files', 'info');
+    return;
+  }
+  showToast('Note has no target', 'info');
 }
 
 /* ── Chat ──────────────────────────────────────────────────────── */
@@ -3092,7 +3395,7 @@ document.addEventListener('click', e => {
   });
   updateDepthLabel();
 })();
-window.addEventListener('resize', () => { if(graphChart)graphChart.resize(); if(wordCloudChart)wordCloudChart.resize(); });
+window.addEventListener('resize', () => { if(graphChart)graphChart.resize(); if(graphChart2)graphChart2.resize(); if(wordCloudChart)wordCloudChart.resize(); });
 /* ── Tagify Mode Badge on Chat Input ───────────────────────────── */
 let chatTagify = null;
 let _chatSearchDebounce = null;
@@ -4116,6 +4419,9 @@ function noteIndicatorHtml(nodeId) {
 const IS_DEV_MODE = new URLSearchParams(location.search).get('dev') === 'true';
 if (IS_DEV_MODE) {
   document.getElementById('dev-toolbar')?.classList.remove('hidden');
+  // Reveal Graph 1 / Graph 2 variant tabs above the graph chart so we
+  // can A/B test stable-layout (Graph 2) vs. force-directed (Graph 1).
+  document.getElementById('graph-variant-tabs')?.classList.remove('hidden');
 }
 fetchIndexCount(); checkChatStatus(); loadFolderTree();
 // Load the graph on startup, but show the Welcome tab by default
