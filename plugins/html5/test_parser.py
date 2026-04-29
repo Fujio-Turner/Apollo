@@ -164,3 +164,21 @@ class TestHtml5PluginParsesRealHtml:
         f = tmp_path / "doc.txt"
         f.write_text(SAMPLE_HTML)
         assert HtmlParser().parse_file(str(f)) is None
+
+
+class TestHtml5PluginConfig:
+    """Phase 2A: parser receives its merged config and respects ``enabled``."""
+
+    def test_disabled_plugin_can_parse_returns_false(self, tmp_path):
+        f = tmp_path / "page.html"
+        f.write_text("<html></html>")
+        parser = HtmlParser(config={"enabled": False})
+        assert parser.can_parse(str(f)) is False
+
+    def test_extract_links_toggle_off_yields_empty_links(self, tmp_path):
+        f = tmp_path / "page.html"
+        f.write_text('<html><body><a href="x.html">x</a></body></html>')
+        parser = HtmlParser(config={"extract_links": False})
+        result = parser.parse_file(str(f))
+        assert result is not None
+        assert result["links"] == []

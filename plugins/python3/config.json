@@ -1,0 +1,57 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing and Python files fall through to the generic text indexer.",
+  "extensions": [".py"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot).",
+  "extract_comments": true,
+  "_extract_comments": "Extract `# TODO`-style comment nodes from each file.",
+  "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+  "_comment_tags": "Tags surfaced as comment nodes when `extract_comments` is true.",
+  "extract_strings": true,
+  "_extract_strings": "Capture string literals as `string` nodes (useful for full-text search).",
+  "extract_type_checking_imports": true,
+  "_extract_type_checking_imports": "Also walk `if TYPE_CHECKING:` import blocks (otherwise skipped at runtime).",
+  "detect_patterns": true,
+  "_detect_patterns": "Annotate files with framework patterns (FastAPI, Django, …) inferred from imports.",
+  "known_patterns": {
+    "fastapi": ["fastapi"],
+    "django": ["django"],
+    "flask": ["flask"],
+    "sqlalchemy": ["sqlalchemy"],
+    "pydantic": ["pydantic"],
+    "celery": ["celery"],
+    "pytest": ["pytest"]
+  },
+  "_known_patterns": "Map of pattern label → import-prefix list. A file matches a pattern when any of its imports starts with one of these prefixes.",
+  "ignore_dirs": [
+    "venv",
+    ".venv",
+    "env",
+    ".env",
+    "virtualenv",
+    "site-packages",
+    "dist-packages",
+    ".eggs",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pypackages__",
+    "__pycache__",
+    ".pytype"
+  ],
+  "_ignore_dirs": "Folder names the indexer skips when this plugin is enabled (Python virtualenvs, build/cache dirs, etc.).",
+  "ignore_files": [
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    "*.egg-info"
+  ],
+  "_ignore_files": "Glob patterns for files the indexer should skip.",
+  "ignore_dir_markers": [
+    "pyvenv.cfg",
+    "conda-meta"
+  ],
+  "_ignore_dir_markers": "Sentinel file names that mark an entire directory as ignorable (catches non-standard virtualenv layouts)."
+}

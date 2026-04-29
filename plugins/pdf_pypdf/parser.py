@@ -126,17 +126,51 @@ class PdfParser(BaseParser):
     without touching the others.
     """
 
+    #: Source-of-truth defaults for this plugin's runtime knobs. Mirrors
+    #: ``plugins/pdf_pypdf/config.json``.
+    DEFAULT_CONFIG: dict = {
+        "enabled": True,
+        "extensions": [".pdf"],
+        "max_file_size_bytes": _MAX_FILE_SIZE,
+        "extract_pages": True,
+        "extract_outline": True,
+        "extract_metadata": True,
+        "decrypt_with_empty_password": True,
+        "ignore_dirs": [],
+        "ignore_files": [],
+        "ignore_dir_markers": [],
+    }
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialise the parser with its merged config dict."""
+        merged = dict(self.DEFAULT_CONFIG)
+        if config:
+            merged.update(config)
+        self.config: dict = merged
+        self._extensions = frozenset(
+            ext.lower()
+            for ext in (self.config.get("extensions") or _PDF_EXTENSIONS)
+        )
+
     # ------------------------------------------------------------------
     # BaseParser interface
     # ------------------------------------------------------------------
 
-    def can_parse(self, filepath: str) -> bool:
-        """Return True for ``.pdf`` files (case-insensitive).
+    @property
+    def _max_size(self) -> int:
+        """Effective ``max_file_size_bytes`` from config (with default)."""
+        return int(self.config.get("max_file_size_bytes") or _MAX_FILE_SIZE)
 
-        Self-disables when ``pypdf`` is not importable so Apollo can
-        fall back to the generic text indexer instead of raising.
+    def can_parse(self, filepath: str) -> bool:
+        """Return True for configured PDF extensions.
+
+        Returns ``False`` when the plugin has been disabled via config
+        OR when ``pypdf`` is not importable, so Apollo can fall back to
+        the generic text indexer instead of raising.
         """
-        if Path(filepath).suffix.lower() not in _PDF_EXTENSIONS:
+        if not self.config.get("enabled", True):
+            return False
+        if Path(filepath).suffix.lower() not in self._extensions:
             return False
         try:
             import pypdf  # noqa: F401
@@ -148,16 +182,16 @@ class PdfParser(BaseParser):
         """Read *filepath* from disk and delegate to :meth:`_parse_reader`.
 
         Returns ``None`` for the wrong extension, files larger than
-        :data:`_MAX_FILE_SIZE`, missing ``pypdf``, encrypted PDFs we
-        can't unlock, or any I/O / parser error.
+        ``self.config["max_file_size_bytes"]``, missing ``pypdf``,
+        encrypted PDFs we can't unlock, or any I/O / parser error.
         """
         path = Path(filepath)
-        if path.suffix.lower() not in _PDF_EXTENSIONS:
+        if path.suffix.lower() not in self._extensions:
             return None
 
         try:
             size = path.stat().st_size
-            if size > _MAX_FILE_SIZE:
+            if size > self._max_size:
                 logger.debug("skipping %s: %d bytes exceeds limit", path, size)
                 return None
         except OSError as exc:
@@ -179,9 +213,13 @@ class PdfParser(BaseParser):
                            path, type(exc).__name__, exc)
             return None
 
-        # Try to unlock with the empty password if encrypted; if that
+        # Try to unlock with the empty password if encrypted (gated by
+        # the ``decrypt_with_empty_password`` config flag); if that
         # fails, give up and let the generic indexer take over.
         if getattr(reader, "is_encrypted", False):
+            if not self.config.get("decrypt_with_empty_password", True):
+                logger.debug("encrypted PDF %s skipped (decrypt_with_empty_password=False)", path)
+                return None
             try:
                 if not reader.decrypt(""):
                     logger.debug("encrypted PDF %s could not be unlocked with empty password", path)
@@ -217,10 +255,24 @@ class PdfParser(BaseParser):
             return None
 
         # 2. Metadata ----------------------------------------------------
-        metadata = _coerce_metadata(getattr(reader, "metadata", None))
+        metadata = (
+            _coerce_metadata(getattr(reader, "metadata", None))
+            if self.config.get("extract_metadata", True)
+            else None
+        )
 
         # 3. Outline (table of contents) → sections ----------------------
-        sections = self._extract_sections(reader, pages)
+        sections = (
+            self._extract_sections(reader, pages)
+            if self.config.get("extract_outline", True)
+            else []
+        )
+
+        # ``extract_pages`` toggles whether per-page entries appear in
+        # the result. The body text we pass to embeddings is always
+        # populated regardless — that's what makes the document
+        # searchable.
+        emit_pages = self.config.get("extract_pages", True)
 
         # 4. Title -------------------------------------------------------
         title = _derive_title(metadata, sections, filepath)
@@ -244,7 +296,7 @@ class PdfParser(BaseParser):
             "imports": [],
             "variables": [],
             "documents": documents,
-            "pages": pages,
+            "pages": pages if emit_pages else [],
             "sections": sections,
             "metadata": metadata,
             "title": title,

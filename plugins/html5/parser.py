@@ -155,27 +155,70 @@ class HtmlParser(BaseParser):
        pipeline.
     """
 
+    #: Source-of-truth defaults for this plugin's runtime knobs. Mirrors
+    #: ``plugins/html5/config.json``.
+    DEFAULT_CONFIG: dict = {
+        "enabled": True,
+        "extensions": [".html", ".htm", ".xhtml"],
+        "max_file_size_bytes": _MAX_FILE_SIZE,
+        "extract_sections": True,
+        "extract_code_blocks": True,
+        "extract_links": True,
+        "extract_meta": True,
+        "extract_imports": True,
+        "asset_tags": dict(_ASSET_TAGS),
+        "extract_comments": True,
+        "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+        "ignore_dirs": [
+            "_site", "public", ".jekyll-cache", ".jekyll-metadata",
+            "_book", ".docusaurus", ".next", ".nuxt", ".cache",
+        ],
+        "ignore_files": [],
+        "ignore_dir_markers": [],
+    }
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialise the parser with its merged config dict."""
+        merged = dict(self.DEFAULT_CONFIG)
+        if config:
+            merged.update(config)
+        self.config: dict = merged
+        self._extensions = frozenset(
+            ext.lower()
+            for ext in (self.config.get("extensions") or _HTML_EXTENSIONS)
+        )
+
     # ------------------------------------------------------------------
     # BaseParser interface
     # ------------------------------------------------------------------
 
+    @property
+    def _max_size(self) -> int:
+        """Effective ``max_file_size_bytes`` from config (with default)."""
+        return int(self.config.get("max_file_size_bytes") or _MAX_FILE_SIZE)
+
     def can_parse(self, filepath: str) -> bool:
-        """Return True for ``.html`` / ``.htm`` / ``.xhtml`` files."""
-        return Path(filepath).suffix.lower() in _HTML_EXTENSIONS
+        """Return True for configured HTML extensions.
+
+        Returns ``False`` when the plugin has been disabled via config.
+        """
+        if not self.config.get("enabled", True):
+            return False
+        return Path(filepath).suffix.lower() in self._extensions
 
     def parse_file(self, filepath: str) -> dict | None:
         """Read *filepath* from disk and delegate to :meth:`_parse_raw`.
 
         Returns ``None`` for the wrong extension, files larger than
-        :data:`_MAX_FILE_SIZE`, or any I/O error.
+        ``self.config["max_file_size_bytes"]``, or any I/O error.
         """
         path = Path(filepath)
-        if path.suffix.lower() not in _HTML_EXTENSIONS:
+        if path.suffix.lower() not in self._extensions:
             return None
 
         try:
             size = path.stat().st_size
-            if size > _MAX_FILE_SIZE:
+            if size > self._max_size:
                 logger.debug("skipping %s: %d bytes exceeds limit", path, size)
                 return None
             raw = path.read_text(encoding="utf-8", errors="replace")
@@ -187,9 +230,9 @@ class HtmlParser(BaseParser):
 
     def parse_source(self, source: str, filepath: str) -> dict | None:
         """Parse from an already-loaded source string."""
-        if Path(filepath).suffix.lower() not in _HTML_EXTENSIONS:
+        if Path(filepath).suffix.lower() not in self._extensions:
             return None
-        if len(source) > _MAX_FILE_SIZE:
+        if len(source) > self._max_size:
             return None
         return self._parse_raw(source, filepath)
 
@@ -198,7 +241,12 @@ class HtmlParser(BaseParser):
         if not raw.strip():
             return None
 
-        collector = _HtmlCollector()
+        collector = _HtmlCollector(
+            asset_tags=self.config.get("asset_tags") or _ASSET_TAGS,
+            comment_tags=self.config.get("comment_tags"),
+            extract_imports=bool(self.config.get("extract_imports", True)),
+            extract_comments=bool(self.config.get("extract_comments", True)),
+        )
         try:
             collector.feed(raw)
             collector.close()
@@ -207,10 +255,12 @@ class HtmlParser(BaseParser):
             logger.debug("html.parser raised on %s; skipping", filepath)
             return None
 
-        sections = collector.sections
-        code_blocks = collector.code_blocks
-        links = collector.links
-        meta = collector.meta
+        sections = collector.sections if self.config.get("extract_sections", True) else []
+        code_blocks = (
+            collector.code_blocks if self.config.get("extract_code_blocks", True) else []
+        )
+        links = collector.links if self.config.get("extract_links", True) else []
+        meta = collector.meta if self.config.get("extract_meta", True) else []
         title = collector.title
         imports = collector.imports
         comments = collector.comments
@@ -258,8 +308,29 @@ class _HtmlCollector(_StdlibHTMLParser):
     accumulate text into the right bucket as it arrives.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        asset_tags: dict | None = None,
+        comment_tags=None,
+        extract_imports: bool = True,
+        extract_comments: bool = True,
+    ) -> None:
         super().__init__(convert_charrefs=True)
+
+        # Per-instance config so the parser can be reconfigured at
+        # runtime (e.g. when the user toggles a knob in Settings).
+        self._asset_tags: dict[str, str] = (
+            dict(asset_tags) if asset_tags else dict(_ASSET_TAGS)
+        )
+        self._extract_imports = extract_imports
+        self._extract_comments = extract_comments
+        if comment_tags:
+            alt = "|".join(re.escape(t) for t in comment_tags)
+            self._comment_tag_re = re.compile(
+                rf"\b({alt})\b[:\s]*(.*)", re.IGNORECASE
+            )
+        else:
+            self._comment_tag_re = _HTML_COMMENT_TAG_RE
 
         self.title: str | None = None
         self.sections: list[dict] = []
@@ -509,8 +580,10 @@ class _HtmlCollector(_StdlibHTMLParser):
                     sec["_buf"].append(data)
 
     def handle_comment(self, data: str) -> None:
+        if not self._extract_comments:
+            return
         line, _ = self.getpos()
-        m = _HTML_COMMENT_TAG_RE.search(data)
+        m = self._comment_tag_re.search(data)
         if not m:
             return
         self.comments.append({
@@ -553,7 +626,9 @@ class _HtmlCollector(_StdlibHTMLParser):
         self, tag: str, attrs: dict[str, str], line: int
     ) -> None:
         """Record an asset reference as an ``imports`` entry, if any."""
-        attr = _ASSET_TAGS.get(tag)
+        if not self._extract_imports:
+            return
+        attr = self._asset_tags.get(tag)
         if not attr:
             return
         url = attrs.get(attr, "").strip()

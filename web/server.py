@@ -19,6 +19,7 @@ import asyncio
 import json as json_mod
 import logging
 import os
+import threading
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -130,11 +131,27 @@ def _load_settings():
         settings = dict(DEFAULT_SETTINGS)
     # Refresh the plugins section from the live plugins/ directory so
     # settings.json is always an accurate mirror of what's installed.
+    # IMPORTANT: the ``config`` slot inside each plugin entry is reserved
+    # for **user overrides** written by ``PATCH /api/settings/plugins/
+    # <name>/config`` (Phase 2B). We must therefore strip the on-disk
+    # ``config.json`` mirror that ``detect_installed_plugins()`` puts
+    # into that slot — otherwise the next call to ``_load_settings``
+    # would stomp anything the user just patched. The on-disk values
+    # are still available live via ``detect_installed_plugins()`` /
+    # ``load_plugin_config()``; we just don't *persist* them here.
     try:
         from apollo.projects.settings import detect_installed_plugins
         detected = detect_installed_plugins()
-        if settings.get("plugins") != detected:
-            settings["plugins"] = detected
+        existing = settings.get("plugins") or {}
+        new_plugins: dict = {}
+        for name, meta in detected.items():
+            entry = {k: v for k, v in meta.items() if k != "config"}
+            user_override = (existing.get(name) or {}).get("config")
+            if isinstance(user_override, dict) and user_override:
+                entry["config"] = user_override
+            new_plugins[name] = entry
+        if new_plugins != settings.get("plugins"):
+            settings["plugins"] = new_plugins
             _save_settings(settings)
     except Exception:
         # Detection is best-effort; never block settings load on it.
@@ -199,6 +216,23 @@ class ConnectionManager:
                 stale.append(ws)
         for ws in stale:
             self.disconnect(ws)
+
+
+def _build_active_parsers() -> list:
+    """Construct the active parser list from plugin discovery.
+
+    Re-runs :func:`apollo.plugins.discover_plugins` (which honours each
+    plugin's ``config.json`` ``enabled`` flag and merged user overrides
+    from ``data/settings.json``) and appends a ``TextFileParser`` fallback
+    so plain text / data files are still indexed when no plugin claims
+    them.
+    """
+    from apollo.plugins import discover_plugins
+    from apollo.parser import TextFileParser
+    found = list(discover_plugins())
+    if not any(isinstance(p, TextFileParser) for p in found):
+        found.append(TextFileParser())
+    return found
 
 
 def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
@@ -375,6 +409,30 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     watcher = None
     _event_loop = None
 
+    # ── Active parser list (Phase 2B) ────────────────────────────
+    # `parsers` is the back-compat argument from CLI callers. The
+    # internal `_active_parsers` list is what `/api/index` and the
+    # PATCH-driven `_reload_parsers()` mutate at runtime so a plugin
+    # config flip takes effect with no server restart. We seed it from
+    # plugin discovery; a lock guards in-place mutation so a reload
+    # cannot race with an in-flight indexing pass.
+    _parsers_lock = threading.Lock()
+    _active_parsers: list = _build_active_parsers()
+
+    def _reload_parsers() -> int:
+        """Re-run plugin discovery and atomically swap ``_active_parsers``.
+
+        Mutates the list in place under ``_parsers_lock`` so any caller
+        that captured the reference (e.g. the running file watcher) sees
+        the new contents next time it iterates. Returns the new parser
+        count.
+        """
+        new_list = _build_active_parsers()
+        with _parsers_lock:
+            _active_parsers[:] = new_list
+        logger.info("plugin parsers reloaded: %d active", len(new_list))
+        return len(new_list)
+
     def _ws_on_update(update: dict):
         """Called from watcher thread — schedule async broadcast on event loop."""
         nonlocal _event_loop
@@ -517,12 +575,19 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             if parsers:
                 build_parsers = parsers
             else:
-                build_parsers = [PythonParser(), TextFileParser()]
-                try:
-                    from apollo.parser import TreeSitterParser
-                    build_parsers.insert(0, TreeSitterParser())
-                except Exception:
-                    pass
+                # Snapshot the live plugin-driven parser list under the
+                # lock so a concurrent _reload_parsers() can't mutate it
+                # mid-build. Falls back to the legacy hard-coded set
+                # only if discovery returned nothing (no plugins).
+                with _parsers_lock:
+                    build_parsers = list(_active_parsers)
+                if not build_parsers:
+                    build_parsers = [PythonParser(), TextFileParser()]
+                    try:
+                        from apollo.parser import TreeSitterParser
+                        build_parsers.insert(0, TreeSitterParser())
+                    except Exception:
+                        pass
 
             t0 = time.time()
             logger.info("indexing step 1/4: parsing files in %s", target)
@@ -1299,6 +1364,10 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     @app.get("/api/settings")
     def get_settings():
         from apollo.chat.providers import PROVIDERS, public_registry
+        from apollo.projects.settings import (
+            detect_installed_plugins,
+            load_plugin_config,
+        )
         settings = _load_settings()
         # API keys live exclusively in env vars (.env). Surface them masked
         # so the UI can show "set" vs "empty" without leaking secrets.
@@ -1312,6 +1381,35 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             base = dict(DEFAULT_SETTINGS.get(section, {}))
             base.update(settings.get(section, {}) or {})
             return base
+
+        # Compose the per-plugin payload the Settings → Plugins UI needs:
+        #   * everything _load_settings() persists (installed/version/sha256/
+        #     plus any user override under "config"),
+        #   * a fresh ``config_schema`` field — the raw on-disk
+        #     ``config.json`` including ``_<key>`` description siblings —
+        #     so the UI can auto-render labels and tooltips,
+        #   * a fresh ``config`` field — the merged effective values
+        #     (on-disk defaults ⊕ user overrides, ``_<key>`` stripped) —
+        #     so the form controls can be populated without the client
+        #     having to do the merge itself.
+        plugins_out: dict = {}
+        try:
+            installed = detect_installed_plugins()
+        except Exception:
+            installed = {}
+        for name, entry in (settings.get("plugins") or {}).items():
+            out = dict(entry)
+            schema = (installed.get(name) or {}).get("config") or {}
+            if schema:
+                out["config_schema"] = schema
+            try:
+                merged = load_plugin_config(name)
+            except Exception:
+                merged = {}
+            if merged or schema:
+                out["config"] = merged
+            plugins_out[name] = out
+
         return {
             "providers": public_registry(),
             "api_keys": api_keys,
@@ -1322,8 +1420,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "reindex": _merged("reindex"),
             "captures": _merged("captures"),
             "logging": _merged("logging"),
-            # Read-only: which plugins are present under ``plugins/``.
-            "plugins": settings.get("plugins") or {},
+            # Read-only metadata + on-disk schema + merged effective config
+            # for every plugin present under ``plugins/``.
+            "plugins": plugins_out,
         }
 
     @app.put("/api/settings")
@@ -1437,6 +1536,159 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             chat_service.reset_client()
 
         return {"status": "saved"}
+
+    # -------------------------------------------------- Plugin config (2B) --
+
+    # JSON value types we accept in a per-plugin config override. Anything
+    # else (e.g. an arbitrary class instance) is rejected as a 400 so the
+    # settings file stays JSON-serializable round-trip.
+    _PLUGIN_CONFIG_TYPES = (bool, int, float, str, list, dict, type(None))
+
+    def _validate_plugin_value(key: str, value, expected) -> None:
+        """Raise HTTPException(400) when ``value`` is not type-compatible
+        with the on-disk default ``expected`` for ``key``.
+
+        ``enabled`` is special-cased as a strict ``bool``. For everything
+        else we require the value to be the same broad JSON kind as the
+        on-disk default (so a config that ships ``"comment_tags": []``
+        accepts any list, even an empty one).
+        """
+        if key == "enabled":
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`enabled` must be a bool, got {type(value).__name__}",
+                )
+            return
+        if not isinstance(value, _PLUGIN_CONFIG_TYPES):
+            raise HTTPException(
+                status_code=400,
+                detail=f"`{key}` has unsupported value type: {type(value).__name__}",
+            )
+        # Allow null to clear a key only when the on-disk default is
+        # also null (rare); otherwise require a matching kind.
+        if expected is None:
+            return
+        # bool is a subclass of int — disallow that conflation.
+        if isinstance(expected, bool):
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a bool, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a number, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, str):
+            if not isinstance(value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a string, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, list):
+            if not isinstance(value, list):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a list, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, dict):
+            if not isinstance(value, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be an object, got {type(value).__name__}",
+                )
+            return
+
+    @app.patch("/api/settings/plugins/{name}/config")
+    async def patch_plugin_config(name: str, request: Request):
+        """Apply a partial config override for plugin *name* and reload.
+
+        Body is a partial dict of overrides (a strict subset of keys
+        present in the plugin's on-disk ``config.json``). Validates:
+        - the plugin exists on disk,
+        - every key is known (rejects typos / stale fields),
+        - every value's type matches the on-disk default,
+        - ``enabled`` is a bool when present.
+
+        On success the override is persisted to ``data/settings.json``
+        under ``plugins[<name>].config`` and ``_reload_parsers()`` swaps
+        the live parser list so subsequent requests see the new config.
+        """
+        from apollo.projects.settings import detect_installed_plugins
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        installed = detect_installed_plugins()
+        if name not in installed:
+            raise HTTPException(status_code=404, detail=f"Unknown plugin: {name}")
+
+        on_disk = installed[name].get("config") or {}
+        if not on_disk:
+            # Plugin has no config.json; refuse to invent keys for it.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Plugin {name!r} ships no config.json; nothing to override",
+            )
+
+        # Validate keys + types up-front so a bad request never persists.
+        for k, v in body.items():
+            # Reject `_<key>` description siblings — they are docs for
+            # the Settings UI, not runtime knobs, and editing them via
+            # the API would just confuse the schema. The on-disk
+            # config.json is the source of truth for descriptions.
+            if isinstance(k, str) and k.startswith("_"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot patch description sibling {k!r}: "
+                        "keys starting with '_' are read-only docs."
+                    ),
+                )
+            if k not in on_disk:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown config key for plugin {name!r}: {k!r}",
+                )
+            _validate_plugin_value(k, v, on_disk[k])
+
+        # Persist the merged override under plugins[name].config. We
+        # merge over any existing override so a partial patch doesn't
+        # erase keys the user previously set.
+        current = _load_settings()
+        plugins_section = current.setdefault("plugins", {})
+        plugin_entry = plugins_section.setdefault(name, {})
+        existing_override = plugin_entry.get("config") or {}
+        if not isinstance(existing_override, dict):
+            existing_override = {}
+        existing_override.update(body)
+        plugin_entry["config"] = existing_override
+        _save_settings(current)
+
+        # Hot-swap the active parser list so the change takes effect
+        # immediately without a server restart.
+        try:
+            n = _reload_parsers()
+        except Exception:
+            logger.exception("failed to reload parsers after plugin config patch")
+            n = -1
+
+        return {
+            "status": "saved",
+            "plugin": name,
+            "config": existing_override,
+            "active_parsers": n,
+        }
 
     # ---------------------------------------------------------------- Chat --
 

@@ -3081,47 +3081,336 @@ function _esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// Cache the most recent /api/settings plugins payload so the inline
+// PATCH handlers below can read schemas / current values without
+// having to re-fetch the whole settings document for every keystroke.
+let _pluginsCache = {};
+
 function renderPluginsList(plugins) {
   const host = document.getElementById('plugins-list');
   if (!host) return;
-  const names = Object.keys(plugins).sort();
+  _pluginsCache = plugins || {};
+  const names = Object.keys(_pluginsCache).sort();
   if (!names.length) {
     host.innerHTML = '<span class="opacity-50">No plugins detected under <code class="font-mono">plugins/</code>.</span>';
     return;
   }
-  const cards = names.map(name => {
-    const p = plugins[name] || {};
-    const installed = !!p.installed;
-    const badge = installed
-      ? '<span class="badge badge-success badge-sm">installed</span>'
-      : '<span class="badge badge-ghost badge-sm">unavailable</span>';
-    const desc = p.description
-      ? `<p class="text-xs opacity-70 mt-1">${_esc(p.description)}</p>`
-      : '<p class="text-xs opacity-40 italic mt-1">No description (missing or invalid plugin.md)</p>';
-    const version = p.version
-      ? `<span class="badge badge-outline badge-sm font-mono cursor-help" title="SHA-256(parser.py): ${_esc(p.sha256) || '(unavailable)'}">v${_esc(p.version)}</span>`
-      : '<span class="badge badge-ghost badge-sm">no version</span>';
-    const url = p.url
-      ? `<a href="${_esc(p.url)}" target="_blank" rel="noopener" class="link link-primary text-xs break-all">${_esc(p.url)}</a>`
-      : '<span class="opacity-40 text-xs italic">no url</span>';
-    const author = p.author
-      ? `<span class="text-xs">${_esc(p.author)}</span>`
-      : '<span class="opacity-40 text-xs italic">unknown</span>';
-    return `
-      <div class="border border-base-300 rounded-lg p-3 mb-3">
-        <div class="flex items-center gap-2 flex-wrap">
-          <code class="font-mono text-sm font-semibold">${_esc(name)}</code>
-          ${version}
-          ${badge}
-        </div>
-        ${desc}
-        <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 mt-2 text-xs">
-          <span class="opacity-50">Author:</span>${author}
-          <span class="opacity-50">URL:</span>${url}
-        </div>
-      </div>`;
-  }).join('');
+  const cards = names.map(name => _renderPluginCard(name, _pluginsCache[name] || {})).join('');
   host.innerHTML = cards;
+  // Wire interactive controls after the DOM is in place.
+  names.forEach(name => _bindPluginCard(name));
+}
+
+/* Build the markup for a single plugin card. */
+function _renderPluginCard(name, p) {
+  const installed = !!p.installed;
+  const schema = (p && p.config_schema) || {};
+  const merged = (p && p.config) || {};
+  const hasConfig = Object.keys(schema).length > 0;
+  const enabled = hasConfig ? (merged.enabled !== false) : true;
+
+  const statusBadge = installed
+    ? '<span class="badge badge-success badge-sm">installed</span>'
+    : '<span class="badge badge-ghost badge-sm">unavailable</span>';
+  const enabledBadge = hasConfig
+    ? (enabled
+        ? '<span class="badge badge-info badge-sm" data-role="enabled-badge">enabled</span>'
+        : '<span class="badge badge-warning badge-sm" data-role="enabled-badge">disabled</span>')
+    : '';
+  const desc = p.description
+    ? `<p class="text-xs opacity-70 mt-1">${_esc(p.description)}</p>`
+    : '<p class="text-xs opacity-40 italic mt-1">No description (missing or invalid plugin.md)</p>';
+  const version = p.version
+    ? `<span class="badge badge-outline badge-sm font-mono cursor-help" title="SHA-256(parser.py): ${_esc(p.sha256) || '(unavailable)'}">v${_esc(p.version)}</span>`
+    : '<span class="badge badge-ghost badge-sm">no version</span>';
+  const url = p.url
+    ? `<a href="${_esc(p.url)}" target="_blank" rel="noopener" class="link link-primary text-xs break-all">${_esc(p.url)}</a>`
+    : '<span class="opacity-40 text-xs italic">no url</span>';
+  const author = p.author
+    ? `<span class="text-xs">${_esc(p.author)}</span>`
+    : '<span class="opacity-40 text-xs italic">unknown</span>';
+
+  const enableToggle = hasConfig ? `
+        <label class="cursor-pointer flex items-center gap-2 ml-auto" title="${_esc(_pluginFieldDoc(schema, 'enabled') || 'Enable / disable this plugin')}">
+          <span class="text-xs opacity-60">enabled</span>
+          <input type="checkbox" class="toggle toggle-sm toggle-success" data-role="plugin-enabled" ${enabled ? 'checked' : ''} />
+        </label>` : '';
+
+  const settingsPanel = hasConfig
+    ? _renderPluginSettingsPanel(name, schema, merged)
+    : '';
+
+  return `
+    <div class="border border-base-300 rounded-lg p-3 mb-3" data-plugin-name="${_esc(name)}">
+      <div class="flex items-center gap-2 flex-wrap">
+        <code class="font-mono text-sm font-semibold">${_esc(name)}</code>
+        ${version}
+        ${statusBadge}
+        ${enabledBadge}
+        ${enableToggle}
+      </div>
+      ${desc}
+      <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 mt-2 text-xs">
+        <span class="opacity-50">Author:</span>${author}
+        <span class="opacity-50">URL:</span>${url}
+      </div>
+      ${settingsPanel}
+    </div>`;
+}
+
+/* Look up a `_<key>` description sibling on the on-disk schema. */
+function _pluginFieldDoc(schema, key) {
+  const v = schema['_' + key];
+  return typeof v === 'string' ? v : '';
+}
+
+/* Build the collapsible "Settings" panel for one plugin. Inputs are
+   typed off the on-disk schema's value (so a JSON `bool` always renders
+   as a checkbox even if the user-saved override happens to be the
+   wrong type). Read-only types render a <pre> JSON view. */
+function _renderPluginSettingsPanel(name, schema, merged) {
+  // Collect runtime keys (skip `_<key>` description siblings, and skip
+  // `enabled` because it has its own dedicated toggle in the header).
+  const keys = Object.keys(schema)
+    .filter(k => !k.startsWith('_') && k !== 'enabled')
+    .sort();
+  if (!keys.length) {
+    return `
+      <details class="mt-3">
+        <summary class="cursor-pointer text-xs opacity-70 select-none">Settings</summary>
+        <div class="mt-2 text-xs opacity-50 italic">This plugin has no editable settings.</div>
+      </details>`;
+  }
+  const rows = keys.map(k => _renderPluginField(name, k, schema, merged)).join('');
+  return `
+    <details class="mt-3 plugin-settings-panel">
+      <summary class="cursor-pointer text-xs opacity-70 select-none">Settings</summary>
+      <div class="mt-2 grid grid-cols-1 gap-3 text-xs">
+        ${rows}
+      </div>
+      <div class="flex justify-end gap-2 mt-3">
+        <button type="button" class="btn btn-xs btn-ghost" data-role="plugin-reset">Reset to defaults</button>
+        <button type="button" class="btn btn-xs btn-primary" data-role="plugin-save">Save</button>
+      </div>
+    </details>`;
+}
+
+/* Render a single field row. `key` is the runtime knob; the schema's
+   value at `key` decides which control we draw. */
+function _renderPluginField(name, key, schema, merged) {
+  const onDisk = schema[key];
+  const current = (merged && key in merged) ? merged[key] : onDisk;
+  const doc = _pluginFieldDoc(schema, key);
+  const labelHtml = `
+    <div class="flex items-center gap-2">
+      <code class="font-mono text-xs opacity-80">${_esc(key)}</code>
+      ${doc ? `<span class="opacity-50 text-[11px]">— ${_esc(doc)}</span>` : ''}
+    </div>`;
+
+  const dataAttr = `data-plugin-field="${_esc(key)}"`;
+
+  if (typeof onDisk === 'boolean') {
+    return `
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input type="checkbox" class="checkbox checkbox-sm mt-0.5" ${dataAttr} data-plugin-type="bool" ${current ? 'checked' : ''} />
+        <div class="flex-1">${labelHtml}</div>
+      </label>`;
+  }
+  if (typeof onDisk === 'number' && Number.isInteger(onDisk)) {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="number" step="1" class="input input-bordered input-xs w-48 font-mono" ${dataAttr} data-plugin-type="int" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (typeof onDisk === 'number') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="number" step="any" class="input input-bordered input-xs w-48 font-mono" ${dataAttr} data-plugin-type="float" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (typeof onDisk === 'string') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="text" class="input input-bordered input-xs w-full font-mono" ${dataAttr} data-plugin-type="string" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (Array.isArray(onDisk)) {
+    const allStrings = onDisk.every(x => typeof x === 'string');
+    if (allStrings) {
+      const tags = Array.isArray(current) ? current : [];
+      return `
+        <div class="flex flex-col gap-1">
+          ${labelHtml}
+          <input type="text" class="input input-bordered input-xs w-full font-mono" ${dataAttr} data-plugin-type="list[str]" value="${_esc(tags.join(', '))}" placeholder="comma-separated values" />
+        </div>`;
+    }
+    // Non-string list → read-only JSON.
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+        <span class="opacity-50 text-[11px] italic">Read-only in v1 (edit <code>config.json</code> directly).</span>
+      </div>`;
+  }
+  if (onDisk && typeof onDisk === 'object') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+        <span class="opacity-50 text-[11px] italic">Read-only in v1 (edit <code>config.json</code> directly).</span>
+      </div>`;
+  }
+  // Fallback: null / unsupported → show JSON preview.
+  return `
+    <div class="flex flex-col gap-1">
+      ${labelHtml}
+      <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+    </div>`;
+}
+
+/* Wire toggle + Save + Reset for a single plugin card. */
+function _bindPluginCard(name) {
+  const card = document.querySelector(`[data-plugin-name="${CSS.escape(name)}"]`);
+  if (!card) return;
+
+  const toggle = card.querySelector('[data-role="plugin-enabled"]');
+  if (toggle && !toggle.dataset.bound) {
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('change', async () => {
+      const newVal = !!toggle.checked;
+      const ok = await _patchPluginConfig(name, { enabled: newVal });
+      if (!ok) {
+        // revert UI on failure
+        toggle.checked = !newVal;
+      } else {
+        showToast(`Plugin ${name}: ${newVal ? 'enabled' : 'disabled'}`, 'success');
+        // Refresh so badges + computed merged values stay in sync.
+        await loadSettings();
+      }
+    });
+  }
+
+  const saveBtn = card.querySelector('[data-role="plugin-save"]');
+  if (saveBtn && !saveBtn.dataset.bound) {
+    saveBtn.dataset.bound = '1';
+    saveBtn.addEventListener('click', async () => {
+      const diff = _collectPluginDiff(card, name);
+      if (diff === null) return; // collection error (toast already shown)
+      if (Object.keys(diff).length === 0) {
+        showToast('No changes to save', 'info');
+        return;
+      }
+      const ok = await _patchPluginConfig(name, diff);
+      if (ok) {
+        showToast(`Plugin ${name}: saved`, 'success');
+        await loadSettings();
+      }
+    });
+  }
+
+  const resetBtn = card.querySelector('[data-role="plugin-reset"]');
+  if (resetBtn && !resetBtn.dataset.bound) {
+    resetBtn.dataset.bound = '1';
+    resetBtn.addEventListener('click', async () => {
+      const schema = (_pluginsCache[name] || {}).config_schema || {};
+      // Build a payload of every editable runtime knob (skip `_<key>`
+      // description siblings) set back to its on-disk default. We
+      // include `enabled` so disabled→enabled also resets via the
+      // same call.
+      const defaults = {};
+      Object.keys(schema).forEach(k => {
+        if (k.startsWith('_')) return;
+        const v = schema[k];
+        // Skip dict / non-string list — they're read-only in v1, but
+        // sending the on-disk value back is still safe and keeps the
+        // override store clean.
+        defaults[k] = v;
+      });
+      const ok = await _patchPluginConfig(name, defaults);
+      if (ok) {
+        showToast(`Plugin ${name}: reset to defaults`, 'success');
+        await loadSettings();
+      }
+    });
+  }
+}
+
+/* Walk the form controls inside a card and collect a partial diff
+   against the currently-loaded merged values. Returns `null` on a
+   parse error (and toasts the user). */
+function _collectPluginDiff(card, name) {
+  const schema = (_pluginsCache[name] || {}).config_schema || {};
+  const merged = (_pluginsCache[name] || {}).config || {};
+  const diff = {};
+  const fields = card.querySelectorAll('[data-plugin-field]');
+  for (const el of fields) {
+    const key = el.getAttribute('data-plugin-field');
+    const type = el.getAttribute('data-plugin-type');
+    if (type === 'json-readonly') continue;
+    let value;
+    try {
+      if (type === 'bool') {
+        value = !!el.checked;
+      } else if (type === 'int') {
+        const raw = el.value.trim();
+        if (raw === '') continue; // skip empty -> treat as no change
+        value = parseInt(raw, 10);
+        if (Number.isNaN(value)) throw new Error(`"${key}" must be an integer`);
+      } else if (type === 'float') {
+        const raw = el.value.trim();
+        if (raw === '') continue;
+        value = parseFloat(raw);
+        if (Number.isNaN(value)) throw new Error(`"${key}" must be a number`);
+      } else if (type === 'string') {
+        value = el.value;
+      } else if (type === 'list[str]') {
+        value = el.value
+          .split(',')
+          .map(s => s.trim())
+          .filter(s => s.length > 0);
+      } else {
+        continue;
+      }
+    } catch (e) {
+      showToast(e.message || String(e), 'error');
+      return null;
+    }
+    const current = (key in merged) ? merged[key] : schema[key];
+    if (!_pluginValuesEqual(current, value)) {
+      diff[key] = value;
+    }
+  }
+  return diff;
+}
+
+function _pluginValuesEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/* PATCH /api/settings/plugins/<name>/config with a body, surfacing
+   server validation errors via a toast. Returns true on success. */
+async function _patchPluginConfig(name, body) {
+  try {
+    await apiFetch(`/api/settings/plugins/${encodeURIComponent(name)}/config`, {
+      method: 'PATCH',
+      body,
+    });
+    return true;
+  } catch (e) {
+    showToast(`Plugin ${name}: ${e.message || e}`, 'error');
+    return false;
+  }
 }
 
 function collectExtraSettings() {

@@ -51,6 +51,28 @@ def _sha256_of_file(path: Path) -> Optional[str]:
         return None
 
 
+def _read_plugin_config(config_path: Path) -> dict:
+    """Read a plugin's ``config.json`` and return it as a dict.
+
+    Returns an empty dict for missing or unreadable files. Malformed
+    JSON is logged and treated as empty so a broken config never blocks
+    plugin discovery — the plugin will fall back to its
+    ``DEFAULT_CONFIG``.
+    """
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        logger.warning("plugin config %s is not a JSON object; ignoring", config_path)
+        return {}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning("failed to read plugin config %s: %s", config_path, exc)
+        return {}
+
+
 def _read_plugin_manifest(manifest_path: Path) -> dict:
     """Parse a plugin's ``plugin.md`` and return the metadata dict.
 
@@ -97,6 +119,7 @@ def detect_installed_plugins() -> dict:
             "url":         "...",
             "author":      "...",
             "sha256":      "<sha256 of parser.py>",  # "" if unreadable
+            "config":      {...},  # contents of the plugin's config.json
         }
 
     Subpackage plugins (``plugins/<name>/__init__.py``) and single-file
@@ -104,6 +127,12 @@ def detect_installed_plugins() -> dict:
     plugins should ship a ``plugin.md`` manifest (see
     ``guides/making_plugins.md``); single-file plugins look for a
     sibling ``<name>.plugin.md``.
+
+    The ``config`` field is the on-disk ``config.json`` for the plugin
+    (or ``<name>.config.json`` next to a single-file plugin). Missing
+    or malformed configs become an empty dict. User overrides stored
+    under ``data/settings.json`` → ``plugins[<name>].config`` are NOT
+    merged here; use :func:`load_plugin_config` for the merged view.
     """
     root = Path(__file__).parent.parent.parent  # Apollo project root
     plugins_dir = root / "plugins"
@@ -119,18 +148,94 @@ def detect_installed_plugins() -> dict:
         if entry.is_dir() and (entry / "__init__.py").exists():
             manifest = entry / "plugin.md"
             parser_file = entry / "parser.py"
+            config_file = entry / "config.json"
             meta = _read_plugin_manifest(manifest)
             digest = _sha256_of_file(parser_file) if parser_file.exists() else ""
-            result[name] = {"installed": True, **meta, "sha256": digest or ""}
+            cfg = _read_plugin_config(config_file)
+            result[name] = {"installed": True, **meta, "sha256": digest or "", "config": cfg}
 
         elif entry.is_file() and entry.suffix == ".py" and entry.stem != "__init__":
             stem = entry.stem
             manifest = plugins_dir / f"{stem}.plugin.md"
+            config_file = plugins_dir / f"{stem}.config.json"
             meta = _read_plugin_manifest(manifest)
             digest = _sha256_of_file(entry) or ""
-            result[stem] = {"installed": True, **meta, "sha256": digest}
+            cfg = _read_plugin_config(config_file)
+            result[stem] = {"installed": True, **meta, "sha256": digest, "config": cfg}
 
     return result
+
+
+def load_plugin_config(name: str, settings_path: Optional[Union[str, Path]] = None) -> dict:
+    """Return the merged config for plugin *name*.
+
+    Order of precedence (later wins):
+
+    1. The plugin's on-disk ``config.json`` (or ``<name>.config.json``
+       for single-file plugins).
+    2. User overrides stored in ``data/settings.json`` under
+       ``plugins[<name>].config``.
+
+    Returns ``{}`` if the plugin has neither an on-disk config nor a
+    user override (e.g. a third-party plugin that doesn't ship one).
+
+    User overrides intentionally live in the global settings file —
+    NOT in the plugin's own folder — so that upgrading a plugin (which
+    overwrites its bundled ``config.json``) cannot clobber what the
+    user chose. Stale keys carried over from an older plugin version
+    are silently dropped during merge; a one-line warning is logged.
+
+    **Description siblings (`_<key>`)** are dropped from the returned
+    dict. By convention each runtime knob can ship a sibling key
+    prefixed with ``_`` whose value is a human-readable description
+    used by the Settings UI for tooltips/labels. Those keys are not
+    runtime data, so the parser must never see them.
+    """
+    root = Path(__file__).parent.parent.parent
+    plugins_dir = root / "plugins"
+
+    on_disk: dict = {}
+    sub_cfg = plugins_dir / name / "config.json"
+    single_cfg = plugins_dir / f"{name}.config.json"
+    if sub_cfg.exists():
+        on_disk = _read_plugin_config(sub_cfg)
+    elif single_cfg.exists():
+        on_disk = _read_plugin_config(single_cfg)
+
+    # Read user overrides directly from settings.json so we don't pull
+    # in the full SettingsManager (avoids circular init in tests).
+    override: dict = {}
+    if settings_path is None:
+        settings_path = root / "data" / "settings.json"
+    settings_path = Path(settings_path)
+    if settings_path.exists():
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+            override = (
+                data.get("plugins", {}).get(name, {}).get("config", {}) or {}
+            )
+            if not isinstance(override, dict):
+                override = {}
+        except (OSError, json.JSONDecodeError, ValueError):
+            override = {}
+
+    merged = dict(on_disk)
+    stale: list[str] = []
+    for k, v in override.items():
+        if on_disk and k not in on_disk:
+            # Drop stale keys from older config versions, but warn.
+            stale.append(k)
+            continue
+        merged[k] = v
+    if stale:
+        logger.warning(
+            "plugin %r: dropping stale override keys not in on-disk config.json: %s",
+            name, sorted(stale),
+        )
+    # Strip `_<key>` description siblings — they are documentation for
+    # the Settings UI, never runtime values.
+    return {k: v for k, v in merged.items() if not k.startswith("_")}
 
 
 @dataclass
@@ -191,9 +296,23 @@ class SettingsManager:
         else:
             loaded = SettingsData()
 
+        # See ``web.server._load_settings`` for the rationale: the
+        # ``config`` slot inside each plugin entry is reserved for user
+        # overrides (PATCH-driven), so we must NOT mirror the on-disk
+        # ``config.json`` into it — that would clobber overrides on the
+        # next load. Strip ``config`` from detected metadata and only
+        # carry forward whatever the user previously set.
         detected = detect_installed_plugins()
-        if loaded.plugins != detected:
-            loaded.plugins = detected
+        existing = loaded.plugins or {}
+        new_plugins: dict = {}
+        for name, meta in detected.items():
+            entry = {k: v for k, v in meta.items() if k != "config"}
+            user_override = (existing.get(name) or {}).get("config")
+            if isinstance(user_override, dict) and user_override:
+                entry["config"] = user_override
+            new_plugins[name] = entry
+        if loaded.plugins != new_plugins:
+            loaded.plugins = new_plugins
             self._data = loaded
             try:
                 self.save()

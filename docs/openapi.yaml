@@ -637,6 +637,68 @@ paths:
                     type: string
                     enum: [saved]
 
+  /api/settings/plugins/{name}/config:
+    patch:
+      operationId: patchPluginConfig
+      tags: [Settings]
+      summary: Apply a partial config override for a plugin and hot-reload
+      description: >
+        Validates the body against the plugin's on-disk ``config.json``
+        (every key must be present in the on-disk schema and every value
+        must be type-compatible with the on-disk default; ``enabled`` is
+        a strict bool when present), persists the merged override under
+        ``plugins[<name>].config`` in ``data/settings.json``, and re-runs
+        plugin discovery so subsequent requests use the new parser list
+        with no server restart.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Plugin folder name under ``plugins/`` (e.g. ``markdown_gfm``).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: >
+                Partial dict of config overrides. Keys MUST exist in the
+                plugin's on-disk ``config.json``. Values MUST type-match
+                the corresponding on-disk default; ``enabled`` is a
+                strict ``bool``.
+              example:
+                enabled: false
+      responses:
+        "200":
+          description: Override saved and parser list reloaded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, plugin, config, active_parsers]
+                properties:
+                  status:
+                    type: string
+                    enum: [saved]
+                  plugin:
+                    type: string
+                  config:
+                    type: object
+                    additionalProperties: true
+                    description: Merged user-override dict after the patch.
+                  active_parsers:
+                    type: integer
+                    description: Number of parsers active after the reload.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
   # ── Chat ────────────────────────────────────────────────────────────
   /api/chat/status:
     get:

@@ -156,3 +156,21 @@ class TestMarkdownGfmPluginParsesRealMarkdown:
         f = tmp_path / "empty.md"
         f.write_text("   \n  \n")
         assert MarkdownParser().parse_file(str(f)) is None
+
+
+class TestMarkdownGfmPluginConfig:
+    """Phase 2A: parser receives its merged config and respects ``enabled``."""
+
+    def test_disabled_plugin_can_parse_returns_false(self, tmp_path):
+        f = tmp_path / "doc.md"
+        f.write_text("# hi\n")
+        parser = MarkdownParser(config={"enabled": False})
+        assert parser.can_parse(str(f)) is False
+
+    def test_extract_links_toggle_off_yields_empty_links(self, tmp_path):
+        f = tmp_path / "doc.md"
+        f.write_text("# T\n\n[ext](https://example.com)\n")
+        parser = MarkdownParser(config={"extract_links": False})
+        result = parser.parse_file(str(f))
+        assert result is not None
+        assert result["links"] == []

@@ -73,13 +73,24 @@ logger = logging.getLogger(__name__)
 # Module-level regexes & constants
 # ---------------------------------------------------------------------
 
-# Matches "tagged" comments such as ``# TODO: clean this up`` or
-# ``# FIXME maybe?``. Group 1 is the tag, group 2 is the trailing text.
-# The regex is case-insensitive but the tag is upper-cased on storage so
-# downstream consumers can do exact-match comparisons.
+# Default tag set for "tagged" comments such as ``# TODO: clean this up``
+# or ``# FIXME maybe?``. The regex is case-insensitive but the tag is
+# upper-cased on storage so downstream consumers can do exact-match
+# comparisons. The actual set used at runtime is ``self.config["comment_tags"]``;
+# this constant is the source-of-truth default mirrored in
+# ``DEFAULT_CONFIG`` and ``plugins/python3/config.json``.
+_DEFAULT_COMMENT_TAGS = ("TODO", "FIXME", "NOTE", "HACK", "XXX")
 _COMMENT_TAG_RE = re.compile(
     r"#\s*(TODO|FIXME|NOTE|HACK|XXX)\b[:\s]*(.*)", re.IGNORECASE
 )
+
+
+def _build_comment_tag_re(tags) -> re.Pattern:
+    """Build a tagged-comment regex matching the user-configured tag set."""
+    if not tags:
+        return _COMMENT_TAG_RE
+    alt = "|".join(re.escape(t) for t in tags)
+    return re.compile(rf"#\s*({alt})\b[:\s]*(.*)", re.IGNORECASE)
 
 # Heuristic for detecting embedded SQL inside string literals. We look
 # for a small set of well-known keywords; this is intentionally loose so
@@ -127,17 +138,69 @@ class PythonParser(BaseParser):
     be read, tested, or replaced in isolation.
     """
 
+    #: Source-of-truth defaults for this plugin's runtime knobs. Mirrors
+    #: ``plugins/python3/config.json``. The merged config (defaults ⊕
+    #: user override) is stored on ``self.config`` after construction.
+    DEFAULT_CONFIG: dict = {
+        "enabled": True,
+        "extensions": [".py"],
+        "extract_comments": True,
+        "comment_tags": list(_DEFAULT_COMMENT_TAGS),
+        "extract_strings": True,
+        "extract_type_checking_imports": True,
+        "detect_patterns": True,
+        "known_patterns": {
+            "fastapi": ["fastapi"],
+            "django": ["django"],
+            "flask": ["flask"],
+            "sqlalchemy": ["sqlalchemy"],
+            "pydantic": ["pydantic"],
+            "celery": ["celery"],
+            "pytest": ["pytest"],
+        },
+        "ignore_dirs": [
+            "venv", ".venv", "env", ".env", "virtualenv",
+            "site-packages", "dist-packages",
+            ".eggs", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+            ".ruff_cache", "__pypackages__", "__pycache__", ".pytype",
+        ],
+        "ignore_files": ["*.pyc", "*.pyo", "*.pyd", "*.egg-info"],
+        "ignore_dir_markers": ["pyvenv.cfg", "conda-meta"],
+    }
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialise the parser with its merged config dict.
+
+        The config is shallow-merged on top of :attr:`DEFAULT_CONFIG`:
+        the caller's keys win, and unspecified keys fall back to the
+        defaults. Pass ``None`` (or an empty dict) to use defaults.
+        """
+        merged = dict(self.DEFAULT_CONFIG)
+        if config:
+            merged.update(config)
+        self.config: dict = merged
+        self._comment_tag_re = _build_comment_tag_re(
+            self.config.get("comment_tags") or _DEFAULT_COMMENT_TAGS
+        )
+        # Lower-case extension set for fast lookup in ``can_parse``.
+        self._extensions = frozenset(
+            ext.lower() for ext in (self.config.get("extensions") or [".py"])
+        )
+
     # ------------------------------------------------------------------
     # BaseParser interface
     # ------------------------------------------------------------------
 
     def can_parse(self, filepath: str) -> bool:
-        """Return True if the file has a .py extension.
+        """Return True if the file has a configured Python extension.
 
+        Returns ``False`` when the plugin has been disabled via config.
         Note: extension-only check. We don't sniff ``#!`` shebangs or
         try to read the file — that's the caller's job to optimise.
         """
-        return Path(filepath).suffix == ".py"
+        if not self.config.get("enabled", True):
+            return False
+        return Path(filepath).suffix.lower() in self._extensions
 
     def parse_file(self, filepath: str) -> dict | None:
         """Read *filepath* from disk and delegate to :meth:`parse_source`.
@@ -172,6 +235,27 @@ class PythonParser(BaseParser):
         functions = self._extract_functions(tree, source_lines, parent_map)
         classes = self._extract_classes(tree, source_lines)
 
+        comments = (
+            self._extract_comments(source_lines)
+            if self.config.get("extract_comments", True)
+            else []
+        )
+        type_checking = (
+            self._extract_type_checking_imports(tree)
+            if self.config.get("extract_type_checking_imports", True)
+            else []
+        )
+        strings = (
+            self._extract_strings(tree)
+            if self.config.get("extract_strings", True)
+            else []
+        )
+        patterns = (
+            self._detect_patterns(imports, functions, classes)
+            if self.config.get("detect_patterns", True)
+            else []
+        )
+
         return {
             "file": filepath,
             "module_docstring": ast.get_docstring(tree),
@@ -179,10 +263,10 @@ class PythonParser(BaseParser):
             "classes": classes,
             "imports": imports,
             "variables": self._extract_variables(tree),
-            "comments": self._extract_comments(source_lines),
-            "type_checking_imports": self._extract_type_checking_imports(tree),
-            "strings": self._extract_strings(tree),
-            "patterns": self._detect_patterns(imports, functions, classes),
+            "comments": comments,
+            "type_checking_imports": type_checking,
+            "strings": strings,
+            "patterns": patterns,
         }
 
     # ------------------------------------------------------------------
@@ -570,10 +654,15 @@ class PythonParser(BaseParser):
     # ------------------------------------------------------------------
 
     def _extract_comments(self, source_lines: list[str]) -> list[dict]:
-        """Scan raw source lines for tagged comments."""
+        """Scan raw source lines for tagged comments.
+
+        The tag set is taken from ``self.config["comment_tags"]`` so end
+        users can add custom tags (e.g. ``"REVIEW"``, ``"OPTIMISE"``)
+        from the Settings → Plugins panel without code changes.
+        """
         comments: list[dict] = []
         for lineno, line in enumerate(source_lines, start=1):
-            m = _COMMENT_TAG_RE.search(line)
+            m = self._comment_tag_re.search(line)
             if m:
                 comments.append({
                     "tag": m.group(1).upper(),
@@ -689,15 +778,23 @@ class PythonParser(BaseParser):
         functions: list[dict],
         classes: list[dict],
     ) -> list[str]:
-        """Detect framework/library patterns based on imports and code."""
+        """Detect framework/library patterns based on imports and code.
+
+        The pattern → prefix-list map comes from
+        ``self.config["known_patterns"]`` so users can add or remove
+        framework hints from the Settings UI. The class-level
+        :attr:`_KNOWN_PATTERNS` is the source-of-truth default.
+        """
         import_modules = set()
         for imp in imports:
             mod = imp.get("module", "")
             if mod:
                 import_modules.add(mod.split(".")[0])
 
+        known = self.config.get("known_patterns") or self._KNOWN_PATTERNS
+
         patterns: list[str] = []
-        for pattern, prefixes in self._KNOWN_PATTERNS.items():
+        for pattern, prefixes in known.items():
             if any(p in import_modules for p in prefixes):
                 patterns.append(pattern)
 
