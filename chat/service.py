@@ -116,8 +116,33 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_wordcloud",
-            "description": "Get the most frequent entity names in the graph (for understanding what the codebase contains).",
-            "parameters": {"type": "object", "properties": {}},
+            "description": (
+                "Get the most strongly-connected entity names in the graph, weighted "
+                "by graph strength (sum of in+out degree across nodes sharing a name). "
+                "Use this to understand which symbols are 'hubs' in the codebase — "
+                "high-strength names are likely to be impacted by, or to impact, "
+                "changes elsewhere. Returns up to `limit` items, each with `name`, "
+                "`strength` (sum of degrees), and `count` (number of nodes sharing "
+                "that name). Use `mode='all'` only when you need the long tail "
+                "(weakly-connected helpers and singletons)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["strong", "relevant", "all"],
+                        "description": (
+                            "strong=top 30 hubs (default); relevant=top 100 with "
+                            "strength>=2; all=everything (capped at 500)."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional cap on returned items (defaults to the mode's natural cap).",
+                    },
+                },
+            },
         },
     },
     {
@@ -681,15 +706,50 @@ class ChatService:
         elif name == "get_wordcloud":
             from collections import defaultdict
             exclude = {"directory", "file", "import"}
+            mode = (args.get("mode") or "strong").lower()
+            strengths: dict[str, float] = defaultdict(float)
             counts: dict[str, int] = defaultdict(int)
-            for _, data in self.graph.nodes(data=True):
+            for nid, data in self.graph.nodes(data=True):
                 if data.get("type", "") in exclude:
                     continue
                 n = data.get("name", "")
-                if n:
-                    counts[n] += 1
-            top_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:50]
-            return json.dumps([{"name": n, "count": c} for n, c in top_items])
+                if not n:
+                    continue
+                try:
+                    deg = self.graph.degree(nid)
+                except Exception:
+                    deg = 0
+                strengths[n] += deg
+                counts[n] += 1
+            items = [
+                {"name": n, "strength": float(strengths[n]), "count": counts[n]}
+                for n in strengths
+            ]
+            items.sort(key=lambda x: x["strength"], reverse=True)
+            total = len(items)
+            if mode == "all":
+                cap = 500
+                items = items[:cap]
+                min_strength = 0
+            elif mode == "relevant":
+                cap = 100
+                items = [i for i in items if i["strength"] >= 2][:cap]
+                min_strength = 2
+            else:
+                mode = "strong"
+                cap = 30
+                items = [i for i in items if i["strength"] >= 2][:cap]
+                min_strength = 2
+            requested_limit = args.get("limit")
+            if isinstance(requested_limit, int) and requested_limit > 0:
+                items = items[:requested_limit]
+            return json.dumps({
+                "items": items,
+                "total": total,
+                "shown": len(items),
+                "mode": mode,
+                "min_strength": min_strength,
+            })
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 

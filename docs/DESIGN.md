@@ -412,7 +412,7 @@ A local web application that lets you visually explore the knowledge graph, filt
 | View                   | Library                   | Purpose                                                   |
 |------------------------|---------------------------|-----------------------------------------------------------|
 | **Force-directed graph** | ECharts `type: 'graph'`  | Interactive node-link diagram of code relationships (like the [WebKit dep example](https://echarts.apache.org/examples/en/editor.html?c=graph-webkit-dep)). Nodes = code entities, edges = calls/imports/references. Draggable, zoomable, pannable. |
-| **Word cloud**          | ECharts `echarts-wordcloud` extension | Show most-used symbols, module names, or semantic topics. Click a word to filter the graph to related nodes. |
+| **Idea Cloud**          | ECharts `echarts-wordcloud` extension | Symbols sized by **graph strength** (sum of in+out degree, aggregated by name) — not raw frequency. Three tiers: *strong* (top 30 hubs), *relevant* (top 100, strength ≥ 2), *all* (full long tail). Click a word to seed an AI question or filter the graph. See §7.6 for the impact-analysis workflow. |
 | **Treemap**             | ECharts `type: 'treemap'` | Visualize the directory/file structure sized by number of entities, lines of code, or connection count. |
 | **Sunburst**            | ECharts `type: 'sunburst'`| Hierarchical view: directory → file → class → function. Good for understanding project structure at a glance. |
 
@@ -484,19 +484,35 @@ The backend exposes a small REST API. The frontend is a single-page app (could b
 | `/api/search`        | POST   | `{ "text": "email", "top": 10 }` | `{ results: [{ node, score }] }`       |
 | `/api/query`         | POST   | JSON query DSL object        | `{ nodes: [...], edges: [...] }`        |
 | `/api/node/:id`      | GET    | —                            | `{ source, file, lines, edges, embedding_preview }` |
-| `/api/wordcloud`     | GET    | `?path=src/&metric=frequency`| `[{ name: "emails", value: 42 }, ...]`  |
+| `/api/wordcloud`     | GET    | `?path=src/&mode=strong`     | `{ items: [{ name: "GraphQuery", value: 84.0, count: 1 }, ...], total, shown, mode, min_strength }` — `value` = graph strength (in+out degree summed by name) |
 | `/api/tree`          | GET    | `?path=/`                    | Nested directory/file tree with counts  |
 
-### 7.4 Word Cloud Modes
+### 7.4 Idea Cloud — Strength-Weighted Tiers
 
-The word cloud can be driven by different metrics:
+The Idea Cloud weights every name by **graph strength** — the sum of in+out
+degree across every node that shares that display name. This is the
+"connectivity" mode of earlier drafts, promoted to the default because it is
+the only metric that meaningfully answers *"which symbols actually matter to
+this project?"* Raw frequency was too noisy (`__init__`, `name`, `get` always
+won), and semantic topic / recent-change modes are tracked separately under
+the embeddings and watcher subsystems.
 
-| Mode            | What it shows                                  | Use case                              |
-|-----------------|------------------------------------------------|---------------------------------------|
-| **Frequency**   | Most-used symbol names across the codebase     | "What are the core functions?"        |
-| **Connectivity**| Symbols with the most graph edges              | "What are the most connected pieces?" |
-| **Semantic topics** | Cluster embeddings → extract topic labels  | "What themes exist in this codebase?" |
-| **Recent changes** | Symbols in recently modified files           | "What's being actively worked on?"    |
+Three render tiers, exposed as both a UI cycle button and an API parameter
+(`?mode=`):
+
+| Tier         | Cap | Floor              | Font range | Intent                                                  |
+|--------------|-----|--------------------|------------|---------------------------------------------------------|
+| **strong**   | 30  | strength ≥ 2       | 18–48 px   | Default. The hub symbols — readable headline.           |
+| **relevant** | 100 | strength ≥ 2       | 12–40 px   | "Show More" — broader context, still filtered.          |
+| **all**      | 500 | none (singletons OK) | 8–28 px  | Explicit opt-in. Long tail; useful only for completeness.|
+
+Sizing inside ECharts uses `Math.log2(value + 1)` so a few hub nodes don't
+collapse the rest into 8 px. A small legend (`showing 30 of 412, strength ≥ 2`)
+makes the filtering visible so missing items feel intentional. Tooltips show
+the raw `strength` and `count` for each word.
+
+The same tiers are exposed to the AI through the `get_wordcloud` tool with a
+`mode` argument; see §7.6.
 
 ### 7.5 Tech Choices for Frontend
 
@@ -509,7 +525,82 @@ The word cloud can be driven by different metrics:
 
 **Recommendation**: **ECharts** — it covers all four visualization types (force graph, word cloud, treemap, sunburst) in one library with consistent APIs. The WebKit dependency example you found is almost exactly our use case. The `echarts-wordcloud` extension adds word cloud support.
 
-### 7.6 Updated UI Wireframe (with Chat)
+### 7.6 Impact-Analysis Workflow (UI + AI)
+
+The Idea Cloud is more than decoration — it is the **entry point for impact
+analysis**. A user (or the AI) typically wants to answer one of two related
+questions:
+
+> *"If I change X, what else will break?"*
+> *"How central is X to the project, really?"*
+
+The strength-weighted cloud directly ranks symbols by how plausibly the
+answer to those questions is "a lot." The full loop combines tree, graph,
+cloud, and AI chat into a single discovery → drill-in → assess flow:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│   1. Discover (Idea Cloud, mode=strong)                          │
+│        │  hub names sized by strength                            │
+│        ▼                                                         │
+│   2. Locate (search_graph / find: badge)                         │
+│        │  resolve hub name → concrete node IDs                   │
+│        ▼                                                         │
+│   3. Drill-in (/api/graph + /api/node/:id, depth 1–2)            │
+│        │  enumerate callers, callees, inheritance, imports       │
+│        ▼                                                         │
+│   4. Assess (AI chat with the above context attached)            │
+│           "what relies on this? what would break if I change     │
+│            its signature?"                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### What "strength" actually estimates
+
+For a name `n` aggregating nodes `N₁ … Nₖ`:
+
+```
+strength(n) = Σᵢ (in_degree(Nᵢ) + out_degree(Nᵢ))
+```
+
+This is a cheap, language-agnostic proxy for *blast radius*: edges in this
+graph are imports, calls, inherits, contains, references — every edge
+touching a node is one place a change could ripple to or be triggered by.
+It deliberately ignores edge **type** weighting (a `calls` edge is treated
+the same as an `imports` edge) because over-weighting any one type would
+bias the cloud toward whatever language/plugin happens to emit the most of
+it. A future enhancement (§14) could add per-edge-type weights once we have
+real signal that one matters more than another.
+
+#### How the AI uses it
+
+The `get_wordcloud` tool now mirrors the HTTP endpoint and accepts the same
+`mode` parameter (`strong` / `relevant` / `all`). Recommended AI playbook:
+
+1. **`get_wordcloud(mode="strong")`** to pull the project's hub vocabulary.
+2. **`search_graph(name)`** for a candidate hub → resolve to node IDs.
+3. **`get_neighbors(node_id, depth=1)`** (or `query_callers` / `query_callees`
+   when added) to count and inspect direct dependents.
+4. Compose an answer that ties the user's proposed change to a concrete
+   ranked list of files/functions likely to be impacted, citing the
+   `strength` and direct-dependent count as evidence.
+
+Tier guidance for the AI:
+
+| User intent                                       | Recommended `mode` |
+|---------------------------------------------------|--------------------|
+| "Give me an overview of what this project is about." | `strong`           |
+| "What other things depend on `X`?" (X is a likely hub) | `strong` then `search_graph` |
+| "Find every place we touch couchbase / SMTP / etc." | `relevant` (broader net) |
+| "Audit dead code / orphans / single-use helpers."   | `all` (long tail is the point) |
+
+The AI should default to `strong`. `all` returns up to 500 entries and is
+mostly low-signal noise for normal questions — it should be opt-in, just
+like the user-facing button.
+
+### 7.7 Updated UI Wireframe (with Chat)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -1049,7 +1140,7 @@ Streamed response to UI (DaisyUI chat bubbles)
 | `search_graph` | Keyword or semantic search across all indexed nodes | `query` (required), `top`, `type` |
 | `get_node` | Full node detail: source, metadata, all edges (callers, callees, imports) | `node_id` (required) |
 | `get_stats` | Graph summary: total nodes/edges, counts by type | — |
-| `get_wordcloud` | Top 50 most frequent entity names | — |
+| `get_wordcloud` | Hub symbols ranked by graph strength (in+out degree, aggregated by name). Returns `{items, total, shown, mode, min_strength}`; each item has `name`, `strength`, `count`. | `mode` (`strong`/`relevant`/`all`), `limit` |
 
 #### Future — Planned Tools & Enhancements
 

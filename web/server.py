@@ -1289,19 +1289,63 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
 
     @app.get("/api/wordcloud")
-    def wordcloud(path: Optional[str] = Query(None)):
+    def wordcloud(
+        path: Optional[str] = Query(None),
+        mode: str = Query("strong"),
+    ):
+        """
+        Idea Cloud weighted by graph strength (in + out degree), aggregated
+        across nodes sharing the same display name. The `mode` parameter
+        controls how aggressively the long tail is hidden:
+
+          - strong   : top 30, strength >= 2  (default; readable headline)
+          - relevant : top 100, strength >= 2 (compact "Show More" view)
+          - all      : everything, capped at 500 (full "show every relationship")
+        """
+        strengths: dict[str, float] = defaultdict(float)
         counts: dict[str, int] = defaultdict(int)
-        for _, data in graph.nodes(data=True):
+        for nid, data in graph.nodes(data=True):
             ntype = data.get("type", "")
             if ntype in EXCLUDE_TYPES_WORDCLOUD:
                 continue
             if path and not data.get("path", "").startswith(path):
                 continue
             name = data.get("name", "")
-            if name:
-                counts[name] += 1
+            if not name:
+                continue
+            try:
+                deg = graph.degree(nid)
+            except Exception:
+                deg = 0
+            strengths[name] += deg
+            counts[name] += 1
 
-        return [{"name": name, "value": count} for name, count in counts.items()]
+        items = [
+            {"name": n, "value": float(strengths[n]), "count": counts[n]}
+            for n in strengths
+        ]
+        items.sort(key=lambda x: x["value"], reverse=True)
+        total = len(items)
+
+        mode_norm = (mode or "strong").lower()
+        if mode_norm == "all":
+            items = items[:500]
+            min_strength = 0
+        elif mode_norm == "relevant":
+            items = [i for i in items if i["value"] >= 2][:100]
+            min_strength = 2
+        else:  # "strong" or anything unknown
+            mode_norm = "strong"
+            items = [i for i in items if i["value"] >= 2][:30]
+            min_strength = 2
+
+        return {
+            "items": items,
+            "total": total,
+            "shown": len(items),
+            "mode": mode_norm,
+            "min_strength": min_strength,
+        }
 
     @app.get("/api/tree")
     def tree():
