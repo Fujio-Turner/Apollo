@@ -2,7 +2,10 @@
 
 > Spec format: [OpenAPI 3.1.0](https://spec.openapis.org/oas/latest.html)
 >
-> Live docs: [`/docs`](http://localhost:8080/docs) (Swagger UI) · [`/redoc`](http://localhost:8080/redoc) (Redoc)
+> Live docs:
+> - [`/api-docs`](http://localhost:8080/api-docs) — Swagger UI **rendering the hand-maintained `docs/openapi.yaml`** (curated descriptions, examples, schemas)
+> - [`/openapi.yaml`](http://localhost:8080/openapi.yaml) — raw YAML spec, served verbatim for external clients & codegen
+> - [`/docs`](http://localhost:8080/docs) (Swagger UI) and [`/redoc`](http://localhost:8080/redoc) — **FastAPI auto-generated** views derived from `server.py`
 
 ---
 
@@ -112,17 +115,20 @@ Every endpoint belongs to exactly one tag. Tags group endpoints in the docs UI a
 
 | Tag | Prefix | Description |
 |---|---|---|
-| System | `/api/env` | Runtime environment flags |
+| System | `/api/env`, `/api/version` | Runtime environment flags and backend version |
 | Filesystem | `/api/browse-*`, `/api/tree` | Local directory browsing |
-| Indexing | `/api/index*` | Create, delete, monitor indexes |
-| Graph | `/api/graph`, `/api/node`, `/api/wordcloud`, `/api/stats` | Graph data retrieval |
-| Search | `/api/search` | Semantic and keyword search |
+| Indexing | `/api/index`, `/api/indexing-status` | Create, delete, monitor indexes |
+| Reindex | `/api/index/sweep`, `/api/index/history`, `/api/index/last`, `/api/index/summary`, `/api/index/config` | Phase 9 incremental reindex telemetry & config |
+| Graph | `/api/graph`, `/api/node`, `/api/neighbors`, `/api/wordcloud`, `/api/stats` | Graph data retrieval |
+| Search | `/api/search`, `/api/search/multi` | Semantic and keyword search |
 | Files | `/api/file/*`, `/api/project/search` | Read-only file inspection |
+| Projects | `/api/projects/*` | Project manifests, bootstrap wizard, reprocess, leave |
 | Annotations | `/api/annotations*` | User-authored highlights, **notes**, **bookmarks**, tags & collections (Notes & Bookmarks tab) |
-| Settings | `/api/settings` | API keys and chat config |
+| Settings | `/api/settings`, `/api/logging/info` | API keys, chat config, plugin config, logging snapshot |
 | Chat | `/api/chat*` | AI chat, threads, history |
 | Images | `/api/image/*` | Image generation |
 | Watch | `/api/watch/*` | File watcher status and control |
+| Realtime | `/ws` | WebSocket channel for live graph updates |
 
 When adding a new endpoint, assign it to an existing tag. If none fit, add a new tag entry to both the `tags:` list in `openapi.yaml` and the table above.
 

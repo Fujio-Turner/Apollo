@@ -462,7 +462,7 @@ A local web application that lets you visually explore the knowledge graph, filt
 │                     │  JSON   │                          │
 │  /api/graph         │         │  ECharts force graph     │
 │  /api/search        │         │  ECharts word cloud      │
-│  /api/query         │         │  ECharts treemap         │
+│  /api/tree          │         │  ECharts treemap         │
 │  /api/node/:id      │         │  Source code panel       │
 │  /api/wordcloud     │         │  Filter sidebar          │
 └────────┬───────────┘         └──────────────────────────┘
@@ -478,14 +478,19 @@ The backend exposes a small REST API. The frontend is a single-page app (could b
 
 **API Endpoints:**
 
-| Endpoint             | Method | Input                        | Output                                  |
-|----------------------|--------|------------------------------|-----------------------------------------|
-| `/api/graph`         | GET    | `?path=src/&depth=2&edges=calls,imports` | `{ nodes: [...], edges: [...], categories: [...] }` — ECharts-ready |
-| `/api/search`        | POST   | `{ "text": "email", "top": 10 }` | `{ results: [{ node, score }] }`       |
-| `/api/query`         | POST   | JSON query DSL object        | `{ nodes: [...], edges: [...] }`        |
-| `/api/node/:id`      | GET    | —                            | `{ source, file, lines, edges, embedding_preview }` |
-| `/api/wordcloud`     | GET    | `?path=src/&mode=strong`     | `{ items: [{ name: "GraphQuery", value: 84.0, count: 1 }, ...], total, shown, mode, min_strength }` — `value` = graph strength (in+out degree summed by name) |
-| `/api/tree`          | GET    | `?path=/`                    | Nested directory/file tree with counts  |
+> Headline endpoints; the full inventory lives in [`API.md`](./API.md) and
+> [`openapi.yaml`](./openapi.yaml).
+
+| Endpoint                         | Method | Input                        | Output                                  |
+|----------------------------------|--------|------------------------------|-----------------------------------------|
+| `/api/graph`                     | GET    | `?path=src/&types=&edges=&limit=&max_edges=` | `{ nodes, edges, categories, total_nodes, total_edges, truncated }` — ECharts-ready |
+| `/api/search`                    | GET    | `?q=email&top=10&type=function` | `{ results: [{ id, name, type, path, line_start, score }] }` |
+| `/api/search/multi`              | POST   | `{ "queries": ["a","b"], "top": 10 }` | Deduped, score-merged search results          |
+| `/api/node/:id`                  | GET    | —                            | `{ source, file, lines, edges_in, edges_out }` |
+| `/api/node/:id/connections`      | GET    | —                            | Edges plus per-edge source-code preview snippets |
+| `/api/neighbors/:id`             | GET    | `?depth=&edge_types=&direction=` | BFS-walk neighbours              |
+| `/api/wordcloud`                 | GET    | `?path=src/&mode=strong`     | `{ items: [{ name, value, count }], total, shown, mode, min_strength }` — `value` = graph strength (in+out degree summed by name) |
+| `/api/tree`                      | GET    | `?path=/`                    | Nested directory/file tree with counts  |
 
 ### 7.4 Idea Cloud — Strength-Weighted Tiers
 
@@ -1711,22 +1716,37 @@ URL → fetch (httpx) → detect content type
 
 `build_incremental` uses stat-based prefilter: unchanged files skip without a read. Adding one `.md` file costs only that file's parse + embed (~1-2 seconds). No full re-index needed.
 
-### 14.4 New API Endpoints
+### 14.4 API Endpoints
 
-#### Annotations
+#### Annotations *(implemented — see [`API.md`](./API.md#annotations))*
+
+The original draft proposed separate `/api/highlights`, `/api/notes`, and
+`/api/bookmarks` endpoint families. The implementation consolidated all
+three (plus `tag`) under a single polymorphic `Annotation` model
+discriminated by a `type` field, served by one endpoint family:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/highlights` | GET/POST | List or create highlights on a node |
-| `/api/highlights/{id}` | PUT/DELETE | Update or delete a highlight |
-| `/api/notes` | GET/POST | List or create notes (`?q=` search, `?node_id=`, `?trash=true`) |
-| `/api/notes/{id}` | GET/PUT/DELETE | Read, update, soft-delete a note |
-| `/api/notes/{id}/restore` | POST | Restore from trash |
-| `/api/notes/{id}/purge` | DELETE | Permanently delete |
-| `/api/bookmarks` | GET/POST | List or create bookmarks |
-| `/api/bookmarks/{id}` | DELETE | Remove a bookmark |
+| `/api/annotations` | GET | List annotations, optionally filtered by `?type=highlight\|bookmark\|note\|tag` |
+| `/api/annotations/create` | POST | Create a new annotation |
+| `/api/annotations/by-target` | GET | Find annotations for `?file=` or `?node=` |
+| `/api/annotations/by-tag` | GET | Find annotations carrying `?tag=` |
+| `/api/annotations/{id}` | GET/PUT/DELETE | Read, update (any subset of fields), or delete |
+| `/api/annotations/collections` | GET/POST | List or create collections grouping related annotations |
+| `/api/annotations/collections/{id}` | DELETE | Remove a collection (annotations themselves are kept) |
 
-#### Web Captures
+The trash / soft-delete / restore behaviour from the original draft is
+not exposed — `DELETE /api/annotations/{id}` is a hard delete. The
+`stale` boolean on each annotation indicates whether its target file or
+node still exists in the index.
+
+#### Web Captures *(planned — not yet implemented)*
+
+The capture pipeline below remains a design target; no `/api/captures*`
+endpoints exist in the running server today. Captures will likely be
+introduced as a fifth `Annotation.type` rather than a separate route
+family, mirroring the consolidation already done for highlights / notes
+/ bookmarks.
 
 | Endpoint | Method | Description |
 |---|---|---|

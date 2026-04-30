@@ -1976,6 +1976,31 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             raise HTTPException(status_code=404, detail="favicon not found")
         return FileResponse(favicon_file, media_type="image/svg+xml")
 
+    # ── Hand-maintained OpenAPI spec + viewer ─────────────────────────
+    # FastAPI already exposes its own auto-generated spec at /openapi.json
+    # (and Swagger UI at /docs, ReDoc at /redoc). The endpoints below
+    # serve the curated docs/openapi.yaml — the human-maintained source
+    # of truth referenced by docs/API.md and guides/API_OPENAPI.md — so
+    # that external clients and the in-app viewer can consume it without
+    # leaving the running server.
+
+    _OPENAPI_SPEC = (Path(__file__).parent.parent / "docs" / "openapi.yaml").resolve()
+
+    @app.get("/openapi.yaml", include_in_schema=False)
+    def openapi_yaml():
+        """Serve the hand-maintained OpenAPI 3.1 spec verbatim."""
+        if not _OPENAPI_SPEC.exists():
+            raise HTTPException(status_code=404, detail="openapi.yaml not found")
+        return FileResponse(_OPENAPI_SPEC, media_type="application/yaml")
+
+    @app.get("/api-docs", include_in_schema=False)
+    def api_docs():
+        """Render docs/openapi.yaml with Swagger UI."""
+        page = STATIC_DIR / "api-docs.html"
+        if not page.exists():
+            raise HTTPException(status_code=404, detail="api-docs.html not found")
+        return FileResponse(page, media_type="text/html")
+
     @app.get("/")
     def index():
         index_file = STATIC_DIR / "index.html"

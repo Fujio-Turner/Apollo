@@ -293,6 +293,28 @@ The top-bar search and chat box are merged into a single Tagify-powered input wi
 - **Annotation tabs** — 📝 Notes, ⭐ Bookmarks, 🌐 Web Captures.
 - **Edge cap** — `/api/graph` limits edges to 3× node count to prevent browser freeze.
 
+## REST API & Interactive Docs
+
+Every feature in the Browser UI is built on the same JSON HTTP API that
+external clients can call directly. Apollo ships a hand-maintained
+[OpenAPI 3.1](https://spec.openapis.org/oas/latest.html) specification at
+[`docs/openapi.yaml`](docs/openapi.yaml) covering all **55 endpoints**
+(System, Filesystem, Indexing, Reindex, Graph, Search, Files, Projects,
+Annotations, Settings, Chat, Images, Watch, Realtime).
+
+Three live views are exposed by the running server:
+
+| URL | What it is |
+|---|---|
+| **[`/api-docs`](http://localhost:8080/api-docs)** | **Swagger UI rendering of the hand-maintained `docs/openapi.yaml`** — curated descriptions, examples, and reusable schemas. **Start here.** |
+| [`/openapi.yaml`](http://localhost:8080/openapi.yaml) | Raw YAML spec served verbatim. Feed this to codegen tools (`openapi-generator`, `swagger-codegen`, etc.) to scaffold typed clients. |
+| [`/docs`](http://localhost:8080/docs) and [`/redoc`](http://localhost:8080/redoc) | FastAPI's auto-generated views, derived from the route signatures in `web/server.py`. Useful for spot-checking that runtime behaviour matches the curated spec. |
+
+A markdown quick-reference for the same endpoints lives at
+[`docs/API.md`](docs/API.md). The conventions for adding new endpoints —
+required tags, OperationIDs, error shapes, schema reuse — are documented
+in [`guides/API_OPENAPI.md`](guides/API_OPENAPI.md).
+
 ## Configuration
 
 | Environment Variable | Description |
@@ -396,8 +418,9 @@ apollo/
 ## Documentation
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — full design document with all 14 phases
-- [`docs/API.md`](docs/API.md) — REST API quick reference
-- [`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3.1 specification
+- [`docs/API.md`](docs/API.md) — REST API quick reference (markdown)
+- [`docs/openapi.yaml`](docs/openapi.yaml) — OpenAPI 3.1 specification (machine-readable, source of truth)
+- **In-app:** [`/api-docs`](http://localhost:8080/api-docs) — Swagger UI viewer for the spec above (live on the running server)
 - [`guides/making_plugins.md`](guides/making_plugins.md) — **how to add a language plugin** (Go, PHP, Java, PDFs, anything)
 - [`guides/SCHEMA_DESIGN.md`](guides/SCHEMA_DESIGN.md) — database schema rules
 - [`guides/STYLE_HTML_CSS.md`](guides/STYLE_HTML_CSS.md) — HTML/CSS standards
