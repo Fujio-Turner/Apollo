@@ -133,16 +133,45 @@ BFS-walks the graph from `node_id`, optionally restricted to specific edge types
 
 ### `GET /api/wordcloud`
 
-Returns term frequencies for a word-cloud visualization.
+Idea Cloud — symbols ranked by **graph strength** (sum of in+out degree across
+nodes sharing the same display name), aggregated per name. The `value` field
+is the strength itself, not a raw frequency, so high-value items are the
+project's true hubs and the most useful candidates for impact analysis.
 
-| Param  | Type   | Description              |
-|--------|--------|--------------------------|
-| `path` | string | Filter to a path prefix  |
+| Param   | Type   | Description                                                                       |
+|---------|--------|-----------------------------------------------------------------------------------|
+| `path`  | string | Optional path-prefix filter (e.g. `apollo/`).                                     |
+| `mode`  | string | `strong` (default, top 30, strength ≥ 2), `relevant` (top 100, strength ≥ 2), or `all` (everything, capped at 500). |
 
 **Response**
 ```json
-[{ "name": "parse", "value": 42 }, { "name": "render", "value": 17 }]
+{
+  "items": [
+    { "name": "GraphQuery", "value": 84.0, "count": 1 },
+    { "name": "search",     "value": 42.0, "count": 3 }
+  ],
+  "total": 412,
+  "shown": 30,
+  "mode": "strong",
+  "min_strength": 2
+}
 ```
+
+`value` = sum of in+out degree across every node with that display name.
+`count` = number of distinct nodes that share the name. `total` is the total
+unique names before tier filtering; `shown` is what made it into `items`.
+
+**Recommended workflow (impact analysis):**
+
+1. Fetch `mode=strong` to surface the hub symbols.
+2. For a hub name, call [`/api/search`](#post-apisearch) → grab the top node IDs.
+3. For each ID, call [`/api/graph`](#get-apigraph) with a small depth and/or
+   [`/api/node/{id}`](#get-apinodeid) to enumerate callers/callees.
+4. The breadth and `value` together estimate **blast radius** — how much of
+   the project a change to that hub is likely to touch.
+
+Use `mode=all` only when you explicitly need the long tail (low-strength
+helpers, single-use utilities) — it returns dense, low-signal data.
 
 ### `GET /api/stats`
 

@@ -238,21 +238,44 @@ paths:
     get:
       operationId: getWordcloud
       tags: [Graph]
-      summary: Word-cloud data for the indexed symbols
+      summary: Idea Cloud — symbols ranked by graph strength (in+out degree)
+      description: |
+        Returns the most strongly-connected entity names in the indexed graph,
+        aggregated across nodes that share the same display name.
+
+        The `value` field is the **strength** (sum of in+out degree across all
+        nodes sharing this name) and approximates how central a symbol is to
+        the project. The `mode` parameter controls how aggressively the long
+        tail is hidden:
+
+          * `strong`   — top 30, strength ≥ 2  (default; readable headline)
+          * `relevant` — top 100, strength ≥ 2 (compact "Show More" view)
+          * `all`      — everything, capped at 500 (full "show every relationship")
+
+        Intended workflow: render the cloud → click a hub name → use
+        `/api/graph` and `/api/node/{id}` to drill into the surrounding
+        sub-graph and assess what other code may be affected by changes to
+        that hub.
       parameters:
         - name: path
           in: query
+          description: Optional path-prefix filter (e.g. `apollo/`).
           schema:
             type: string
+        - name: mode
+          in: query
+          description: Tier of aggressiveness — `strong` (default), `relevant`, or `all`.
+          schema:
+            type: string
+            enum: [strong, relevant, all]
+            default: strong
       responses:
         "200":
-          description: Word-cloud entries
+          description: Word-cloud entries with selection metadata
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/WordcloudEntry"
+                $ref: "#/components/schemas/WordcloudResponse"
 
   /api/stats:
     get:
@@ -1409,12 +1432,43 @@ components:
 
     WordcloudEntry:
       type: object
-      required: [name, value]
+      required: [name, value, count]
       properties:
         name:
           type: string
+          description: Display name of the symbol/entity (function, class, variable, etc.).
         value:
+          type: number
+          description: |
+            Graph **strength** for this name — the sum of in+out degree across
+            every node that shares this display name. Higher = more central /
+            more impacted-by-or-impacting other code. Use this as the "weight"
+            for visual sizing or for ranking impact-analysis candidates.
+        count:
           type: integer
+          description: Number of distinct nodes that share this display name.
+
+    WordcloudResponse:
+      type: object
+      required: [items, total, shown, mode, min_strength]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WordcloudEntry"
+        total:
+          type: integer
+          description: Total number of distinct names available before tier-based filtering.
+        shown:
+          type: integer
+          description: Number of items returned in `items` after filtering and capping.
+        mode:
+          type: string
+          enum: [strong, relevant, all]
+          description: Tier the server actually applied (echoes the request).
+        min_strength:
+          type: number
+          description: Lower bound on `value` applied by this mode (0 for `all`, 2 otherwise).
 
     # ── Search ────────────────────────────────────────────────────────
     SearchResult:

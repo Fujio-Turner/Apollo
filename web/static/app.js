@@ -35,8 +35,12 @@ let graphChart = null, wordCloudChart = null, currentGraph = null, selectedNode 
    '2' = stable circular-layout render with hideOverlap labels (mirrors the
    ECharts "graph-label-overlap" example). Hidden in normal mode. */
 let graphChart2 = null, currentGraphVariant = '1';
-let wordCloudAllData = [], wordCloudExpanded = false;
-const WORDCLOUD_DEFAULT_LIMIT = 30;
+let wordCloudMode = 'strong', wordCloudMeta = null;
+const WORDCLOUD_TIERS = {
+  strong:   { next: 'relevant', label: 'Show More',                sizeRange: [18, 48] },
+  relevant: { next: 'all',      label: 'Show All Relationships',   sizeRange: [12, 40] },
+  all:      { next: 'strong',   label: 'Back to Strong',           sizeRange: [8, 28]  },
+};
 
 /* ── Depth Slider ──────────────────────────────────────────────── */
 const DEPTH_STOPS = [
@@ -2149,41 +2153,89 @@ async function searchNodes(query) {
 }
 
 /* ── Idea Cloud ────────────────────────────────────────────────── */
-function renderWordCloud(data) {
+/* Cloud reflects graph *strength* (sum of in+out degree per name), not raw
+   name frequency. Three tiers: strong (top 30, big fonts) → relevant
+   (top 100, compact) → all (everything, dense). Values are log-scaled so a
+   handful of hub nodes don't squash everything else into 8px noise. */
+function renderWordCloud(items, mode) {
   const container = document.getElementById('wordcloud-container');
   if (!container || !container.offsetHeight) return;
   if (!wordCloudChart) wordCloudChart = echarts.init(container);
-  wordCloudChart.setOption({ series: [{ type:'wordCloud', shape:'circle', sizeRange:[10,48], rotationRange:[0,0], gridSize:2, left:0, top:0, right:0, bottom:0, width:'100%', height:'100%',
-    textStyle: { fontFamily:'Inter,sans-serif', color:()=>{const c=Object.values(NODE_COLORS);return c[Math.floor(Math.random()*c.length)];} },
-    emphasis:{textStyle:{color:'#7c3aed'}}, data }] });
+  const tier = WORDCLOUD_TIERS[mode] || WORDCLOUD_TIERS.strong;
+  const data = (items || []).map(d => ({
+    name: d.name,
+    value: Math.log2((d.value || 0) + 1),  // log-scale so hubs don't dwarf the rest
+    rawStrength: d.value,
+    count: d.count,
+  }));
+  wordCloudChart.setOption({
+    series: [{
+      type: 'wordCloud', shape: 'circle', sizeRange: tier.sizeRange,
+      rotationRange: [0, 0], gridSize: 2,
+      left: 0, top: 0, right: 0, bottom: 0, width: '100%', height: '100%',
+      textStyle: {
+        fontFamily: 'Inter,sans-serif',
+        color: () => { const c = Object.values(NODE_COLORS); return c[Math.floor(Math.random() * c.length)]; },
+      },
+      emphasis: { textStyle: { color: '#7c3aed' } },
+      data,
+    }],
+    tooltip: {
+      show: true,
+      formatter: p => {
+        const d = p.data || {};
+        return `<b>${p.name}</b><br/>strength: ${Math.round(d.rawStrength || 0)}<br/>nodes: ${d.count || 1}`;
+      },
+    },
+  }, true);
   wordCloudChart.off('click');
   wordCloudChart.on('click', p => { askChatFromCloud(p.name); });
   updateWordCloudToggle();
+  updateWordCloudLegend();
 }
 
 function updateWordCloudToggle() {
   const btn = document.getElementById('wordcloud-toggle');
   if (!btn) return;
-  if (wordCloudAllData.length <= WORDCLOUD_DEFAULT_LIMIT) {
+  if (!wordCloudMeta || wordCloudMeta.total <= 30) {
     btn.classList.add('hidden');
-  } else {
-    btn.classList.remove('hidden');
-    btn.textContent = wordCloudExpanded ? 'Show Less' : 'Show More';
+    return;
   }
+  btn.classList.remove('hidden');
+  const tier = WORDCLOUD_TIERS[wordCloudMode] || WORDCLOUD_TIERS.strong;
+  btn.textContent = tier.label;
+  btn.classList.remove('btn-primary', 'btn-warning');
+  btn.classList.add(wordCloudMode === 'relevant' ? 'btn-warning' : 'btn-primary');
+}
+
+function updateWordCloudLegend() {
+  const el = document.getElementById('wordcloud-legend');
+  if (!el) return;
+  if (!wordCloudMeta) { el.classList.add('hidden'); return; }
+  const { shown, total, min_strength } = wordCloudMeta;
+  if (total <= 30) { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  const floor = min_strength > 0 ? `, strength ≥ ${min_strength}` : '';
+  el.textContent = `showing ${shown} of ${total}${floor}`;
 }
 
 function toggleWordCloud() {
-  wordCloudExpanded = !wordCloudExpanded;
-  const data = wordCloudExpanded ? wordCloudAllData : wordCloudAllData.slice(0, WORDCLOUD_DEFAULT_LIMIT);
-  renderWordCloud(data);
+  const tier = WORDCLOUD_TIERS[wordCloudMode] || WORDCLOUD_TIERS.strong;
+  loadWordCloud(tier.next);
 }
 
-async function loadWordCloud() {
+async function loadWordCloud(mode) {
+  const requested = mode || wordCloudMode || 'strong';
   try {
-    const data = await apiFetch('/api/wordcloud');
-    wordCloudAllData = data.sort((a, b) => b.value - a.value);
-    wordCloudExpanded = false;
-    renderWordCloud(wordCloudAllData.slice(0, WORDCLOUD_DEFAULT_LIMIT));
+    const resp = await apiFetch(`/api/wordcloud?mode=${encodeURIComponent(requested)}`);
+    // Back-compat: server may return a bare list (older builds) or the new
+    // {items, total, shown, mode, min_strength} shape.
+    const items = Array.isArray(resp) ? resp : (resp.items || []);
+    wordCloudMeta = Array.isArray(resp)
+      ? { total: items.length, shown: items.length, mode: requested, min_strength: 0 }
+      : { total: resp.total, shown: resp.shown, mode: resp.mode || requested, min_strength: resp.min_strength || 0 };
+    wordCloudMode = wordCloudMeta.mode;
+    renderWordCloud(items, wordCloudMode);
   } catch (e) { console.error(e); }
 }
 
