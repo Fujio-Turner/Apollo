@@ -1,12 +1,142 @@
 # Making an Apollo Language Plugin
 
-Apollo parses source code into a graph. Each programming language (or
-file format) is handled by a **plugin**: a small, self-contained module
-that knows how to read one kind of file and turn it into a structured
-result the rest of Apollo can index, search, and visualize.
+Apollo parses source code into a **knowledge graph**. Each programming
+language (or file format) is handled by a **plugin**: a small,
+self-contained module that knows how to read one kind of file and turn
+it into a structured result the rest of Apollo can index, search, and
+visualize.
 
 This guide shows you how to write a new plugin — for example a
 `go.py` for Go, a `php.py` for PHP, a `java.py` for Java, etc.
+
+---
+
+## 0. Why plugins exist: the goal is **relationships**, not entities
+
+Read [`docs/DESIGN.md`](../docs/DESIGN.md) first. The point of Apollo
+is **not** to list the functions/classes/imports inside each file —
+that's just the raw material. The product is the **knowledge graph**
+of the relationships *between* those entities, surfaced visually and
+made queryable by people and AI:
+
+| Edge type    | Meaning                                  | Source field a plugin must emit                              |
+|--------------|------------------------------------------|--------------------------------------------------------------|
+| `defines`    | A file/class defines an entity           | `functions[]`, `classes[]`, `variables[]`, `methods[]`       |
+| `calls`      | A function calls another function        | `functions[].calls[]` (call sites with names + line)         |
+| `imports`    | A file imports a module / symbol         | `imports[]`                                                  |
+| `references` | A function reads / writes a variable     | call/name analysis inside `functions[].calls[]` & body walks |
+| `inherits`   | A class extends / implements another     | `classes[].bases[]`                                          |
+| `contains`   | A directory contains a file              | (handled by builder, not the plugin)                         |
+| `tests`      | A test function exercises a target       | `functions[].is_test = True` + matching name                 |
+
+If your plugin only emits names, the graph has nodes floating in
+space — no `calls` edges, no `inherits` edges, no callers/callees,
+no "show me everything that touches `SMTP_HOST`" queries, no semantic
+search of method bodies. **A plugin that doesn't surface
+relationships is a stub, not a working plugin.** The reference
+implementation is [`plugins/python3/`](../plugins/python3/parser.py) —
+study it before writing any new plugin.
+
+### 0.1 Two flavors of plugin, same goal
+
+#### A. **Programming-language plugins** (Python, Go, Java, JS, PHP, Rust, C#, Kotlin, Swift, …)
+
+Despite syntactic differences, every programming language shares the
+same handful of universal building blocks. A plugin's job is to map
+those blocks onto Apollo's entity & edge schema:
+
+| Universal concept              | What you emit                                                                                |
+|--------------------------------|----------------------------------------------------------------------------------------------|
+| **Constant / module variable** | one entry in `variables[]` with `name`, `value`, `line`, `annotation`                       |
+| **Local variable / parameter** | per-function `params[]` (name, default, annotation, kind) — *not* a top-level node          |
+| **Function / method**          | one entry in `functions[]` *or* (for methods) inside `classes[].methods[]`                  |
+| **Function body / loops / if-else** | extract `calls[]` (every callsite — name + args + line), `complexity` (loop+branch count), `loc` |
+| **Function calls another function** | each callsite goes in that function's `calls[]` so the builder can draw a `calls` edge |
+| **Class / struct / interface** | one entry in `classes[]` with `bases[]`, `methods[]`, `class_vars[]`                        |
+| **Inheritance / `extends` / `implements`** | the parent type names go in `classes[].bases[]` so the builder can draw an `inherits` edge |
+| **Import / require / use / include** | one entry in `imports[]` with `module`, `names[]`, `alias`, `line`, `level`           |
+| **Decorators / annotations / attributes** | `decorators[]` on the function/method/class                                          |
+| **Docstring / leading comment** | `docstring` field on the function/class/method (powers semantic search & AI chat)            |
+| **TODO / FIXME / NOTE comments** | `comments[]` with `tag`, `text`, `line`                                                     |
+| **Async / generator / nested / test** | `is_async`, `is_generator`, `is_nested`, `is_test` flags                                |
+| **Magic strings (SQL, URL, regex)** | `strings[]` with `kind` (`sql` / `url` / `regex`) — these become connection points too |
+
+Mechanically, the plugin's parser walks the AST (or CST, or — for
+languages without a Python AST library — a token / tree-sitter / regex
+parser) **once** and fills out the result dict. The richer the
+extraction, the richer the graph.
+
+> **Why "loops" and "if/else" matter even though they aren't nodes.**
+> They feed the `complexity` score on each function and are walked to
+> find the calls/references buried inside them. A plugin that only
+> looks at the top of a function body and ignores the nested control
+> flow will miss most of the `calls` edges.
+
+#### B. **Document / asset / non-code plugins** (Markdown, HTML, PDF, AsciiDoc, RST, JSON Schema, OpenAPI, images, …)
+
+Document formats *don't* have functions or classes, so the
+relationship surface is harder to mine — but the goal is the same:
+**find connections that can become edges in the graph**. A document
+plugin that just dumps file text into a single node is barely better
+than the generic `TextFileParser`. Strive for one or more of:
+
+| Connection signal                         | What you emit                                                          | Resulting edge / node                          |
+|-------------------------------------------|------------------------------------------------------------------------|------------------------------------------------|
+| **Internal hyperlinks** (`[x](./other.md)`, `<a href="../guides/y.md">`, `href="/img/foo.png"`) | one entry in `links[]` with `target`, `kind: internal`, `line` | `link::…` node + future `references` edge to the target file when resolution succeeds |
+| **External hyperlinks** (`https://…`)     | `links[]` with `kind: external` — still useful for "what does this site link out to?" queries | `link::…` node                                 |
+| **Anchor / heading references** (`[x](#section-id)`) | `links[]` with `kind: anchor`, `target_anchor: "section-id"`     | `link::…` node + `references` edge to the local section |
+| **Image / asset references** (`![alt](/img/x.png)`, `<img src="…">`) | `links[]` with `kind: image`, `target` is the asset path | links docs to the binary assets they embed |
+| **Code blocks with a language tag**       | `code_blocks[]` with `language`, `content`, `line_start`               | enables cross-format search ("show me all `bash` snippets in our docs") |
+| **Frontmatter / metadata** (`title`, `tags`, `author`, `date`) | `frontmatter` dict + `tags[]`                                | tag-based clustering, author/date filtering    |
+| **Headings / sections** (h1–h6)           | `sections[]` with `level`, `name`, `line_start`, `line_end`            | hierarchical `section` nodes — enables "jump to section" + section-level embedding |
+| **Tables** (when they encode structured data) | `tables[]` with `headers[]` and `rows[][]`                          | structured data search                         |
+| **Task items** (`- [ ]` / `- [x]`)        | `task_items[]` with `text`, `checked`, `line`                          | progress tracking + linkable todo nodes        |
+| **Embedded references to code symbols** (e.g. `\`MailService\`` mentions in a doc) | (advanced) `mentions[]` with the symbol name | the builder can resolve to a `references` edge from doc → code |
+
+**The honest caveat the user raised:** internal links are great when
+they hit *another file Apollo has indexed*, but they often dead-end
+on truly internal references the file doesn't expose (e.g. a PDF
+table-of-contents entry that points to an internal byte offset).
+That's fine — emit them anyway as `link` nodes. Even unresolved
+links are useful: they show up in the graph, they're searchable, and
+when the linked file *is* later added to the index the existing edge
+resolves automatically. **Do not skip emitting a link just because
+its target isn't currently in the index.**
+
+> The two reference document plugins are
+> [`plugins/markdown_gfm/`](../plugins/markdown_gfm/parser.py) and
+> [`plugins/html5/`](../plugins/html5/parser.py). Both follow this
+> pattern: walk the AST → emit sections, links, code blocks, tables,
+> task items, frontmatter.
+
+### 0.2 The minimum bar a plugin must clear
+
+Whether your plugin is for a programming language or a document
+format, the result dict you return **must** be consumable by
+[`graph/builder.py`](../graph/builder.py) without raising. That means
+every entry you emit has to carry the keys the builder reads. The
+builder treats these as **required**, not optional:
+
+| Entity            | Required keys                                                                                            |
+|-------------------|----------------------------------------------------------------------------------------------------------|
+| `functions[]`     | `name`, `line_start`, `line_end`, `source` (everything else has a sensible default in the builder)       |
+| `classes[]`       | `name`, `line_start`, `line_end`, `source`, `bases` (list — empty is OK), `methods` (list — empty is OK) |
+| `classes[].methods[]` | same required keys as `functions[]`                                                                   |
+| `imports[]`       | `module` (the rest read defensively via `.get()`)                                                        |
+| `variables[]`     | `name`, `line` (the builder dereferences `var["line"]` directly)                                         |
+
+If you can't compute a real `line_start` / `line_end` (e.g. for a
+non-line-based format), set them to `0` — but never omit them.
+Emitting `{"name": "main"}` with no line info is **not** a valid
+function entry; it will crash the indexer.
+
+> **Self-test before you ship.** Run your plugin's `test_parser.py`
+> *and* index a small fixture project that contains real files of
+> your language with `python main.py index <fixture-dir>`. If the
+> indexer raises `KeyError` on any of the keys above, the plugin
+> isn't done.
+
+---
 
 ### Naming convention: include the version or flavor
 
@@ -55,9 +185,22 @@ to support multiple, ship multiple plugin folders.
 4. Inside it, create `plugin.md` — the **plugin manifest** with a
    YAML front-matter block declaring `description`, `version`, `url`,
    and `author` (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
-5. Done. `plugins.discover_plugins()` will pick it up automatically
+5. Inside it, create `config.json` — the **plugin runtime config**
+   declaring at minimum `"enabled": true` plus any plugin-specific
+   knobs you want users to tweak from **Settings → Plugins**
+   (see [§ 2.6](#26-the-plugin-config-configjson)).
+6. Inside it, create `test_parser.py` — the **per-plugin smoke test**
+   covering discovery, extension matching, and one happy-path parse
+   (see [§ 6](#6-testing-your-plugin)).
+7. Inside `parser.py`, follow the project-wide logging standard in
+   [`guides/LOGGING.md`](LOGGING.md) — at minimum,
+   `logger = logging.getLogger(__name__)` at module top, lazy
+   `%`-formatted log calls, no `print()`, and `logger.warning(...)`
+   (with `exc_info=True` when useful) inside any `except` that
+   swallows an error. See [§ 5.2](#52-logging-use-the-project-standard).
+8. Done. `plugins.discover_plugins()` will pick it up automatically
    and Apollo's **Settings → Plugins** tab will show the manifest
-   metadata alongside a SHA-256 hash of `parser.py`.
+   metadata, the editable config, and a SHA-256 hash of `parser.py`.
 
 No registry to edit. No imports to add elsewhere. Drop the folder in,
 restart Apollo, and the new language is supported.
@@ -72,15 +215,21 @@ plugins/
 ├── markdown_gfm/          # built-in: GitHub Flavored Markdown
 │   ├── __init__.py        #   exports PLUGIN
 │   ├── parser.py          #   the BaseParser implementation
-│   └── plugin.md          #   manifest (description / version / url / author)
+│   ├── plugin.md          #   manifest (description / version / url / author)
+│   ├── config.json        #   runtime config (enabled + knobs)
+│   └── test_parser.py     #   per-plugin smoke test (pytest)
 ├── python3/               # built-in: Python 3 (AST)
 │   ├── __init__.py
 │   ├── parser.py
-│   └── plugin.md
+│   ├── plugin.md
+│   ├── config.json
+│   └── test_parser.py
 └── <your_language>/       # ← your new plugin goes here
     ├── __init__.py
     ├── parser.py
-    └── plugin.md
+    ├── plugin.md
+    ├── config.json
+    └── test_parser.py
 ```
 
 Each plugin is a **self-contained subpackage**. Everything one plugin
@@ -231,6 +380,208 @@ manifest.
 
 ---
 
+### 2.6. The plugin config (`config.json`)
+
+Alongside `plugin.md`, every subpackage plugin **must** ship a
+`config.json` in the same folder. This is the plugin's **runtime
+configuration**: a JSON object holding the knobs Apollo users can flip
+from **Settings → Plugins** without editing source.
+
+Single-file plugins (`plugins/foo.py`) put their config next to the
+file as `plugins/foo.config.json`.
+
+#### Required format
+
+The only required key is `enabled`, a boolean that controls whether
+the plugin participates in indexing. A newly installed plugin **must**
+default to `"enabled": true` so it works out of the box.
+
+```json
+{
+  "enabled": true
+}
+```
+
+Beyond `enabled`, you are free to add any plugin-specific options that
+make sense for your parser. Suggested conventions for built-in knobs:
+
+| Key                     | Type             | Purpose                                              |
+| ----------------------- | ---------------- | ---------------------------------------------------- |
+| `enabled`               | `bool`           | **Required.** Skip parsing entirely when `false`.    |
+| `extensions`            | `list[str]`      | File extensions this plugin claims (lower-case).     |
+| `max_file_size_bytes`   | `int`            | Skip files larger than this. `0` / absent = no cap.  |
+| `extract_<thing>`       | `bool`           | Toggle for an optional extraction pass.              |
+| `comment_tags`          | `list[str]`      | Tags surfaced from `# TODO`, `<!-- FIXME -->`, etc.  |
+| `ignore_dirs`           | `list[str]`      | **Per-language directory ignores.** Folder *names* the indexer should skip when this plugin is enabled (e.g. `venv`, `site-packages`, `node_modules`). |
+| `ignore_files`          | `list[str]`      | Glob patterns for files to skip (e.g. `"*.pyc"`).    |
+| `ignore_dir_markers`    | `list[str]`      | Marker filenames inside a directory that mark the whole directory as ignorable (e.g. `pyvenv.cfg` flags arbitrary virtualenv folders even with non-standard names). |
+
+#### Describe each knob with a `_<key>` sibling
+
+Plugins are sorta stand-alone — once installed, the only thing the user
+sees in **Settings → Plugins** is your `config.json`. To make the UI
+self-documenting, **every runtime key should ship a sibling key
+prefixed with `_` whose value is a human-readable description**. The
+Settings UI renders that description as the form field's label /
+tooltip; the loader strips all `_<key>` siblings out of the merged
+runtime dict so your parser never sees them as data.
+
+```json
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "max_file_size_bytes": 1048576,
+  "_max_file_size_bytes": "Skip files larger than this many bytes (default 1 MB)."
+}
+```
+
+Rules:
+
+- The sibling key is `_` + the runtime key (`extract_links` →
+  `_extract_links`).
+- Description values are strings.
+- Description siblings are **read-only** — `PATCH /api/settings/
+  plugins/<name>/config` rejects any body whose keys start with `_`.
+- If a description is missing, the UI falls back to showing the bare
+  key. This is fine for back-compat, but every shipped plugin in the
+  repo should provide one for every knob.
+
+#### Per-language directory ignores (very important)
+
+Different programming languages put third-party / generated code in
+different places. Indexing those folders can multiply node and edge
+counts by 100× or more without adding any signal — they are not the
+user's source code.
+
+Each plugin must declare **its own** ignore list. Apollo merges the
+union of every *enabled* plugin's `ignore_dirs` / `ignore_files` /
+`ignore_dir_markers` into the indexer's effective skip set. Disabling
+a plugin from **Settings → Plugins** also removes its ignores, so a
+project that doesn't use a given language doesn't pay for its noise
+filters.
+
+Recommended ignore lists by language:
+
+| Language     | `ignore_dirs` (typical)                                                                                    | `ignore_dir_markers`     |
+| ------------ | ---------------------------------------------------------------------------------------------------------- | ------------------------ |
+| Python 3     | `venv`, `.venv`, `env`, `.env`, `virtualenv`, `site-packages`, `dist-packages`, `.eggs`, `.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `__pypackages__`, `__pycache__` | `pyvenv.cfg`, `conda-meta` |
+| Node / TS    | `node_modules`, `bower_components`, `.next`, `.nuxt`, `.svelte-kit`                                        | —                        |
+| Go           | `vendor`                                                                                                   | `go.mod`* (only as include marker) |
+| Rust         | `target`                                                                                                   | `Cargo.lock`* (only as include marker) |
+| Java / Kotlin | `target`, `build`, `out`, `.gradle`                                                                       | —                        |
+| HTML / docs  | `_site`, `public`, `.jekyll-cache`, `_book`, `.docusaurus`                                                 | —                        |
+
+> **Apollo internals stay in the core builder.** Folders such as
+> `.git`, `_apollo`, `.apollo`, and `_apollo_web` are skipped
+> unconditionally by the graph builder regardless of which plugins
+> are enabled. Plugins should not list these.
+
+##### Example: the Python 3 plugin's ignore declaration
+
+```json
+{
+  "enabled": true,
+  "extensions": [".py"],
+  "ignore_dirs": [
+    "venv", ".venv", "env", ".env", "virtualenv",
+    "site-packages", "dist-packages",
+    ".eggs", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "__pypackages__", "__pycache__"
+  ],
+  "ignore_files": ["*.pyc", "*.pyo", "*.pyd", "*.egg-info"],
+  "ignore_dir_markers": ["pyvenv.cfg", "conda-meta"]
+}
+```
+
+When the user opens a Python project, the indexer sees the python3
+plugin is enabled, pulls its `ignore_dirs` into the skip set, and
+walks the tree without descending into any `venv/` or
+`site-packages/` it encounters. Toggling python3 *off* in **Settings →
+Plugins** removes those ignores too — useful when you do *want* to
+audit a vendored copy of `site-packages`.
+
+#### Examples from the built-in plugins
+
+`plugins/python3/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".py"],
+  "extract_comments": true,
+  "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+  "extract_strings": true,
+  "extract_type_checking_imports": true,
+  "detect_patterns": true
+}
+```
+
+`plugins/markdown_gfm/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".md", ".markdown"],
+  "max_file_size_bytes": 1048576,
+  "extract_callouts": true,
+  "extract_tables": true,
+  "extract_task_items": true,
+  "extract_wikilinks": true
+}
+```
+
+`plugins/pdf_pypdf/config.json`:
+
+```json
+{
+  "enabled": true,
+  "extensions": [".pdf"],
+  "max_file_size_bytes": 52428800,
+  "extract_outline": true,
+  "extract_metadata": true,
+  "decrypt_with_empty_password": true
+}
+```
+
+#### Reading the config from your parser
+
+Apollo loads each plugin's `config.json` at startup and merges any
+overrides from the global `data/settings.json`. The resulting dict is
+passed to the parser instance — so your `__init__` should accept (and
+default) a `config` argument:
+
+```python
+class GoParser(BaseParser):
+    DEFAULT_CONFIG = {
+        "enabled": True,
+        "extensions": [".go"],
+        "max_file_size_bytes": 5_000_000,
+    }
+
+    def __init__(self, config: dict | None = None):
+        merged = {**self.DEFAULT_CONFIG, **(config or {})}
+        self.config = merged
+
+    def can_parse(self, filepath):
+        if not self.config.get("enabled", True):
+            return False
+        ext = Path(filepath).suffix.lower()
+        return ext in self.config.get("extensions", [])
+```
+
+`enabled: false` should make `can_parse()` return `False` so the
+graph builder simply skips the plugin without re-indexing anything.
+
+#### What happens if `config.json` is missing or malformed
+
+The plugin still loads with `enabled: true` and an empty options dict
+(so existing installations don't break), but the Plugins tab won't
+expose any knobs to users. New plugins should always ship a valid
+`config.json`.
+
+---
+
 ## 3. The standard result shape
 
 `parse_file` / `parse_source` must return a `dict` with **at least**
@@ -250,73 +601,90 @@ You may add language-specific keys alongside these (e.g. `traits`,
 `macros`, `goroutines`, `decorators`). Apollo will store and surface
 them in the graph viewer without further changes.
 
+> **The shape below is not "nice to have".** See § 0.2 — the builder
+> dereferences `func["line_start"]`, `cls["bases"]`, `cls["methods"]`,
+> `var["line"]` etc. *directly*. Emitting `{"name": "x"}` will crash
+> the indexer. The "required" rows below are required.
+
 ### Recommended dict shapes
 
-These are the conventions used by the built-in plugins. Follow them
-unless your language genuinely needs something different.
+These are the conventions used by the built-in plugins. Rows marked
+**required** must be present (the builder reads them with `[...]`,
+not `.get(...)`). Other rows are recommended — the more you fill in,
+the richer the graph and the better callers/callees, semantic search,
+and AI-chat answers behave.
 
 **Function / method:**
 ```python
 {
-    "name": "handleRequest",
+    # ─── required (builder reads directly) ───────────────────────────
+    "name":       "handleRequest",
     "line_start": 42,
-    "line_end": 87,
-    "loc": 46,
-    "source": "func handleRequest(...) {...}",
-    "docstring": "Handle an incoming HTTP request.",
-    "args": ["w", "r"],            # bare parameter names
-    "params": [                    # rich parameter info
+    "line_end":   87,
+    "source":     "func handleRequest(...) {...}",
+    # ─── recommended (drives graph edges & semantic features) ────────
+    "loc":         46,
+    "docstring":   "Handle an incoming HTTP request.",
+    "args":        ["w", "r"],            # bare parameter names
+    "params": [                           # rich parameter info
         {"name": "w", "annotation": "http.ResponseWriter",
          "default": None, "kind": "arg"},
     ],
     "return_annotation": "error",
-    "decorators": [],
-    "calls": [                     # callsites inside this function
+    "decorators":  [],
+    "calls": [                            # ★ drives `calls` edges
         {"name": "log.Printf", "args": ["\"hi\""], "line": 50},
     ],
-    "complexity": 4,               # cyclomatic complexity (optional)
-    "is_async": False,
-    "is_nested": False,
-    "is_test": False,
+    "complexity":  4,                     # cyclomatic complexity
+    "is_async":    False,
+    "is_nested":   False,
+    "is_test":     False,                 # ★ enables `tests` edges
+    "context_managers": [],
+    "exceptions":       [],
 }
 ```
 
 **Class / struct:**
 ```python
 {
-    "name": "Server",
+    # ─── required ────────────────────────────────────────────────────
+    "name":       "Server",
     "line_start": 10,
-    "line_end": 95,
-    "source": "type Server struct {...}",
-    "docstring": "HTTP server wrapper.",
-    "bases": ["BaseHandler"],      # parents / embedded types
-    "methods": [ ...function dicts... ],
-    "decorators": [],
+    "line_end":   95,
+    "source":     "type Server struct {...}",
+    "bases":      ["BaseHandler"],        # ★ drives `inherits` edges (empty list OK)
+    "methods":    [ ...function dicts... ],  # ★ each is a `defines` edge from class
+    # ─── recommended ─────────────────────────────────────────────────
+    "docstring":   "HTTP server wrapper.",
+    "decorators":  [],
     "class_vars": [
         {"name": "addr", "annotation": "string", "value": "\":8080\"",
          "line": 11},
     ],
+    "is_dataclass":  False,
+    "is_namedtuple": False,
 }
 ```
 
 **Import:**
 ```python
 {
-    "module": "net/http",
-    "names":  [],                  # for `from x import a, b`
+    "module": "net/http",                 # required
+    # ─── recommended ─────────────────────────────────────────────────
+    "names":  [],                         # for `from x import a, b`
     "alias":  None,
     "line":   3,
-    "level":  0,                   # relative-import depth
+    "level":  0,                          # relative-import depth
 }
 ```
 
 **Variable:**
 ```python
 {
-    "name": "VERSION",
-    "value": "\"1.0.0\"",
+    "name": "VERSION",                    # required
+    "line": 1,                            # required
+    "value":      "\"1.0.0\"",            # recommended
     "annotation": "string",
-    "line": 1,
 }
 ```
 
@@ -457,40 +825,351 @@ The two built-in plugins are deliberately written as references:
   frontmatter. Good template for any structured-text or config format
   (HTML, AsciiDoc, reStructuredText, YAML schemas, etc.).
 
+- **`plugins/go1/`, `plugins/java17/`, `plugins/javascript1/`,
+  `plugins/node20/`, `plugins/php8/`** — all use the **regex pattern**
+  described below in § 5.1. Good templates for any language with no
+  installable Python-callable AST.
+
 Read whichever one is closer to what you're building, then adapt it.
+
+### 5.1 No Python AST? Use the regex pattern
+
+If there is no installable Python parser for your language and you don't
+want to ship a tree-sitter binary, you can still write a working plugin
+with carefully scoped regexes — the bundled Go/Java/JS/Node/PHP plugins
+do exactly this. The pattern that turns regex matches into the **same
+result-dict shape** the AST plugins produce has three small pieces:
+
+#### 1. Compute line numbers from byte offsets
+
+Regex matches give you a character offset; the builder needs 1-based
+line numbers. One helper handles every callsite:
+
+```python
+def _line_at(source: str, pos: int) -> int:
+    """Return the 1-based line number of byte offset *pos* in *source*."""
+    return source.count("\n", 0, pos) + 1
+```
+
+Call it with `m.start()` to get `line_start` and with the closing-brace
+offset (see step 2) to get `line_end`. For per-call lines inside a
+function body, do the same with the body-relative offset plus the
+body's starting line.
+
+#### 2. Find the matching `}` for `line_end` and `source`
+
+`line_end` and `source` (the full text of the function/class) require
+walking from the opening `{` to its matching `}`. A small scanner that
+respects strings and `// ... */` / `/* ... */` comments is enough:
+
+```python
+def _find_matching_brace(source: str, open_pos: int) -> int:
+    """Index of the ``}`` matching the ``{`` at *open_pos*; tolerant
+    of strings and comments so braces inside literals don't fool it."""
+    depth = 0
+    i = open_pos
+    n = len(source)
+    in_str = None         # quote char we're inside, or None
+    in_line_comment = False
+    in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1; continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2; continue
+            i += 1; continue
+        if in_str:
+            if ch == "\\":
+                i += 2; continue
+            if ch == in_str:
+                in_str = None
+            i += 1; continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True; i += 2; continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True; i += 2; continue
+        if ch in ('"', "'", "`"):
+            in_str = ch; i += 1; continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n - 1   # truncated source: never crash, return *some* range
+```
+
+With those two helpers, every function/class match becomes:
+
+```python
+header_start = m.start()
+open_brace   = m.end() - 1            # the '{' the regex captured
+close_brace  = _find_matching_brace(source, open_brace)
+line_start   = _line_at(source, header_start)
+line_end     = _line_at(source, close_brace)
+src_slice    = source[header_start : close_brace + 1]
+body         = source[open_brace + 1 : close_brace]
+```
+
+#### 3. Methods go *inside* `classes[].methods[]`, not in `functions[]`
+
+The graph builder draws a `defines` edge from class → method by walking
+`classes[i]["methods"]`. Methods that leak into the top-level
+`functions[]` list become orphan nodes with no parent class. The fix
+is to scan a class body for method-shaped matches and attach them:
+
+```python
+def _extract_class(self, source, m):
+    open_brace  = m.end() - 1
+    close_brace = _find_matching_brace(source, open_brace)
+    body_start  = open_brace + 1
+
+    # Methods only — finditer is bounded to the class body.
+    methods = []
+    for mm in METHOD_RE.finditer(source, body_start, close_brace):
+        m_open  = mm.end() - 1
+        m_close = _find_matching_brace(source, m_open)
+        if m_close > close_brace:
+            continue                       # spilled out of the class
+        methods.append({
+            "name": mm.group("name"),
+            "line_start": _line_at(source, mm.start()),
+            "line_end":   _line_at(source, m_close),
+            "source":     source[mm.start() : m_close + 1],
+            "calls":      _extract_calls(source[m_open+1 : m_close],
+                                         _line_at(source, m_open + 1)),
+        })
+
+    return {
+        "name": m.group("name"),
+        "line_start": _line_at(source, m.start()),
+        "line_end":   _line_at(source, close_brace),
+        "source":     source[m.start() : close_brace + 1],
+        "bases":      _split_extends(m.group("extends")),
+        "methods":    methods,
+    }
+```
+
+The same walk lets you collect `bases` from the `extends` /
+`implements` clause and produce `inherits` edges in the graph — without
+those, your plugin emits class nodes with no inheritance relationships,
+which violates the goal in § 0.
+
+#### 4. Extract `calls[]` so the graph gets `calls` edges
+
+For every function/method body, scan for `ident(` callsites and emit
+them — the cross-file resolver in `graph/builder.py` does the rest:
+
+```python
+_CALL_RE = re.compile(r"\b(?P<name>[A-Za-z_][\w\.]*)\s*\(")
+_LANG_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", ...})
+
+def _extract_calls(body: str, body_start_line: int) -> list[dict]:
+    out, seen = [], set()
+    for m in _CALL_RE.finditer(body):
+        name = m.group("name")
+        if name.split(".")[0] in _LANG_KEYWORDS:
+            continue
+        line = body_start_line + body.count("\n", 0, m.start())
+        key = (name, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "args": [], "line": line})
+    return out
+```
+
+A regex-based plugin will miss some constructs a real AST would catch —
+that's fine. **Emit what you can** so the graph has *some* `calls`
+edges. A future tree-sitter or real-AST plugin can ship later as a
+separate folder (e.g. `go_treesitter/`) and supersede this one.
+
+#### Heads-up: `ignore_dir_markers` means *skip*, not *include*
+
+The `ignore_dir_markers` config field lists sentinel **filenames** that
+mark a directory as **ignorable**. It is what catches non-standard
+virtualenvs (`pyvenv.cfg`) or conda envs (`conda-meta`).
+
+Do **not** put a project-root marker like `package.json`, `composer.json`,
+`go.mod`, or `pom.xml` in `ignore_dir_markers` — those files mark
+directories the plugin should *index*, not skip. Putting them here
+silently disables the plugin for every real project.
+
+### 5.2 Logging: use the project standard
+
+The single source of truth for diagnostics in Apollo is
+[`guides/LOGGING.md`](LOGGING.md). **Plugins are not exempt** — every
+parser module you ship under `plugins/<name>/` MUST follow it.
+
+The minimum a plugin must do:
+
+```python
+# plugins/<name>/parser.py
+from __future__ import annotations
+
+import logging
+
+from apollo.parser.base import BaseParser
+
+logger = logging.getLogger(__name__)   # → "plugins.<name>.parser"
+
+
+class MyParser(BaseParser):
+    def parse_file(self, filepath: str) -> dict | None:
+        try:
+            source = open(filepath, encoding="utf-8").read()
+        except (OSError, IOError) as exc:
+            # Recoverable — Apollo skips the file and continues.
+            logger.warning("could not read %s: %s", filepath, exc)
+            return None
+        try:
+            return self.parse_source(source, filepath)
+        except Exception:
+            # Unexpected failure: include the traceback automatically.
+            logger.exception("parser %s failed on %s",
+                             type(self).__name__, filepath)
+            return None
+```
+
+Hard rules (cribbed from [`LOGGING.md`](LOGGING.md), repeated here so
+plugin authors don't miss them):
+
+- `logger = logging.getLogger(__name__)` at the **top** of every
+  parser/helper module. Never hard-code the logger name string. Apollo
+  filters by dotted module path — `APOLLO_LOG_LEVEL=DEBUG
+  APOLLO_LOG_FILTER=plugins.<name>.*` only works if you use `__name__`.
+- **No `print()`** anywhere in plugin code (docstring example snippets
+  inside `"""…"""` are fine — they're not executed).
+- **Lazy `%`-formatting:** `logger.warning("could not read %s: %s",
+  path, exc)`, *not* `logger.warning(f"could not read {path}: {exc}")`.
+  f-strings interpolate even when the level is suppressed.
+- **`logger.exception(...)` inside `except`** when you want the
+  traceback; otherwise `logger.warning(..., exc_info=True)` for a
+  recovered failure.
+- **Pick the right level** (§ 4 of `LOGGING.md`): a file we couldn't
+  read or parse but that didn't abort the index is `WARNING`; a
+  genuine bug is `ERROR` / `logger.exception`. Raw tracing inside a
+  hot loop is `DEBUG`.
+- **Never log secrets, full file contents, or user prompt text** at
+  `INFO` or above. Log a path or hash, not the body.
+
+Apollo's CI does not yet enforce these mechanically, but the plugin
+audit script (`pytest plugins/ -q` plus a grep for `print(`,
+`f"…"` inside `logger.*`, and bare `except:`) is the bar a new plugin
+has to clear before merge.
 
 ---
 
 ## 6. Testing your plugin
 
-Add a quick smoke test under `tests/`:
+Every plugin **must** ship a `test_parser.py` **inside its own folder**.
+This keeps tests self-contained alongside the code they exercise:
+deleting the plugin (``rm -rf plugins/<name>/``) deletes its tests in
+the same step, and third-party plugin authors don't have to know about
+a separate `tests/` directory.
+
+### Required: `plugins/<name>/test_parser.py`
+
+At minimum the file should cover three things:
+
+1. **Discovery** — the plugin is picked up by
+   ``apollo.plugins.discover_plugins()``.
+2. **Extension matching** — ``can_parse()`` accepts the right
+   extensions and rejects everything else.
+3. **One happy-path parse** — a small inline fixture file is parsed
+   into a result dict with the standard shape.
+
+Example (`plugins/go1/test_parser.py`):
 
 ```python
-# tests/test_go1_parser.py
+"""Self-contained smoke tests for the go1 plugin."""
+from __future__ import annotations
+
 from apollo.plugins import discover_plugins
 from plugins.go1 import GoParser  # re-exported by plugins/go1/__init__.py
 
 
-def test_go_plugin_is_discovered():
-    plugins = discover_plugins()
-    assert any(isinstance(p, GoParser) for p in plugins)
+class TestGo1PluginDiscovery:
+    def test_plugin_is_discovered(self):
+        plugins = discover_plugins()
+        assert any(isinstance(p, GoParser) for p in plugins)
 
 
-def test_go_plugin_recognises_extension(tmp_path):
-    f = tmp_path / "main.go"
-    f.write_text("package main\n")
-    parser = GoParser()
-    assert parser.can_parse(str(f))
-    result = parser.parse_file(str(f))
-    assert result is not None
-    assert result["file"] == str(f)
+class TestGo1PluginRecognisesExtension:
+    def test_recognises_go_extension(self, tmp_path):
+        f = tmp_path / "main.go"
+        f.write_text("package main\n")
+        assert GoParser().can_parse(str(f))
+
+    def test_rejects_non_go_extension(self, tmp_path):
+        f = tmp_path / "doc.txt"
+        f.write_text("hi")
+        assert not GoParser().can_parse(str(f))
+
+
+class TestGo1PluginParsesRealGo:
+    def test_parses_minimal_module(self, tmp_path):
+        path = tmp_path / "main.go"
+        path.write_text("package main\n\nfunc main() {}\n")
+        result = GoParser().parse_file(str(path))
+
+        assert result is not None
+        assert result["file"] == str(path)
+        # All five required keys must be present.
+        for key in ("functions", "classes", "imports", "variables"):
+            assert key in result
 ```
 
-Run the suite:
+> **Per-plugin fixtures.** Inline the data your tests need (small
+> strings, ``tmp_path.write_text(...)``). Don't depend on
+> ``tests/conftest.py`` fixtures — pytest's `conftest.py` discovery is
+> directory-scoped, and your goal is a plugin folder that works
+> standalone. If a plugin really needs shared fixtures, add a
+> ``plugins/<name>/conftest.py`` next to ``test_parser.py``.
+
+### Discovery
+
+`pytest.ini` lists both `tests` and `plugins` under `testpaths`, so a
+plain `pytest` run finds plugin tests automatically. To run **only**
+your plugin's tests:
 
 ```bash
-pytest tests/test_go1_parser.py -q
+pytest plugins/go1/ -q
 ```
+
+To run all plugin tests:
+
+```bash
+pytest plugins/ -q
+```
+
+### Why not `tests/`?
+
+Keeping plugin tests in a separate top-level directory leaks plugin
+concerns into the rest of the repo:
+
+- Removing a plugin leaves dead test files behind in `tests/`.
+- Third-party plugin authors have to ship two folders.
+- Browsing `plugins/<name>/` doesn't show how the plugin is verified.
+
+Cross-cutting tests that span multiple plugins / the graph builder /
+the API still belong in `tests/` — that's where the shared
+`conftest.py` lives. The rule of thumb: **tests that exercise
+exactly one plugin go in that plugin's folder; tests that exercise
+multiple components go in `tests/`.**
+
+### Tests do **not** run at app runtime
+
+`test_parser.py` is a pytest-only file — Apollo never imports it when
+the app starts, when you index a folder, or when you run the API. It
+only runs in development / CI when you invoke `pytest` explicitly.
 
 ---
 
@@ -518,15 +1197,52 @@ Before you commit a new plugin:
 - [ ] Folder contains `plugin.md` with a valid YAML front-matter block
       providing **`description`, `version`, `url`, `author`**
       (see [§ 2.5](#25-the-plugin-manifest-pluginmd)).
+- [ ] Folder contains `config.json` with at minimum `"enabled": true`
+      plus any plugin-specific knobs
+      (see [§ 2.6](#26-the-plugin-config-configjson)).
+- [ ] Folder contains `test_parser.py` covering discovery, extension
+      matching, and one happy-path parse
+      (see [§ 6](#6-testing-your-plugin)).
 - [ ] Parser class subclasses `apollo.parser.base.BaseParser`.
-- [ ] `can_parse()` returns `True` only for files this plugin handles.
+- [ ] `can_parse()` returns `True` only for files this plugin handles
+      **and** returns `False` when `self.config["enabled"]` is False.
 - [ ] `parse_file()` returns the standard dict (or `None`).
 - [ ] All five required keys (`file`, `functions`, `classes`,
       `imports`, `variables`) are always present.
+- [ ] Every entry in `functions[]` and `classes[]` carries the
+      builder-required keys from § 0.2 (`name`, `line_start`,
+      `line_end`, `source`; classes also `bases`, `methods`).
+- [ ] Every entry in `variables[]` carries `name` and `line`.
+- [ ] **Relationships are extracted, not just entities** (§ 0): for a
+      programming-language plugin, `functions[].calls[]` and
+      `classes[].bases[]` are populated when the source has them; for
+      a document plugin, `links[]` / `sections[]` / `code_blocks[]` /
+      `frontmatter` are populated when the file has them.
+- [ ] Methods live inside `classes[].methods[]`, **not** in the
+      top-level `functions[]` list (otherwise they show up as orphan
+      nodes with no parent class — see § 5.1.3).
+- [ ] If your plugin is regex-based (no Python AST), it uses the
+      line-tracking and brace-matching helpers from § 5.1 so every
+      function/class entry carries a real `line_start` / `line_end` /
+      `source`.
+- [ ] `ignore_dir_markers` (if set) only contains sentinel files that
+      mark directories to **skip** (e.g. `pyvenv.cfg`), never
+      project-root markers like `package.json` or `composer.json`
+      (see § 5.1).
+- [ ] Indexing a small fixture project of your language's files via
+      `python main.py index <fixture-dir>` runs to completion without
+      `KeyError` and produces a graph with > 0 `calls` / `inherits` /
+      `references` edges where the source warrants them.
 - [ ] Any third-party deps are in
       `plugins/<name>/requirements.txt` and imported lazily inside the
       parser class.
-- [ ] At least one smoke test under `tests/`.
-- [ ] `pytest -q` is green.
+- [ ] **Logging follows [`guides/LOGGING.md`](LOGGING.md)** (§ 5.2):
+      `logger = logging.getLogger(__name__)` at module top, no
+      `print()` in plugin code, lazy `%`-formatted log calls (no
+      f-strings inside `logger.*`), no bare `except:`, and every
+      `except` that swallows the error logs at least a `WARNING` so
+      users can see which files were skipped.
+- [ ] `pytest plugins/<name>/ -q` is green.
+- [ ] `pytest -q` (full suite) is green.
 - [ ] **Settings → Plugins** tab shows your plugin with the expected
       description, version, URL, and author after a reload.

@@ -104,3 +104,22 @@ class TestPdfPluginParsesRealPdf:
         f = tmp_path / "broken.pdf"
         f.write_bytes(b"this is not a real pdf at all")
         assert PdfParser().parse_file(str(f)) is None
+
+
+class TestPdfPluginConfig:
+    """Phase 2A: parser receives its merged config and respects ``enabled``."""
+
+    def test_disabled_plugin_can_parse_returns_false(self, tmp_path):
+        path = _make_pdf(tmp_path, text="Hello", title="Test")
+        parser = PdfParser(config={"enabled": False})
+        assert parser.can_parse(str(path)) is False
+
+    def test_extract_pages_toggle_off_yields_empty_pages(self, tmp_path):
+        path = _make_pdf(tmp_path, text="Hello", title="Test")
+        parser = PdfParser(config={"extract_pages": False})
+        result = parser.parse_file(str(path))
+        assert result is not None
+        # Pages array is empty when extraction is off, but page_count
+        # still reflects the document's true size.
+        assert result["pages"] == []
+        assert result["page_count"] >= 1

@@ -412,7 +412,7 @@ A local web application that lets you visually explore the knowledge graph, filt
 | View                   | Library                   | Purpose                                                   |
 |------------------------|---------------------------|-----------------------------------------------------------|
 | **Force-directed graph** | ECharts `type: 'graph'`  | Interactive node-link diagram of code relationships (like the [WebKit dep example](https://echarts.apache.org/examples/en/editor.html?c=graph-webkit-dep)). Nodes = code entities, edges = calls/imports/references. Draggable, zoomable, pannable. |
-| **Word cloud**          | ECharts `echarts-wordcloud` extension | Show most-used symbols, module names, or semantic topics. Click a word to filter the graph to related nodes. |
+| **Idea Cloud**          | ECharts `echarts-wordcloud` extension | Symbols sized by **graph strength** (sum of in+out degree, aggregated by name) — not raw frequency. Three tiers: *strong* (top 30 hubs), *relevant* (top 100, strength ≥ 2), *all* (full long tail). Click a word to seed an AI question or filter the graph. See §7.6 for the impact-analysis workflow. |
 | **Treemap**             | ECharts `type: 'treemap'` | Visualize the directory/file structure sized by number of entities, lines of code, or connection count. |
 | **Sunburst**            | ECharts `type: 'sunburst'`| Hierarchical view: directory → file → class → function. Good for understanding project structure at a glance. |
 
@@ -462,7 +462,7 @@ A local web application that lets you visually explore the knowledge graph, filt
 │                     │  JSON   │                          │
 │  /api/graph         │         │  ECharts force graph     │
 │  /api/search        │         │  ECharts word cloud      │
-│  /api/query         │         │  ECharts treemap         │
+│  /api/tree          │         │  ECharts treemap         │
 │  /api/node/:id      │         │  Source code panel       │
 │  /api/wordcloud     │         │  Filter sidebar          │
 └────────┬───────────┘         └──────────────────────────┘
@@ -478,25 +478,46 @@ The backend exposes a small REST API. The frontend is a single-page app (could b
 
 **API Endpoints:**
 
-| Endpoint             | Method | Input                        | Output                                  |
-|----------------------|--------|------------------------------|-----------------------------------------|
-| `/api/graph`         | GET    | `?path=src/&depth=2&edges=calls,imports` | `{ nodes: [...], edges: [...], categories: [...] }` — ECharts-ready |
-| `/api/search`        | POST   | `{ "text": "email", "top": 10 }` | `{ results: [{ node, score }] }`       |
-| `/api/query`         | POST   | JSON query DSL object        | `{ nodes: [...], edges: [...] }`        |
-| `/api/node/:id`      | GET    | —                            | `{ source, file, lines, edges, embedding_preview }` |
-| `/api/wordcloud`     | GET    | `?path=src/&metric=frequency`| `[{ name: "emails", value: 42 }, ...]`  |
-| `/api/tree`          | GET    | `?path=/`                    | Nested directory/file tree with counts  |
+> Headline endpoints; the full inventory lives in [`API.md`](./API.md) and
+> [`openapi.yaml`](./openapi.yaml).
 
-### 7.4 Word Cloud Modes
+| Endpoint                         | Method | Input                        | Output                                  |
+|----------------------------------|--------|------------------------------|-----------------------------------------|
+| `/api/graph`                     | GET    | `?path=src/&types=&edges=&limit=&max_edges=` | `{ nodes, edges, categories, total_nodes, total_edges, truncated }` — ECharts-ready |
+| `/api/search`                    | GET    | `?q=email&top=10&type=function` | `{ results: [{ id, name, type, path, line_start, score }] }` |
+| `/api/search/multi`              | POST   | `{ "queries": ["a","b"], "top": 10 }` | Deduped, score-merged search results          |
+| `/api/node/:id`                  | GET    | —                            | `{ source, file, lines, edges_in, edges_out }` |
+| `/api/node/:id/connections`      | GET    | —                            | Edges plus per-edge source-code preview snippets |
+| `/api/neighbors/:id`             | GET    | `?depth=&edge_types=&direction=` | BFS-walk neighbours              |
+| `/api/wordcloud`                 | GET    | `?path=src/&mode=strong`     | `{ items: [{ name, value, count }], total, shown, mode, min_strength }` — `value` = graph strength (in+out degree summed by name) |
+| `/api/tree`                      | GET    | `?path=/`                    | Nested directory/file tree with counts  |
 
-The word cloud can be driven by different metrics:
+### 7.4 Idea Cloud — Strength-Weighted Tiers
 
-| Mode            | What it shows                                  | Use case                              |
-|-----------------|------------------------------------------------|---------------------------------------|
-| **Frequency**   | Most-used symbol names across the codebase     | "What are the core functions?"        |
-| **Connectivity**| Symbols with the most graph edges              | "What are the most connected pieces?" |
-| **Semantic topics** | Cluster embeddings → extract topic labels  | "What themes exist in this codebase?" |
-| **Recent changes** | Symbols in recently modified files           | "What's being actively worked on?"    |
+The Idea Cloud weights every name by **graph strength** — the sum of in+out
+degree across every node that shares that display name. This is the
+"connectivity" mode of earlier drafts, promoted to the default because it is
+the only metric that meaningfully answers *"which symbols actually matter to
+this project?"* Raw frequency was too noisy (`__init__`, `name`, `get` always
+won), and semantic topic / recent-change modes are tracked separately under
+the embeddings and watcher subsystems.
+
+Three render tiers, exposed as both a UI cycle button and an API parameter
+(`?mode=`):
+
+| Tier         | Cap | Floor              | Font range | Intent                                                  |
+|--------------|-----|--------------------|------------|---------------------------------------------------------|
+| **strong**   | 30  | strength ≥ 2       | 18–48 px   | Default. The hub symbols — readable headline.           |
+| **relevant** | 100 | strength ≥ 2       | 12–40 px   | "Show More" — broader context, still filtered.          |
+| **all**      | 500 | none (singletons OK) | 8–28 px  | Explicit opt-in. Long tail; useful only for completeness.|
+
+Sizing inside ECharts uses `Math.log2(value + 1)` so a few hub nodes don't
+collapse the rest into 8 px. A small legend (`showing 30 of 412, strength ≥ 2`)
+makes the filtering visible so missing items feel intentional. Tooltips show
+the raw `strength` and `count` for each word.
+
+The same tiers are exposed to the AI through the `get_wordcloud` tool with a
+`mode` argument; see §7.6.
 
 ### 7.5 Tech Choices for Frontend
 
@@ -509,7 +530,82 @@ The word cloud can be driven by different metrics:
 
 **Recommendation**: **ECharts** — it covers all four visualization types (force graph, word cloud, treemap, sunburst) in one library with consistent APIs. The WebKit dependency example you found is almost exactly our use case. The `echarts-wordcloud` extension adds word cloud support.
 
-### 7.6 Updated UI Wireframe (with Chat)
+### 7.6 Impact-Analysis Workflow (UI + AI)
+
+The Idea Cloud is more than decoration — it is the **entry point for impact
+analysis**. A user (or the AI) typically wants to answer one of two related
+questions:
+
+> *"If I change X, what else will break?"*
+> *"How central is X to the project, really?"*
+
+The strength-weighted cloud directly ranks symbols by how plausibly the
+answer to those questions is "a lot." The full loop combines tree, graph,
+cloud, and AI chat into a single discovery → drill-in → assess flow:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│   1. Discover (Idea Cloud, mode=strong)                          │
+│        │  hub names sized by strength                            │
+│        ▼                                                         │
+│   2. Locate (search_graph / find: badge)                         │
+│        │  resolve hub name → concrete node IDs                   │
+│        ▼                                                         │
+│   3. Drill-in (/api/graph + /api/node/:id, depth 1–2)            │
+│        │  enumerate callers, callees, inheritance, imports       │
+│        ▼                                                         │
+│   4. Assess (AI chat with the above context attached)            │
+│           "what relies on this? what would break if I change     │
+│            its signature?"                                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### What "strength" actually estimates
+
+For a name `n` aggregating nodes `N₁ … Nₖ`:
+
+```
+strength(n) = Σᵢ (in_degree(Nᵢ) + out_degree(Nᵢ))
+```
+
+This is a cheap, language-agnostic proxy for *blast radius*: edges in this
+graph are imports, calls, inherits, contains, references — every edge
+touching a node is one place a change could ripple to or be triggered by.
+It deliberately ignores edge **type** weighting (a `calls` edge is treated
+the same as an `imports` edge) because over-weighting any one type would
+bias the cloud toward whatever language/plugin happens to emit the most of
+it. A future enhancement (§14) could add per-edge-type weights once we have
+real signal that one matters more than another.
+
+#### How the AI uses it
+
+The `get_wordcloud` tool now mirrors the HTTP endpoint and accepts the same
+`mode` parameter (`strong` / `relevant` / `all`). Recommended AI playbook:
+
+1. **`get_wordcloud(mode="strong")`** to pull the project's hub vocabulary.
+2. **`search_graph(name)`** for a candidate hub → resolve to node IDs.
+3. **`get_neighbors(node_id, depth=1)`** (or `query_callers` / `query_callees`
+   when added) to count and inspect direct dependents.
+4. Compose an answer that ties the user's proposed change to a concrete
+   ranked list of files/functions likely to be impacted, citing the
+   `strength` and direct-dependent count as evidence.
+
+Tier guidance for the AI:
+
+| User intent                                       | Recommended `mode` |
+|---------------------------------------------------|--------------------|
+| "Give me an overview of what this project is about." | `strong`           |
+| "What other things depend on `X`?" (X is a likely hub) | `strong` then `search_graph` |
+| "Find every place we touch couchbase / SMTP / etc." | `relevant` (broader net) |
+| "Audit dead code / orphans / single-use helpers."   | `all` (long tail is the point) |
+
+The AI should default to `strong`. `all` returns up to 500 entries and is
+mostly low-signal noise for normal questions — it should be opt-in, just
+like the user-facing button.
+
+### 7.7 Updated UI Wireframe (with Chat)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -680,6 +776,124 @@ Files referenced:
 **Q: "How should I refactor the email handling?"**
 → System gathers all email-related nodes + their dependency graph + source code.
 → Grok suggests refactoring strategies based on the actual code structure.
+
+### 8.7 TOON-Encoded Tool Results
+
+Every tool result returned to the LLM is re-encoded from JSON to **TOON**
+(Token-Oriented Object Notation) before being appended to the message
+history. TOON is a CSV/YAML hybrid optimised for LLM context: arrays of
+uniform objects collapse from `[{id:1,name:"f"},{id:2,name:"g"}]` into a
+header-once table:
+
+```
+results[2,]{id,name,type,path,line_start}:
+  "func::a.py::f",f,function,a.py,1
+  "func::a.py::g",g,function,a.py,5
+```
+
+In practice we see **30–50% byte reduction** on `search_graph`,
+`search_graph_multi`, `get_neighbors`, `get_wordcloud`, `list_notes`,
+and similar tabular tools. That directly translates into more tool
+rounds fitting under the model's context window before
+`rounds_exhausted` kicks in.
+
+The conversion lives in `chat.service._to_toon_for_llm`. It is
+defensively wrapped: if `python-toon` is not installed, the JSON
+isn't parseable, the encoder raises, *or* the TOON output would be
+*larger* than the JSON (rare, happens for very small / heterogeneous
+payloads), the original JSON string is passed through unchanged.
+
+The trace panel (§8.8) shows both numbers per tool call:
+
+```
+↩ search_graph → 1513 B · 6.9s · toon 921 B (-39.1%)
+```
+
+The system prompt tells the model to expect TOON, so it can read the
+header line for field names and treat each subsequent row as one
+object positionally mapped to those fields.
+
+### 8.8 AI Trace Panel & Step-Event Protocol
+
+Because chat is the primary way users interact with the indexed graph, every
+assistant response carries a **per-message audit trail** so the user — and the
+developer triaging a bug report — can see exactly what the model did.
+
+#### What the user sees
+
+Directly under each assistant bubble there is a thin collapsible strip:
+
+```
+▸ Trace · 7 steps · 3 tool calls · 2.41s
+```
+
+Clicking it expands a monospaced log with one row per pipeline step:
+
+| Icon | Phase             | Shows                                                              |
+|------|-------------------|---------------------------------------------------------------------|
+| ➤    | `request`         | provider/model, history length, currently-selected graph node      |
+| ↻    | `round`           | LLM round index, finish reason, dt, # tool calls returned          |
+| 🔧   | `tool_call`       | tool name + truncated JSON args                                    |
+| ↩    | `tool_return`     | tool name, byte size, dt, 240-char preview of the JSON result      |
+| ✓    | `return_result`   | counts of files / node refs / confidence / total elapsed           |
+| ✎    | `stream_begin`    | timestamp the final SSE stream started                             |
+| ●    | `done`            | tokens, bytes, stream_dt, total_dt, terminal `reason`              |
+| ⚠    | `rounds_exhausted`| 5-round cap hit; falls through to a tool-less stream               |
+| ✗    | `error`           | which phase blew up (`tools` / `stream`) and the exception message |
+
+The summary line and the body are updated live as events arrive, so the user
+gets immediate feedback ("the model is now calling `search_graph`…") instead
+of staring at a typing-dots animation.
+
+#### Wire format
+
+`chat.service.chat_stream` no longer yields raw strings — it yields tagged
+event dicts:
+
+```python
+{"type": "text", "content": "..."}                  # final-answer token
+{"type": "step", "phase": "request", ...}           # pipeline trace
+{"type": "step", "phase": "tool_call", "name": "search_graph", "args_preview": "..."}
+{"type": "step", "phase": "tool_return", "name": "search_graph",
+ "bytes": 1234, "dt": 0.51, "preview": "..."}
+{"type": "step", "phase": "done", "reason": "stream",
+ "tokens": 42, "bytes": 1024, "total_dt": 1.2}
+```
+
+The `/api/chat` SSE endpoint serializes them as two distinct frame kinds:
+
+```
+data: <escaped text token>\n\n             ← regular token (existing format)
+data: [STEP] {"type":"step","phase":"...",...}\n\n
+data: [DONE]\n\n
+data: [ERROR] <exception>\n\n               ← only on backend failure
+```
+
+The client SSE parser (`_streamAssistantResponse` in `web/static/app.js`) is
+line-buffered across `read()` chunk boundaries so a `[DONE]` or `[STEP]` frame
+that straddles a TCP packet boundary is never dropped (this used to make the
+UI hang forever with the typing-dots indicator).
+
+#### Server-side correlation
+
+Each request gets an 8-char `rid` (e.g. `id=a1b2c3d4`) that appears on every
+`apollo.log` line *and* on every step event sent to the UI:
+
+```
+chat.request id=a1b2c3d4 mode=stream provider=xai model=grok-4-1-fast-… msg=...
+tool.call    name=search_graph args={"query":"emails"}
+tool.return  name=search_graph bytes=872 dt=0.41s preview={"results":[...]}
+chat.round   id=a1b2c3d4 round=0 finish=tool_calls dt=1.22s tool_calls=1
+chat.stream_begin id=a1b2c3d4 elapsed=1.74s
+chat.done    id=a1b2c3d4 reason=stream tokens=87 bytes=412 total_dt=2.41s
+sse.close    id=a1b2c3d4 reason=done tokens=87 bytes=412 steps=6 dt=2.41s
+```
+
+Filter the log with `tail -f .apollo/logs/apollo.log | grep -E 'chat\.|tool\.|sse\.'`
+to watch a live request, or grep by `id=…` to follow a single conversation
+turn end-to-end. When a user reports "the AI got stuck", the `rid` shown in
+their browser console (printed as `[chat] stream closed { … }`) is the same
+ID the operator can grep in the server log.
 
 ---
 
@@ -1049,7 +1263,7 @@ Streamed response to UI (DaisyUI chat bubbles)
 | `search_graph` | Keyword or semantic search across all indexed nodes | `query` (required), `top`, `type` |
 | `get_node` | Full node detail: source, metadata, all edges (callers, callees, imports) | `node_id` (required) |
 | `get_stats` | Graph summary: total nodes/edges, counts by type | — |
-| `get_wordcloud` | Top 50 most frequent entity names | — |
+| `get_wordcloud` | Hub symbols ranked by graph strength (in+out degree, aggregated by name). Returns `{items, total, shown, mode, min_strength}`; each item has `name`, `strength`, `count`. | `mode` (`strong`/`relevant`/`all`), `limit` |
 
 #### Future — Planned Tools & Enhancements
 
@@ -1502,22 +1716,37 @@ URL → fetch (httpx) → detect content type
 
 `build_incremental` uses stat-based prefilter: unchanged files skip without a read. Adding one `.md` file costs only that file's parse + embed (~1-2 seconds). No full re-index needed.
 
-### 14.4 New API Endpoints
+### 14.4 API Endpoints
 
-#### Annotations
+#### Annotations *(implemented — see [`API.md`](./API.md#annotations))*
+
+The original draft proposed separate `/api/highlights`, `/api/notes`, and
+`/api/bookmarks` endpoint families. The implementation consolidated all
+three (plus `tag`) under a single polymorphic `Annotation` model
+discriminated by a `type` field, served by one endpoint family:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/highlights` | GET/POST | List or create highlights on a node |
-| `/api/highlights/{id}` | PUT/DELETE | Update or delete a highlight |
-| `/api/notes` | GET/POST | List or create notes (`?q=` search, `?node_id=`, `?trash=true`) |
-| `/api/notes/{id}` | GET/PUT/DELETE | Read, update, soft-delete a note |
-| `/api/notes/{id}/restore` | POST | Restore from trash |
-| `/api/notes/{id}/purge` | DELETE | Permanently delete |
-| `/api/bookmarks` | GET/POST | List or create bookmarks |
-| `/api/bookmarks/{id}` | DELETE | Remove a bookmark |
+| `/api/annotations` | GET | List annotations, optionally filtered by `?type=highlight\|bookmark\|note\|tag` |
+| `/api/annotations/create` | POST | Create a new annotation |
+| `/api/annotations/by-target` | GET | Find annotations for `?file=` or `?node=` |
+| `/api/annotations/by-tag` | GET | Find annotations carrying `?tag=` |
+| `/api/annotations/{id}` | GET/PUT/DELETE | Read, update (any subset of fields), or delete |
+| `/api/annotations/collections` | GET/POST | List or create collections grouping related annotations |
+| `/api/annotations/collections/{id}` | DELETE | Remove a collection (annotations themselves are kept) |
 
-#### Web Captures
+The trash / soft-delete / restore behaviour from the original draft is
+not exposed — `DELETE /api/annotations/{id}` is a hard delete. The
+`stale` boolean on each annotation indicates whether its target file or
+node still exists in the index.
+
+#### Web Captures *(planned — not yet implemented)*
+
+The capture pipeline below remains a design target; no `/api/captures*`
+endpoints exist in the running server today. Captures will likely be
+introduced as a fifth `Annotation.type` rather than a separate route
+family, mirroring the consolidation already done for highlights / notes
+/ bookmarks.
 
 | Endpoint | Method | Description |
 |---|---|---|

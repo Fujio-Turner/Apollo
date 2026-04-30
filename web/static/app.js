@@ -10,11 +10,37 @@ marked.setOptions({
 /* ── Constants ─────────────────────────────────────────────────── */
 const NODE_COLORS = {
   function: '#00d9ff', class: '#ff6b6b', method: '#ffd93d',
-  variable: '#6bcb77', file: '#8b8b8b', directory: '#666666', import: '#b088f9',
+  variable: '#6bcb77', file: '#8b8b8b', directory: '#000000', import: '#b088f9',
 };
+/* Per-type border overrides for the graph nodes. We make directories
+   black-with-white-border so they're visually distinct from files
+   (which stay grey, no border) — previously both were near-identical
+   shades of grey and easy to misclick. */
+const NODE_BORDERS = {
+  directory: { borderColor: '#ffffff', borderWidth: 2 },
+};
+/* Pick black or white text for a badge whose background is `bg` (hex).
+   Avoids invisible black-on-black for the directory badge. */
+function badgeTextColor(bg) {
+  if (typeof bg !== 'string') return '#000';
+  const m = bg.match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return '#000';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 0xff, g = (n >> 8) & 0xff, b = n & 0xff;
+  // Standard relative-luminance threshold; below ~0.5 use white text.
+  return (0.2126*r + 0.7152*g + 0.0722*b) / 255 < 0.5 ? '#fff' : '#000';
+}
 let graphChart = null, wordCloudChart = null, currentGraph = null, selectedNode = null, currentView = 'graph';
-let wordCloudAllData = [], wordCloudExpanded = false;
-const WORDCLOUD_DEFAULT_LIMIT = 30;
+/* Dev-mode (?dev=true) graph variant. '1' = current force-directed render,
+   '2' = stable circular-layout render with hideOverlap labels (mirrors the
+   ECharts "graph-label-overlap" example). Hidden in normal mode. */
+let graphChart2 = null, currentGraphVariant = '1';
+let wordCloudMode = 'strong', wordCloudMeta = null;
+const WORDCLOUD_TIERS = {
+  strong:   { next: 'relevant', label: 'Show More',                sizeRange: [18, 48] },
+  relevant: { next: 'all',      label: 'Show All Relationships',   sizeRange: [12, 40] },
+  all:      { next: 'strong',   label: 'Back to Strong',           sizeRange: [8, 28]  },
+};
 
 /* ── Depth Slider ──────────────────────────────────────────────── */
 const DEPTH_STOPS = [
@@ -66,7 +92,9 @@ function toggleTheme() {
   document.getElementById('theme-icon-sun').classList.toggle('hidden', isDark);
   const label = document.querySelector('#theme-btn .nav-label');
   if (label) label.textContent = isDark ? 'Light Mode' : 'Dark Mode';
-  if (graphChart) { graphChart.dispose(); graphChart = null; loadGraph(); }
+  if (graphChart) { graphChart.dispose(); graphChart = null; }
+  if (graphChart2) { graphChart2.dispose(); graphChart2 = null; }
+  loadGraph();
   if (wordCloudChart) { wordCloudChart.dispose(); wordCloudChart = null; }
 }
 
@@ -78,7 +106,11 @@ function toggleNav() {
   icon.innerHTML = nav.classList.contains('collapsed')
     ? '<path stroke-linecap="round" stroke-linejoin="round" d="M11.25 4.5l7.5 7.5-7.5 7.5m-6-15l7.5 7.5-7.5 7.5" />'
     : '<path stroke-linecap="round" stroke-linejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" />';
-  setTimeout(() => { if (graphChart) graphChart.resize(); if (wordCloudChart) wordCloudChart.resize(); }, 300);
+  setTimeout(() => {
+    if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
+    if (wordCloudChart) wordCloudChart.resize();
+  }, 300);
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -173,7 +205,23 @@ async function apiFetch(url, opts = {}) {
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('application/json')) {
         const j = await r.json();
-        detail = j.detail || j.error || j.message || detail;
+        // Server's structured shape: { status_code, error: { code, message, details? } }
+        // Legacy shapes: { detail }, { error: "msg" }, { message }
+        const structuredMsg =
+          j && j.error && typeof j.error === 'object' ? j.error.message : null;
+        const legacyError =
+          typeof j.error === 'string' ? j.error : null;
+        const candidate =
+          (typeof j.detail === 'string' ? j.detail : null) ||
+          structuredMsg ||
+          legacyError ||
+          (typeof j.message === 'string' ? j.message : null);
+        if (candidate) {
+          detail = candidate;
+        } else if (j && typeof j === 'object') {
+          // Last resort: stringify so we never show "[object Object]"
+          try { detail = JSON.stringify(j).slice(0, 500); } catch { /* keep default */ }
+        }
       } else {
         const t = await r.text();
         if (t) detail = t.slice(0, 500);
@@ -206,6 +254,7 @@ async function apiFetch(url, opts = {}) {
     const pct = Math.min(70, Math.max(15, ((e.clientX - rect.left) / rect.width) * 100));
     left.style.width = pct + '%';
     if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
     if (wordCloudChart) wordCloudChart.resize();
   });
   document.addEventListener('mouseup', () => { dragging = false; });
@@ -225,6 +274,7 @@ async function apiFetch(url, opts = {}) {
     const pct = Math.min(85, Math.max(20, ((e.clientY - rect.top) / rect.height) * 100));
     top.style.height = pct + '%';
     if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
     if (wordCloudChart) wordCloudChart.resize();
   });
   document.addEventListener('mouseup', () => { dragging = false; });
@@ -614,6 +664,9 @@ function listenBootstrapIndexing() {
         graphCacheClear();
         fetchIndexCount();
         loadGraph();
+        // Refresh the sidebar folder tree so newly indexed files/folders
+        // appear without requiring a manual page refresh.
+        loadFolderTree();
       }
     } catch (e) {
       clearInterval(pollInterval);
@@ -635,12 +688,12 @@ function openFolderPicker() {
 function _openNativePicker() {
   const dot = document.getElementById('status-dot');
   const txt = document.getElementById('status-text');
-  dot.className = 'w-1.5 h-1.5 rounded-full bg-warning animate-pulse';
-  txt.textContent = 'Select a folder…';
+  if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-warning animate-pulse';
+  if (txt) txt.textContent = 'Select a folder…';
   fetch('/api/browse-folder', { method: 'POST' })
     .then(r => { if (!r.ok) throw new Error('Cancelled'); return r.json(); })
     .then(async data => {
-      if (!data.path) { dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; txt.textContent = 'Ready'; return; }
+      if (!data.path) { if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; if (txt) txt.textContent = 'Ready'; return; }
       // Route through /api/projects/open so first-time folders trigger the
       // bootstrap wizard (file/folder/file-type filters) instead of
       // unconditionally indexing the entire folder.
@@ -649,26 +702,30 @@ function _openNativePicker() {
           method: 'POST',
           body: { path: data.path }
         });
+        // Drop per-project caches (notes, bookmarks, chat thread, hub
+        // recents) so the new project's data never collides with the
+        // previous one's.
+        _onProjectSwitched();
         if (proj && proj.needs_bootstrap) {
-          dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
-          txt.textContent = 'Configure project…';
+          if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+          if (txt) txt.textContent = 'Configure project…';
           openBootstrapWizard(data.path);
           return;
         }
       } catch (e) {
         showToast(formatApiError(e), 'error');
-        dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
-        txt.textContent = 'Ready';
+        if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+        if (txt) txt.textContent = 'Ready';
         return;
       }
       // Already-bootstrapped project → reindex normally.
-      txt.textContent = 'Indexing ' + data.path + '…';
+      if (txt) txt.textContent = 'Indexing ' + data.path + '…';
       showIndexingModal(data.path);
       return fetch('/api/index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ directory: data.path }) })
         .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.detail || `Error ${r.status}`); }); return r.json(); })
-        .then(() => { graphCacheClear(); fetchIndexCount(); dot.className = 'w-1.5 h-1.5 rounded-full bg-success'; txt.textContent = 'Indexed ' + data.path; });
+        .then(() => { graphCacheClear(); fetchIndexCount(); if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-success'; if (txt) txt.textContent = 'Indexed ' + data.path; });
     })
-    .catch(() => { dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; txt.textContent = 'Ready'; });
+    .catch(() => { if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; if (txt) txt.textContent = 'Ready'; });
 }
 function _openBrowserPicker() {
   const modal = document.getElementById('folder-picker-modal');
@@ -676,6 +733,8 @@ function _openBrowserPicker() {
   document.getElementById('folder-picker-loading').classList.add('hidden');
   document.getElementById('folder-picker-go').disabled = false;
   modal.showModal();
+  // Try common defaults, but always fall back to "/" so the user can
+  // navigate from somewhere even when the preferred seed path is missing.
   _browseLoadDir('/data');
 }
 function closeFolderPicker() { document.getElementById('folder-picker-modal').close(); }
@@ -686,8 +745,24 @@ function _browseLoadDir(path) {
   pathEl.textContent = path;
   listEl.innerHTML = '<li class="text-xs opacity-50 p-2">Loading…</li>';
   fetch('/api/browse-dir?path=' + encodeURIComponent(path))
-    .then(r => r.json())
+    .then(async r => {
+      if (!r.ok) {
+        // Path is invalid (e.g. `/data` doesn't exist on this host).
+        // Recover by loading "/" so the user can navigate from there
+        // instead of getting stuck on a broken listing.
+        let detail = '';
+        try { const j = await r.json(); detail = j.detail || ''; } catch (_) {}
+        if (path !== '/') {
+          listEl.innerHTML = `<li class="text-xs text-warning p-2">${detail || 'Path not found'} — falling back to /</li>`;
+          setTimeout(() => _browseLoadDir('/'), 400);
+          return null;
+        }
+        throw new Error(detail || `Error ${r.status}`);
+      }
+      return r.json();
+    })
     .then(data => {
+      if (!data) return;  // fallback already kicked in
       _browseCurrentPath = data.path;
       pathEl.textContent = data.path;
       let html = '';
@@ -695,15 +770,34 @@ function _browseLoadDir(path) {
         const parent = data.path.replace(/\/[^/]+\/?$/, '') || '/';
         html += `<li><button type="button" class="btn btn-ghost btn-xs w-full justify-start gap-2 font-normal" onclick="_browseLoadDir('${parent.replace(/'/g, "\\'")}')">📁 ..</button></li>`;
       }
-      data.dirs.forEach(d => {
+      (data.dirs || []).forEach(d => {
         const full = (data.path === '/' ? '/' : data.path + '/') + d;
         html += `<li><button type="button" class="btn btn-ghost btn-xs w-full justify-start gap-2 font-normal" onclick="_browseLoadDir('${full.replace(/'/g, "\\'")}')">📁 ${d}</button></li>`;
       });
-      if (!data.dirs.length && data.path === '/') html = '<li class="text-xs opacity-50 p-2">No folders found</li>';
+      if (!(data.dirs || []).length && data.path === '/') html = '<li class="text-xs opacity-50 p-2">No folders found</li>';
       listEl.innerHTML = html;
     })
-    .catch(() => { listEl.innerHTML = '<li class="text-xs text-error p-2">Failed to load</li>'; });
+    .catch((e) => { listEl.innerHTML = `<li class="text-xs text-error p-2">Failed to load${e && e.message ? ': ' + e.message : ''}</li>`; });
 }
+/* Centralised cleanup that fires whenever the active project changes
+ * (My Files → different folder). Drops per-project UI caches and
+ * reloads the My Hub "Recents" so chats/notes shown there belong to
+ * the newly-opened folder, not the previous one. */
+function _onProjectSwitched() {
+  // Per-project annotation cache.
+  if (typeof Annotations !== 'undefined' && Annotations.reset) {
+    try { Annotations.reset(); } catch (_) {}
+  }
+  // Forget the active chat thread — it belonged to the prior project
+  // and the backend now scopes /api/chat/threads to the new folder.
+  try { currentThreadId = null; } catch (_) {}
+  // Refresh My Hub Recents (chats + notes) for the new folder. The
+  // function itself no-ops when the welcome tab isn't mounted.
+  if (typeof loadHubRecent === 'function') {
+    try { loadHubRecent(); } catch (_) {}
+  }
+}
+
 async function submitFolderPicker() {
   const errEl = document.getElementById('folder-picker-error');
   const loadEl = document.getElementById('folder-picker-loading');
@@ -718,7 +812,11 @@ async function submitFolderPicker() {
       method: 'POST',
       body: { path: _browseCurrentPath }
     });
-    
+    // Drop per-project caches (notes, bookmarks, chat thread, hub
+    // recents) so the new project's data never collides with the
+    // previous one's.
+    _onProjectSwitched();
+
     if (data.needs_bootstrap) {
       // Open bootstrap wizard
       openBootstrapWizard(_browseCurrentPath);
@@ -813,6 +911,10 @@ async function loadFolderTree() {
     treeEl.innerHTML = '';
     const children = root.type === 'directory' && root.children ? root.children : [root];
     treeEl.appendChild(renderTreeChildren(children, 0));
+    // Decorate file rows with note-indicator dots (daisyUI indicator).
+    if (typeof Annotations !== 'undefined' && Annotations.refreshIndicators) {
+      Annotations.refreshIndicators();
+    }
   } catch (e) {
     treeEl.innerHTML = '<div class="folder-tree-empty">No folder indexed.</div>';
     titleEl.textContent = 'FOLDER';
@@ -914,6 +1016,9 @@ function renderTreeNode(node, depth) {
   row.className = 'tree-row' + (isDir ? '' : ' is-file');
   row.style.paddingLeft = (4 + depth * 12) + 'px';
   row.title = node.path || node.name || '';
+  // Stash the node id so Annotations.applyTreeIndicators() can map a row
+  // back to its graph node without re-walking the tree.
+  if (node.id) row.dataset.nodeId = node.id;
   row.innerHTML = (isDir ? _CHEVRON_SVG : '<span class="tree-chevron-spacer"></span>')
     + (isDir ? _FOLDER_SVG : fileBadgeHtml(node.name))
     + `<span class="tree-label">${escapeHtml(node.name || '')}</span>`;
@@ -969,7 +1074,11 @@ function switchView(view) {
     el.classList.toggle('hidden', !show);
   });
   if (view === 'settings') loadSettings();
-  if (view === 'graph') setTimeout(() => { if (graphChart) graphChart.resize(); if (wordCloudChart) wordCloudChart.resize(); }, 50);
+  if (view === 'graph') setTimeout(() => {
+    if (graphChart) graphChart.resize();
+    if (graphChart2) graphChart2.resize();
+    if (wordCloudChart) wordCloudChart.resize();
+  }, 50);
 }
 
 /* ── Graph ─────────────────────────────────────────────────────── */
@@ -990,20 +1099,31 @@ async function loadGraph() {
     currentGraph = data;
     renderGraph(data);
     const shown = (data.nodes||[]).length, total = data.total_nodes||shown;
-    document.getElementById('status-nodes').textContent = data.truncated ? `Nodes: ${shown}/${total}` : `Nodes: ${shown}`;
+    const sn = document.getElementById('status-nodes');
+    if (sn) sn.textContent = data.truncated ? `Nodes: ${shown}/${total}` : `Nodes: ${shown}`;
     const edgeShown = (data.edges||[]).length, edgeTotal = data.total_edges||edgeShown;
-    document.getElementById('status-edges').textContent = data.edges_truncated ? `Edges: ${edgeShown}/${edgeTotal}` : `Edges: ${edgeShown}`;
-    document.getElementById('status-dot').classList.add('bg-success');
-    document.getElementById('status-text').textContent = 'Connected';
+    const se = document.getElementById('status-edges');
+    if (se) se.textContent = data.edges_truncated ? `Edges: ${edgeShown}/${edgeTotal}` : `Edges: ${edgeShown}`;
+    const sd = document.getElementById('status-dot');
+    if (sd) sd.classList.add('bg-success');
+    const st = document.getElementById('status-text');
+    if (st) st.textContent = 'Connected';
     fetchIndexCount();
     setTimeout(loadWordCloud, 200);
     // No longer auto-select the largest node on load — leave the graph
     // unselected so the Welcome tab remains visible by default.
-  } catch (e) { console.error(e); document.getElementById('status-text').textContent = 'Error'; }
+  } catch (e) { console.error(e); const st = document.getElementById('status-text'); if (st) st.textContent = 'Error'; }
   finally { overlay.classList.add('hidden'); }
 }
 
 function renderGraph(data) {
+  // In dev mode the user can toggle between Graph 1 (force-directed) and
+  // Graph 2 (stable circular layout w/ hideOverlap labels — see ECharts
+  // "graph-label-overlap" example). In normal mode only Graph 1 renders.
+  if (currentGraphVariant === '2') {
+    renderGraph2(data);
+    return;
+  }
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const tc = isDark ? '#dcddde' : '#333', ec = isDark ? '#3a3a3a' : '#ccc';
   if (!graphChart) {
@@ -1018,12 +1138,27 @@ function renderGraph(data) {
   const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
   const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
   const large = (data.nodes||[]).length > 500;
+  // Dev mode: seed every node with a deterministic (x,y) derived from a
+  // hash of its id, so the same node always starts in the same spot
+  // across renders/releases. Combined with force.layoutAnimation:false
+  // the force layout converges to a stable picture instead of reshuffling
+  // every time the graph reloads. Drag still works (draggable:true).
+  const stable = IS_DEV_MODE;
+  const seedR = stable ? Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length))) : 0;
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8,Math.min(40,n.symbolSize||12));
-    return { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
-      itemStyle:{color:NODE_COLORS[t]||'#888'}, label:{show:!large&&sz>18,fontSize:10,color:tc},
+    const node = { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
+      itemStyle:{color:NODE_COLORS[t]||'#888', ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
       _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line };
+    if (stable) {
+      const h = _g2HashStr(n.id);
+      const ang = ((h % 3600) / 3600) * Math.PI * 2;
+      const rad = (((h >>> 8) % 1000) / 1000) * seedR;
+      node.x = Math.cos(ang) * rad;
+      node.y = Math.sin(ang) * rad;
+    }
+    return node;
   });
   const edges = (data.edges||[]).map(e => ({ source:e.source, target:e.target, lineStyle:{color:ec,opacity:0.5}, _rel:e.type||e.rel }));
   graphChart.setOption({
@@ -1032,15 +1167,138 @@ function renderGraph(data) {
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
     animationDurationUpdate: large ? 0 : 500,
-    animation: !large,
+    animation: !large && !stable,
     series: [{ type:'graph', layout:'force', data:nodes, links:edges, categories, roam:true, draggable:true,
       large: large,
-      force:{repulsion:large?80:120,edgeLength:large?[40,120]:[60,200],gravity:large?0.15:0.08,layoutAnimation:!large,friction:large?0.4:0.6},
+      // In dev mode disable continuous force animation so the deterministic
+      // initial positions aren't relaxed into different ones each render.
+      force:{repulsion:large?80:120,edgeLength:large?[40,120]:[60,200],gravity:large?0.15:0.08,layoutAnimation:!large && !stable,friction:large?0.4:0.6},
       emphasis:{focus:'adjacency',lineStyle:{width:3,color:'#7c3aed'}},
       select:{itemStyle:{borderColor:'#7c3aed',borderWidth:3,shadowBlur:10,shadowColor:'#7c3aed'},label:{show:true,fontSize:12,fontWeight:'bold',color:tc}},
       selectedMode:'single',
       edgeLabel:{show:false}, lineStyle:{curveness:0.1} }],
   }, true);
+}
+
+/* Graph 2 — stable, clustered layout for dev mode (?dev=true).
+   Visual target: ECharts "graph" (Les Miserables) example —
+     https://echarts.apache.org/examples/en/editor.html?c=graph
+   That example loads pre-computed (x,y) positions and uses layout:'none'
+   so the picture is reproducible. We do the same here, but generate the
+   positions deterministically from each node's id and category so the
+   same node always lands in the same place across reloads/releases —
+   solving the "Graph 1 redistributes on every render, I have to hunt
+   for the node again" problem.
+
+   - Per-category cluster centers placed evenly around a large outer
+     ring (clustered, not a single ring of nodes).
+   - Within a cluster, node offset = deterministic hash of id → angle/
+     radius. So clusters look organic but are stable.
+   - lineStyle.color:'source' + curveness:0.3 mirrors Les Miserables. */
+function _g2HashStr(s) {
+  // Simple 32-bit string hash (djb2-ish). Deterministic, no deps.
+  let h = 5381;
+  s = String(s);
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+function renderGraph2(data) {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const tc = isDark ? '#dcddde' : '#333';
+  if (!graphChart2) {
+    graphChart2 = echarts.init(document.getElementById('graph-chart-2'));
+    graphChart2.on('click', onGraphClick);
+    graphChart2.getZr().on('click', function(e) {
+      if (!e.target) clearFocus();
+    });
+  }
+  const catNames = (data.categories||[]).map(c => typeof c === 'string' ? c : c.name);
+  if (!catNames.length) catNames.push(...Object.keys(NODE_COLORS));
+  const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
+  const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
+
+  // Cluster geometry. Outer ring radius scales with node count so
+  // dense graphs don't collapse on top of each other. Each category
+  // gets one fixed cluster center on the outer ring.
+  const totalNodes = (data.nodes||[]).length;
+  const ringR = Math.max(380, 60 * Math.sqrt(Math.max(1, totalNodes)));
+  const catCount = Math.max(1, catNames.length);
+  const catCenters = catNames.map((_, i) => {
+    const a = (i / catCount) * Math.PI * 2 - Math.PI / 2;
+    return { x: Math.cos(a) * ringR, y: Math.sin(a) * ringR };
+  });
+  // Within-cluster radius scales with how many nodes share the cluster.
+  const catSize = {};
+  (data.nodes||[]).forEach(n => {
+    const t = n.value||n.type||'unknown';
+    catSize[t] = (catSize[t]||0) + 1;
+  });
+
+  const nodes = (data.nodes||[]).map(n => {
+    const t = n.value||n.type||'unknown';
+    const sz = Math.max(8, Math.min(40, n.symbolSize||12));
+    const ci = catIdx[t] ?? 0;
+    const center = catCenters[ci] || { x: 0, y: 0 };
+    const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
+    // Deterministic offset within the cluster from the node id hash.
+    const h = _g2HashStr(n.id);
+    const ang = ((h % 3600) / 3600) * Math.PI * 2;
+    const rad = ((h >>> 8) % 1000) / 1000 * inner;
+    const x = center.x + Math.cos(ang) * rad;
+    const y = center.y + Math.sin(ang) * rad;
+    return {
+      id: n.id, name: n.name||n.id, symbolSize: sz, category: ci, x, y,
+      itemStyle: { color: NODE_COLORS[t] || '#888', ...(NODE_BORDERS[t]||{}) },
+      // Match Les Mis: only label larger nodes to keep the picture readable.
+      label: { show: sz > 22, position: 'right', fontSize: 10, color: tc, formatter: '{b}' },
+      _type: t, _path: n.attributes?.path || n.path, _line: n.attributes?.line_start || n.line,
+    };
+  });
+  const edges = (data.edges||[]).map(e => ({
+    source: e.source, target: e.target,
+    lineStyle: { opacity: 0.7, width: 0.8, curveness: 0.3 },
+    _rel: e.type || e.rel,
+  }));
+  graphChart2.setOption({
+    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+      backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
+    legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
+      icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
+    animation: false,            // positions are fixed, no need to animate
+    series: [{
+      type: 'graph',
+      layout: 'none',            // use the (x,y) we computed per node
+      data: nodes, links: edges, categories,
+      roam: true, draggable: true,
+      labelLayout: { hideOverlap: true },
+      // Edge color inherits source node color, like the Les Mis example.
+      lineStyle: { color: 'source', curveness: 0.3 },
+      emphasis: { focus: 'adjacency', label: { show: true, fontSize: 11, fontWeight: 'bold' }, lineStyle: { width: 3, color: '#7c3aed' } },
+      select: { itemStyle: { borderColor: '#7c3aed', borderWidth: 3, shadowBlur: 10, shadowColor: '#7c3aed' }, label: { show: true, fontSize: 12, fontWeight: 'bold', color: tc } },
+      selectedMode: 'single',
+      edgeLabel: { show: false },
+    }],
+  }, true);
+}
+
+/* Dev-mode tab switcher: toggles which graph variant is visible and
+   re-renders the active one against the currently-loaded data. */
+function switchGraphVariant(variant) {
+  if (variant !== '1' && variant !== '2') return;
+  currentGraphVariant = variant;
+  const c1 = document.getElementById('graph-chart');
+  const c2 = document.getElementById('graph-chart-2');
+  if (c1) c1.classList.toggle('hidden', variant !== '1');
+  if (c2) c2.classList.toggle('hidden', variant !== '2');
+  document.querySelectorAll('.graph-variant-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.graphVariant === variant);
+  });
+  if (currentGraph) renderGraph(currentGraph);
+  // ECharts needs a resize after its container becomes visible.
+  setTimeout(() => {
+    if (variant === '1' && graphChart) graphChart.resize();
+    if (variant === '2' && graphChart2) graphChart2.resize();
+  }, 50);
 }
 
 async function onGraphClick(p) {
@@ -1074,7 +1332,12 @@ async function showFileContent(data) {
     title: data.name || data.path || 'File',
     tooltip: relativePath(data.path) || data.path || data.name || '',
     closable: true,
-    onActivate: () => { if (nodeId) applyPersistentFocus(nodeId); },
+    onActivate: () => {
+      if (nodeId) applyPersistentFocus(nodeId);
+      // Re-apply highlights + margin notes whenever this file's tab is
+      // re-activated (e.g. after switching tabs).
+      if (nodeId) requestAnimationFrame(() => Annotations.applyToDetail(nodeId));
+    },
   });
 
   // Brief loading state.
@@ -1095,7 +1358,7 @@ async function showFileContent(data) {
 
   const header = `
     <div class="flex items-center gap-2 flex-wrap mb-3">
-      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">file</span>
+      <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">file</span>
       ${lang ? `<span class="badge badge-sm badge-outline font-mono">${escapeHtml(lang)}</span>` : ''}
       <span class="badge badge-sm badge-ghost font-mono" title="${escapeHtml(file.path)}">${escapeHtml(relativePath(data.path) || file.relative_path || relativePath(file.path))}</span>
       <span class="badge badge-sm badge-ghost font-mono">${sizeKb} KB</span>
@@ -1226,6 +1489,13 @@ async function showFileContent(data) {
   }
 
   Tabs.setBody(tabId, header + body);
+
+  // Apply user annotations (highlights, notes, margin cards). Has to run
+  // *after* the file body is in the DOM so wrapTextInElement can find the
+  // anchor text inside the rendered markdown / HTML / code view.
+  if (nodeId && Tabs.isActive(tabId)) {
+    requestAnimationFrame(() => Annotations.applyToDetail(nodeId));
+  }
 }
 
 /* Full select: detail panel + ring + adjacency focus */
@@ -1564,7 +1834,10 @@ async function showDetail(data) {
     title: data.name || 'Node',
     tooltip: tabTooltip,
     closable: true,
-    onActivate: () => { if (data.id) applyPersistentFocus(data.id); },
+    onActivate: () => {
+      if (data.id) applyPersistentFocus(data.id);
+      if (data.id) requestAnimationFrame(() => Annotations.applyToDetail(data.id));
+    },
   });
   const typeColor = NODE_COLORS[data.type] || '#888';
   const lang = guessLang(data.type, data.path);
@@ -1619,15 +1892,21 @@ async function showDetail(data) {
 
   const isDir = data.type === 'directory';
 
+  const bookmarkBtn = data.id ? bookmarkButtonHtml(data.id, data.name) : '';
+  const noteIndicator = data.id ? noteIndicatorHtml(data.id) : '';
   const headerHtml = isDir
     ? `<div class="flex items-center gap-2 flex-wrap mb-3">
-        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">${data.type}</span>
+        ${bookmarkBtn}
+        ${noteIndicator}
       </div>`
     : `<div class="flex items-center gap-2 flex-wrap mb-3">
-        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:#000">${data.type}</span>
+        <span class="badge badge-sm font-semibold" style="background:${typeColor};color:${badgeTextColor(typeColor)}">${data.type}</span>
         ${lang ? `<span class="badge badge-sm badge-outline font-mono">${lang}</span>` : ''}
         ${data.path ? `<span class="badge badge-sm badge-ghost font-mono gap-1" title="${escapeHtml(data.path)}">${fileIcon} ${escapeHtml(relativePath(data.path))}</span>` : ''}
         ${data.line_start!=null ? `<span class="badge badge-sm badge-ghost font-mono gap-1">${lineIcon} L${data.line_start}${data.line_end ? '-'+data.line_end : ''}</span>` : ''}
+        ${bookmarkBtn}
+        ${noteIndicator}
       </div>`;
 
   const sourceSectionHtml = isDir
@@ -1658,6 +1937,11 @@ async function showDetail(data) {
       const target = body && body.querySelector('.code-line.hl-start');
       if (target) target.scrollIntoView({ block: 'center' });
     });
+  }
+
+  // Apply user annotations (highlights, notes, bookmark state).
+  if (data.id && Tabs.isActive(tabId)) {
+    requestAnimationFrame(() => { Annotations.applyToDetail(data.id); });
   }
 }
 
@@ -1857,7 +2141,7 @@ async function searchNodes(query) {
     c.innerHTML = data.results.map(r => `<div class="search-result-item p-2.5 cursor-pointer hover:bg-base-300 border-b border-base-300 last:border-0" data-id="${r.id}">
       <div class="flex items-center gap-1.5 mb-1">
         <span class="font-semibold text-sm">${r.name}</span>
-        <span class="badge badge-xs font-semibold" style="background:${NODE_COLORS[r.type]||'#444'};color:#000">${r.type}</span>
+        <span class="badge badge-xs font-semibold" style="background:${NODE_COLORS[r.type]||'#444'};color:${badgeTextColor(NODE_COLORS[r.type]||'#444')}">${r.type}</span>
         ${r.score!=null?`<span class="badge badge-xs badge-ghost font-mono ml-auto">${r.score.toFixed(2)}</span>`:''}
       </div>
       ${r.path?`<div class="text-[11px] opacity-70 font-mono truncate">${r.path}</div>`:''}</div>`).join('');
@@ -1869,41 +2153,89 @@ async function searchNodes(query) {
 }
 
 /* ── Idea Cloud ────────────────────────────────────────────────── */
-function renderWordCloud(data) {
+/* Cloud reflects graph *strength* (sum of in+out degree per name), not raw
+   name frequency. Three tiers: strong (top 30, big fonts) → relevant
+   (top 100, compact) → all (everything, dense). Values are log-scaled so a
+   handful of hub nodes don't squash everything else into 8px noise. */
+function renderWordCloud(items, mode) {
   const container = document.getElementById('wordcloud-container');
   if (!container || !container.offsetHeight) return;
   if (!wordCloudChart) wordCloudChart = echarts.init(container);
-  wordCloudChart.setOption({ series: [{ type:'wordCloud', shape:'circle', sizeRange:[10,48], rotationRange:[0,0], gridSize:2, left:0, top:0, right:0, bottom:0, width:'100%', height:'100%',
-    textStyle: { fontFamily:'Inter,sans-serif', color:()=>{const c=Object.values(NODE_COLORS);return c[Math.floor(Math.random()*c.length)];} },
-    emphasis:{textStyle:{color:'#7c3aed'}}, data }] });
+  const tier = WORDCLOUD_TIERS[mode] || WORDCLOUD_TIERS.strong;
+  const data = (items || []).map(d => ({
+    name: d.name,
+    value: Math.log2((d.value || 0) + 1),  // log-scale so hubs don't dwarf the rest
+    rawStrength: d.value,
+    count: d.count,
+  }));
+  wordCloudChart.setOption({
+    series: [{
+      type: 'wordCloud', shape: 'circle', sizeRange: tier.sizeRange,
+      rotationRange: [0, 0], gridSize: 2,
+      left: 0, top: 0, right: 0, bottom: 0, width: '100%', height: '100%',
+      textStyle: {
+        fontFamily: 'Inter,sans-serif',
+        color: () => { const c = Object.values(NODE_COLORS); return c[Math.floor(Math.random() * c.length)]; },
+      },
+      emphasis: { textStyle: { color: '#7c3aed' } },
+      data,
+    }],
+    tooltip: {
+      show: true,
+      formatter: p => {
+        const d = p.data || {};
+        return `<b>${p.name}</b><br/>strength: ${Math.round(d.rawStrength || 0)}<br/>nodes: ${d.count || 1}`;
+      },
+    },
+  }, true);
   wordCloudChart.off('click');
   wordCloudChart.on('click', p => { askChatFromCloud(p.name); });
   updateWordCloudToggle();
+  updateWordCloudLegend();
 }
 
 function updateWordCloudToggle() {
   const btn = document.getElementById('wordcloud-toggle');
   if (!btn) return;
-  if (wordCloudAllData.length <= WORDCLOUD_DEFAULT_LIMIT) {
+  if (!wordCloudMeta || wordCloudMeta.total <= 30) {
     btn.classList.add('hidden');
-  } else {
-    btn.classList.remove('hidden');
-    btn.textContent = wordCloudExpanded ? 'Show Less' : 'Show More';
+    return;
   }
+  btn.classList.remove('hidden');
+  const tier = WORDCLOUD_TIERS[wordCloudMode] || WORDCLOUD_TIERS.strong;
+  btn.textContent = tier.label;
+  btn.classList.remove('btn-primary', 'btn-warning');
+  btn.classList.add(wordCloudMode === 'relevant' ? 'btn-warning' : 'btn-primary');
+}
+
+function updateWordCloudLegend() {
+  const el = document.getElementById('wordcloud-legend');
+  if (!el) return;
+  if (!wordCloudMeta) { el.classList.add('hidden'); return; }
+  const { shown, total, min_strength } = wordCloudMeta;
+  if (total <= 30) { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  const floor = min_strength > 0 ? `, strength ≥ ${min_strength}` : '';
+  el.textContent = `showing ${shown} of ${total}${floor}`;
 }
 
 function toggleWordCloud() {
-  wordCloudExpanded = !wordCloudExpanded;
-  const data = wordCloudExpanded ? wordCloudAllData : wordCloudAllData.slice(0, WORDCLOUD_DEFAULT_LIMIT);
-  renderWordCloud(data);
+  const tier = WORDCLOUD_TIERS[wordCloudMode] || WORDCLOUD_TIERS.strong;
+  loadWordCloud(tier.next);
 }
 
-async function loadWordCloud() {
+async function loadWordCloud(mode) {
+  const requested = mode || wordCloudMode || 'strong';
   try {
-    const data = await apiFetch('/api/wordcloud');
-    wordCloudAllData = data.sort((a, b) => b.value - a.value);
-    wordCloudExpanded = false;
-    renderWordCloud(wordCloudAllData.slice(0, WORDCLOUD_DEFAULT_LIMIT));
+    const resp = await apiFetch(`/api/wordcloud?mode=${encodeURIComponent(requested)}`);
+    // Back-compat: server may return a bare list (older builds) or the new
+    // {items, total, shown, mode, min_strength} shape.
+    const items = Array.isArray(resp) ? resp : (resp.items || []);
+    wordCloudMeta = Array.isArray(resp)
+      ? { total: items.length, shown: items.length, mode: requested, min_strength: 0 }
+      : { total: resp.total, shown: resp.shown, mode: resp.mode || requested, min_strength: resp.min_strength || 0 };
+    wordCloudMode = wordCloudMeta.mode;
+    renderWordCloud(items, wordCloudMode);
   } catch (e) { console.error(e); }
 }
 
@@ -1980,7 +2312,7 @@ async function loadStats() {
 async function showWelcomePanel() {
   Tabs.open({
     id: 'welcome',
-    title: 'Welcome',
+    title: 'My Hub',
     closable: false,
     onActivate: () => {
       // Drop any node selection in the graph; do NOT call clearFocus()
@@ -1989,6 +2321,11 @@ async function showWelcomePanel() {
         selectedNode = null;
         renderGraph(currentGraph);
       }
+      // Re-render whichever sub-tab is active so dynamic event listeners
+      // (lost when Tabs.activate caches the body as innerHTML) get rebound.
+      const subTab = document.querySelector('#hub-pane-annotations:not(.hidden)') ? 'annotations' : 'main';
+      if (subTab === 'annotations') Annotations.openTab(Annotations.currentSubFilter() || 'notes');
+      else loadHubRecent();
     },
   });
   const stats = await loadStats();
@@ -2014,29 +2351,52 @@ async function showWelcomePanel() {
   }
 
   Tabs.setBody('welcome', `
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="md-content">
-        <h2>Welcome</h2>
-        <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
-        <h3>Quick Start</h3>
-        <ul>
-          <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
-          <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
-          <li><strong>Click a node</strong> &mdash; view source and connections</li>
-          <li><strong>Click empty space</strong> &mdash; reset the view</li>
-          <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
-        </ul>
-      </div>
-      <div>
-        <div class="md-content"><h3>Recent</h3></div>
-        <div class="bg-base-200 rounded-lg p-4 text-xs opacity-70 italic">
-          No recent operations yet. Previously completed indexing, searches, and chats will appear here.
+    <div role="tablist" class="tabs tabs-bordered tabs-sm mb-3" id="hub-tabs">
+      <button role="tab" class="tab tab-active" data-hub-tab="main" onclick="switchHubTab('main')">Main</button>
+      <button role="tab" class="tab" data-hub-tab="annotations" onclick="switchHubTab('annotations')">Notes &amp; Bookmarks</button>
+    </div>
+
+    <div id="hub-pane-main" data-hub-pane="main">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="md-content">
+          <h2>My Hub</h2>
+          <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
+          <h3>Quick Start</h3>
+          <ul>
+            <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
+            <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
+            <li><strong>Click a node</strong> &mdash; view source and connections</li>
+            <li><strong>Click empty space</strong> &mdash; reset the view</li>
+            <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
+            <li><strong>Highlight text</strong> in a node detail panel to save a highlight or note; click ★ to bookmark a node</li>
+          </ul>
+        </div>
+        <div>
+          <div class="md-content"><h3>Recent</h3></div>
+          <div id="hub-recent" class="rounded-lg text-xs">
+            <div class="opacity-60 italic p-3">Loading recent activity…</div>
+          </div>
         </div>
       </div>
+      ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
+      ${statsHtml}
     </div>
-    ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
-    ${statsHtml}
+
+    <div id="hub-pane-annotations" data-hub-pane="annotations" class="hidden">
+      <div class="ann-toolbar" style="border-radius:6px;border:1px solid oklch(var(--b3));margin-bottom:10px;padding:8px 10px;display:flex;align-items:center;gap:8px;background:oklch(var(--b2))">
+        <button type="button" class="ann-tab active" data-ann-tab="notes" onclick="Annotations.openTab('notes')">📝 Notes</button>
+        <button type="button" class="ann-tab" data-ann-tab="bookmarks" onclick="Annotations.openTab('bookmarks')">⭐ Bookmarks</button>
+        <button type="button" class="ann-tab" data-ann-tab="highlights" onclick="Annotations.openTab('highlights')">🖍️ Highlights</button>
+        <span class="flex-1"></span>
+        <button type="button" class="btn btn-ghost btn-xs btn-square" onclick="Annotations.refreshList()" title="Refresh">↻</button>
+      </div>
+      <div id="annotations-list" class="ann-list" style="padding:0">
+        <div class="ann-empty">Click a tab above to load…</div>
+      </div>
+    </div>
   `);
+
+  loadHubRecent();
 
   if (stats) {
     if (stats.node_types && Object.keys(stats.node_types).length) {
@@ -2074,6 +2434,141 @@ async function showWelcomePanel() {
       }
     }
   }
+}
+
+/* Switch between sub-tabs inside the My Hub panel. */
+function switchHubTab(tab) {
+  document.querySelectorAll('#hub-tabs [data-hub-tab]').forEach(b => {
+    b.classList.toggle('tab-active', b.dataset.hubTab === tab);
+  });
+  const main = document.getElementById('hub-pane-main');
+  const ann  = document.getElementById('hub-pane-annotations');
+  if (main) main.classList.toggle('hidden', tab !== 'main');
+  if (ann)  ann.classList.toggle('hidden',  tab !== 'annotations');
+  if (tab === 'annotations') {
+    Annotations.openTab(Annotations.currentSubFilter() || 'notes');
+  } else {
+    loadHubRecent();
+  }
+}
+
+/* Format an ISO timestamp into a human-friendly relative time string,
+   e.g. "5 minutes ago", "3 hours ago", "2 days ago", "4 months ago". */
+function formatTimeAgo(iso) {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return '';
+  const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (diffSec < 60) return diffSec <= 1 ? 'just now' : `${diffSec} seconds ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} ${diffMin === 1 ? 'minute' : 'minutes'} ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} ${diffHr === 1 ? 'hour' : 'hours'} ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 30) return `${diffDay} ${diffDay === 1 ? 'day' : 'days'} ago`;
+  const diffMo = Math.floor(diffDay / 30);
+  if (diffMo < 12) return `${diffMo} ${diffMo === 1 ? 'month' : 'months'} ago`;
+  const diffYr = Math.floor(diffMo / 12);
+  return `${diffYr} ${diffYr === 1 ? 'year' : 'years'} ago`;
+}
+
+/* Fetch recent chats + notes, merge sorted by timestamp, render last 10. */
+async function loadHubRecent() {
+  const host = document.getElementById('hub-recent');
+  if (!host) return;
+  host.innerHTML = '<div class="opacity-60 italic p-3">Loading recent activity…</div>';
+
+  const [threads, notes] = await Promise.all([
+    apiFetch('/api/chat/threads').catch(() => []),
+    apiFetch('/api/annotations?type=note').then(d => d.annotations || []).catch(() => []),
+  ]);
+
+  const items = [];
+  (threads || []).forEach(t => {
+    const ts = t.updated_at || t.created_at || '';
+    items.push({
+      kind: 'chat',
+      ts,
+      id: t.id,
+      title: t.title || 'Untitled chat',
+      subtitle: `${t.message_count || 0} ${t.message_count === 1 ? 'message' : 'messages'}`,
+    });
+  });
+  (notes || []).forEach(a => {
+    const ts = a.last_modified_at || a.created_at || '';
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const m = (a.content || '').match(/^>\s?[\s\S]+?\n\n([\s\S]*)$/);
+    const body = (m ? m[1] : (a.content || '')).trim();
+    const title = body ? body.split('\n')[0].slice(0, 80) : 'Note';
+    items.push({
+      kind: 'note',
+      ts,
+      id: a.id,
+      nodeId: tgt.type === 'node' ? tgt.node_id : '',
+      filePath: tgt.type === 'file' ? tgt.file_path : '',
+      title,
+      subtitle: tgtLabel,
+    });
+  });
+
+  items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  const top = items.slice(0, 10);
+
+  if (!top.length) {
+    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats or notes yet.</div>';
+    return;
+  }
+
+  host.innerHTML = top.map(it => {
+    const when = escapeHtml(formatTimeAgo(it.ts));
+    if (it.kind === 'chat') {
+      return `<div class="recent-item recent-chat" data-recent-kind="chat" data-recent-id="${escapeHtml(it.id)}" title="Resume chat">
+          <div class="recent-row">
+            <span class="recent-tag">CHAT</span>
+            <span class="recent-title">${escapeHtml(it.title)}</span>
+            <span class="recent-time">${when}</span>
+          </div>
+          <div class="recent-sub">${escapeHtml(it.subtitle)}</div>
+        </div>`;
+    }
+    return `<div class="recent-item recent-note" data-recent-kind="note" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open note">
+        <div class="recent-row">
+          <span class="recent-tag">NOTE</span>
+          <span class="recent-title">${escapeHtml(it.title)}</span>
+          <span class="recent-time">${when}</span>
+        </div>
+        ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  host.querySelectorAll('.recent-item').forEach(el => {
+    el.addEventListener('click', () => {
+      if (el.dataset.recentKind === 'chat') openRecentChat(el.dataset.recentId);
+      else openRecentNote(el.dataset.recentId, el.dataset.recentNode, el.dataset.recentFile);
+    });
+  });
+}
+
+/* Resume a chat thread in the bottom chat panel. */
+function openRecentChat(threadId) {
+  if (!threadId) return;
+  switchView('graph');
+  setTimeout(() => loadChatThread(threadId), 60);
+}
+
+/* Open the file/node a note was taken on, without deleting the note. */
+async function openRecentNote(annId, nodeId, filePath) {
+  if (nodeId) {
+    switchView('graph');
+    setTimeout(() => { focusNodeInGraph(nodeId); selectNode(nodeId); }, 80);
+    return;
+  }
+  if (filePath) {
+    showToast('Note attached to file — open it from My Files', 'info');
+    return;
+  }
+  showToast('Note has no target', 'info');
 }
 
 /* ── Chat ──────────────────────────────────────────────────────── */
@@ -2249,6 +2744,126 @@ async function sendChatMessage() {
   }
 }
 
+/* ── AI trace panel ────────────────────────────────────────────────
+   Insert a thin collapsible "Show trace" strip directly below the
+   assistant bubble. It records every event the backend emits — request
+   metadata, each tool-calling round, every tool call/return with timings
+   and a result preview, the final stream summary, and any errors — so
+   the user can audit exactly what the AI did to produce the answer
+   without leaving the chat. */
+function _ensureTracePanel(bubble) {
+  const wrapper = bubble.closest('.chat') || bubble.parentElement;
+  if (!wrapper) return null;
+  // The daisyUI `.chat` element is a CSS-grid with reserved cells for
+  // `chat-image` / `chat-header` / `chat-bubble` / `chat-footer`. A bare
+  // child div ends up in the avatar column, NOT under the bubble. So we
+  // attach the trace as a SIBLING of the wrapper (immediately after it)
+  // and align its left edge to the bubble via `.chat-start + .chat-trace`
+  // styling so it visually reads as "underneath" the assistant bubble.
+  const parent = wrapper.parentElement;
+  if (!parent) return null;
+  let panel = wrapper.nextElementSibling;
+  if (panel && panel.classList && panel.classList.contains('chat-trace') &&
+      panel.dataset.forBubble === wrapper.dataset.bubbleId) {
+    return panel;
+  }
+  // Tag the wrapper so we can match its trace panel later (e.g. on regen).
+  if (!wrapper.dataset.bubbleId) {
+    wrapper.dataset.bubbleId = 'b' + Math.random().toString(36).slice(2, 9);
+  }
+  panel = document.createElement('div');
+  panel.className = 'chat-trace text-[10px]';
+  panel.dataset.expanded = '0';
+  panel.dataset.forBubble = wrapper.dataset.bubbleId;
+  panel.innerHTML =
+    '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
+    '<span class="chat-trace-caret">▸</span>' +
+    '<span class="chat-trace-summary">Trace</span>' +
+    '</button>' +
+    '<div class="chat-trace-body hidden"></div>';
+  parent.insertBefore(panel, wrapper.nextSibling);
+  panel.querySelector('.chat-trace-toggle').addEventListener('click', () => {
+    const expanded = panel.dataset.expanded === '1';
+    panel.dataset.expanded = expanded ? '0' : '1';
+    panel.querySelector('.chat-trace-toggle').setAttribute('aria-expanded', expanded ? 'false' : 'true');
+    panel.querySelector('.chat-trace-caret').textContent = expanded ? '▸' : '▾';
+    panel.querySelector('.chat-trace-body').classList.toggle('hidden', expanded);
+  });
+  return panel;
+}
+
+function _renderTracePanel(panel, steps) {
+  if (!panel) return;
+  // Live summary: count tool calls and total elapsed time we can derive.
+  const calls = steps.filter(s => s.phase === 'tool_call').length;
+  const done = steps.find(s => s.phase === 'done');
+  const errored = steps.find(s => s.phase === 'error');
+  const summaryEl = panel.querySelector('.chat-trace-summary');
+  const parts = [`${steps.length} step${steps.length === 1 ? '' : 's'}`];
+  if (calls) parts.push(`${calls} tool call${calls === 1 ? '' : 's'}`);
+  if (done && done.total_dt != null) parts.push(`${done.total_dt}s`);
+  if (errored) parts.push('⚠ error');
+  summaryEl.textContent = 'Trace · ' + parts.join(' · ');
+
+  const body = panel.querySelector('.chat-trace-body');
+  body.innerHTML = steps.map(_traceRowHtml).join('');
+}
+
+function _traceRowHtml(s) {
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ph = s.phase || '';
+  let icon = '·';
+  let line = ph;
+  let cls = '';
+  if (ph === 'request') {
+    icon = '➤';
+    line = `request <span class="opacity-70">${esc(s.provider)}/${esc(s.model)}</span>` +
+      (s.context_node ? ` <span class="opacity-50">ctx=${esc(s.context_node)}</span>` : '') +
+      (s.history_len ? ` <span class="opacity-50">hist=${s.history_len}</span>` : '');
+  } else if (ph === 'round') {
+    icon = '↻';
+    line = `round ${s.round} <span class="opacity-70">finish=${esc(s.finish)}</span>` +
+      ` <span class="opacity-50">${s.dt}s · ${s.tool_calls} tc</span>`;
+  } else if (ph === 'tool_call') {
+    icon = '🔧';
+    line = `<span class="font-semibold">${esc(s.name)}</span>` +
+      ` <span class="opacity-60">${esc(s.args_preview)}</span>`;
+  } else if (ph === 'tool_return') {
+    icon = '↩';
+    // If the JSON tool result was re-encoded as TOON before being sent
+    // back to the LLM, show the savings inline so the user can see how
+    // much context the optimization is buying them.
+    const toonTag = (s.toon_bytes != null && s.toon_saved_pct != null)
+      ? ` <span class="opacity-60">· toon ${s.toon_bytes} B (-${s.toon_saved_pct}%)</span>`
+      : '';
+    line = `<span class="font-semibold">${esc(s.name)}</span> ` +
+      `<span class="opacity-60">→ ${s.bytes} B · ${s.dt}s</span>${toonTag}` +
+      (s.preview ? `<div class="trace-preview opacity-60">${esc(s.preview)}</div>` : '');
+  } else if (ph === 'return_result') {
+    icon = '✓';
+    const files = (s.files || []).length;
+    const refs = (s.node_refs || []).length;
+    line = `return_result <span class="opacity-60">${files} file${files === 1 ? '' : 's'} · ${refs} ref${refs === 1 ? '' : 's'} · ${esc(s.confidence) || '—'} · ${s.total_dt}s</span>`;
+  } else if (ph === 'stream_begin') {
+    icon = '✎';
+    line = `stream begin <span class="opacity-50">elapsed=${s.elapsed}s</span>`;
+  } else if (ph === 'done') {
+    icon = '●';
+    line = `done <span class="opacity-70">reason=${esc(s.reason)}</span> ` +
+      `<span class="opacity-50">${s.tokens != null ? s.tokens + ' tok · ' : ''}${s.bytes != null ? s.bytes + ' B · ' : ''}${s.total_dt}s</span>`;
+  } else if (ph === 'rounds_exhausted') {
+    icon = '⚠'; cls = 'text-warning';
+    line = `rounds exhausted <span class="opacity-60">last=${esc(s.last_finish)}</span>`;
+  } else if (ph === 'error') {
+    icon = '✗'; cls = 'text-error';
+    line = `error in ${esc(s.where)}: ${esc(s.message)}`;
+  } else {
+    line = `${esc(ph)}`;
+  }
+  return `<div class="chat-trace-row ${cls}"><span class="chat-trace-icon">${icon}</span><span class="chat-trace-text">${line}</span></div>`;
+}
+
 /* Stream a chat response into the given bubble. Returns the full text on
    success, or null on error (the bubble is updated with the error message).
    `historyForCall` is the prior message history sent to /api/chat. */
@@ -2285,21 +2900,76 @@ async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
     if (e instanceof ApiError && e.status === 503) checkChatStatus();
     return null;
   }
+  // Per-message trace events the AI emits while it works. Rendered into a
+  // collapsible "Show trace" panel below the bubble so the user can see
+  // exactly which tools were called, with what args, and how long each took.
+  const steps = [];
+  const trace = _ensureTracePanel(ad);
   try {
-    const reader=res.body.getReader(), dec=new TextDecoder(); let full='';
-    while(true) { const {done,value}=await reader.read(); if(done)break; for(const line of dec.decode(value,{stream:true}).split('\n')) {
-      if(!line.startsWith('data: '))continue; const raw=line.slice(6);
-      if(raw==='[DONE]')continue; if(raw.startsWith('[ERROR]')){ad.innerHTML=`<span class="text-error">${raw}</span>`;return null;}
-      const d = raw.replace(/\\r/g,'\r').replace(/\\n/g,'\n').replace(/\\\\/g,'\\');
-      full+=d; ad.innerHTML='<div class="md-content">'+marked.parse(formatChatContent(full))+'</div>';
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let full = '';
+    // Buffer for incomplete SSE lines that straddle a `read()` chunk boundary.
+    // Without this, a chunk that ends mid-line silently drops the trailing
+    // tokens — including a possibly-truncated `[DONE]` — leaving the UI
+    // stuck on the typing indicator forever.
+    let buf = '';
+    let chunkCount = 0;
+    let tDone = false;
+    const t0 = performance.now();
+    console.log('[chat] stream open');
+    const handleLine = (line) => {
+      if (!line.startsWith('data: ')) return null;
+      const raw = line.slice(6);
+      if (raw === '[DONE]') { tDone = true; return 'done'; }
+      if (raw.startsWith('[ERROR]')) {
+        console.error('[chat] server error frame:', raw);
+        ad.innerHTML = `<span class="text-error">${raw}</span>`;
+        return 'error';
+      }
+      if (raw.startsWith('[STEP] ')) {
+        try {
+          const ev = JSON.parse(raw.slice(7));
+          steps.push(ev);
+          _renderTracePanel(trace, steps);
+        } catch (e) {
+          console.warn('[chat] bad STEP frame:', raw, e);
+        }
+        return 'step';
+      }
+      const d = raw.replace(/\\r/g, '\r').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+      full += d;
+      ad.innerHTML = '<div class="md-content">' + marked.parse(formatChatContent(full)) + '</div>';
       if (firstChunk) {
-        // First content arrived — anchor the viewport at the TOP of the
-        // assistant bubble so the user can read the response from line 1
-        // instead of being yanked to the bottom as it grows.
         firstChunk = false;
         scrollAssistantToTop();
       }
-    }}
+      return 'text';
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunkCount++;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        const r = handleLine(line);
+        if (r === 'error') return null;
+      }
+    }
+    // Flush any tail bytes the decoder is still holding (covers a final
+    // `data: …` line that arrived without a trailing newline).
+    buf += dec.decode();
+    if (buf) {
+      const r = handleLine(buf.replace(/\n+$/, ''));
+      if (r === 'error') return null;
+    }
+    console.log(
+      '[chat] stream closed',
+      { chunks: chunkCount, bytes: full.length, steps: steps.length, sawDone: tDone, ms: (performance.now() - t0) | 0 },
+    );
     ad.querySelectorAll('pre code:not(.hljs)').forEach(b => hljs.highlightElement(b));
     _wireChipHandlers(ad);
     // Re-anchor after the final render (heights may have shifted due to
@@ -2687,47 +3357,336 @@ function _esc(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// Cache the most recent /api/settings plugins payload so the inline
+// PATCH handlers below can read schemas / current values without
+// having to re-fetch the whole settings document for every keystroke.
+let _pluginsCache = {};
+
 function renderPluginsList(plugins) {
   const host = document.getElementById('plugins-list');
   if (!host) return;
-  const names = Object.keys(plugins).sort();
+  _pluginsCache = plugins || {};
+  const names = Object.keys(_pluginsCache).sort();
   if (!names.length) {
     host.innerHTML = '<span class="opacity-50">No plugins detected under <code class="font-mono">plugins/</code>.</span>';
     return;
   }
-  const cards = names.map(name => {
-    const p = plugins[name] || {};
-    const installed = !!p.installed;
-    const badge = installed
-      ? '<span class="badge badge-success badge-sm">installed</span>'
-      : '<span class="badge badge-ghost badge-sm">unavailable</span>';
-    const desc = p.description
-      ? `<p class="text-xs opacity-70 mt-1">${_esc(p.description)}</p>`
-      : '<p class="text-xs opacity-40 italic mt-1">No description (missing or invalid plugin.md)</p>';
-    const version = p.version
-      ? `<span class="badge badge-outline badge-sm font-mono cursor-help" title="SHA-256(parser.py): ${_esc(p.sha256) || '(unavailable)'}">v${_esc(p.version)}</span>`
-      : '<span class="badge badge-ghost badge-sm">no version</span>';
-    const url = p.url
-      ? `<a href="${_esc(p.url)}" target="_blank" rel="noopener" class="link link-primary text-xs break-all">${_esc(p.url)}</a>`
-      : '<span class="opacity-40 text-xs italic">no url</span>';
-    const author = p.author
-      ? `<span class="text-xs">${_esc(p.author)}</span>`
-      : '<span class="opacity-40 text-xs italic">unknown</span>';
-    return `
-      <div class="border border-base-300 rounded-lg p-3 mb-3">
-        <div class="flex items-center gap-2 flex-wrap">
-          <code class="font-mono text-sm font-semibold">${_esc(name)}</code>
-          ${version}
-          ${badge}
-        </div>
-        ${desc}
-        <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 mt-2 text-xs">
-          <span class="opacity-50">Author:</span>${author}
-          <span class="opacity-50">URL:</span>${url}
-        </div>
-      </div>`;
-  }).join('');
+  const cards = names.map(name => _renderPluginCard(name, _pluginsCache[name] || {})).join('');
   host.innerHTML = cards;
+  // Wire interactive controls after the DOM is in place.
+  names.forEach(name => _bindPluginCard(name));
+}
+
+/* Build the markup for a single plugin card. */
+function _renderPluginCard(name, p) {
+  const installed = !!p.installed;
+  const schema = (p && p.config_schema) || {};
+  const merged = (p && p.config) || {};
+  const hasConfig = Object.keys(schema).length > 0;
+  const enabled = hasConfig ? (merged.enabled !== false) : true;
+
+  const statusBadge = installed
+    ? '<span class="badge badge-success badge-sm">installed</span>'
+    : '<span class="badge badge-ghost badge-sm">unavailable</span>';
+  const enabledBadge = hasConfig
+    ? (enabled
+        ? '<span class="badge badge-info badge-sm" data-role="enabled-badge">enabled</span>'
+        : '<span class="badge badge-warning badge-sm" data-role="enabled-badge">disabled</span>')
+    : '';
+  const desc = p.description
+    ? `<p class="text-xs opacity-70 mt-1">${_esc(p.description)}</p>`
+    : '<p class="text-xs opacity-40 italic mt-1">No description (missing or invalid plugin.md)</p>';
+  const version = p.version
+    ? `<span class="badge badge-outline badge-sm font-mono cursor-help" title="SHA-256(parser.py): ${_esc(p.sha256) || '(unavailable)'}">v${_esc(p.version)}</span>`
+    : '<span class="badge badge-ghost badge-sm">no version</span>';
+  const url = p.url
+    ? `<a href="${_esc(p.url)}" target="_blank" rel="noopener" class="link link-primary text-xs break-all">${_esc(p.url)}</a>`
+    : '<span class="opacity-40 text-xs italic">no url</span>';
+  const author = p.author
+    ? `<span class="text-xs">${_esc(p.author)}</span>`
+    : '<span class="opacity-40 text-xs italic">unknown</span>';
+
+  const enableToggle = hasConfig ? `
+        <label class="cursor-pointer flex items-center gap-2 ml-auto" title="${_esc(_pluginFieldDoc(schema, 'enabled') || 'Enable / disable this plugin')}">
+          <span class="text-xs opacity-60">enabled</span>
+          <input type="checkbox" class="toggle toggle-sm toggle-success" data-role="plugin-enabled" ${enabled ? 'checked' : ''} />
+        </label>` : '';
+
+  const settingsPanel = hasConfig
+    ? _renderPluginSettingsPanel(name, schema, merged)
+    : '';
+
+  return `
+    <div class="border border-base-300 rounded-lg p-3 mb-3" data-plugin-name="${_esc(name)}">
+      <div class="flex items-center gap-2 flex-wrap">
+        <code class="font-mono text-sm font-semibold">${_esc(name)}</code>
+        ${version}
+        ${statusBadge}
+        ${enabledBadge}
+        ${enableToggle}
+      </div>
+      ${desc}
+      <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 mt-2 text-xs">
+        <span class="opacity-50">Author:</span>${author}
+        <span class="opacity-50">URL:</span>${url}
+      </div>
+      ${settingsPanel}
+    </div>`;
+}
+
+/* Look up a `_<key>` description sibling on the on-disk schema. */
+function _pluginFieldDoc(schema, key) {
+  const v = schema['_' + key];
+  return typeof v === 'string' ? v : '';
+}
+
+/* Build the collapsible "Settings" panel for one plugin. Inputs are
+   typed off the on-disk schema's value (so a JSON `bool` always renders
+   as a checkbox even if the user-saved override happens to be the
+   wrong type). Read-only types render a <pre> JSON view. */
+function _renderPluginSettingsPanel(name, schema, merged) {
+  // Collect runtime keys (skip `_<key>` description siblings, and skip
+  // `enabled` because it has its own dedicated toggle in the header).
+  const keys = Object.keys(schema)
+    .filter(k => !k.startsWith('_') && k !== 'enabled')
+    .sort();
+  if (!keys.length) {
+    return `
+      <details class="mt-3">
+        <summary class="cursor-pointer text-xs opacity-70 select-none">Settings</summary>
+        <div class="mt-2 text-xs opacity-50 italic">This plugin has no editable settings.</div>
+      </details>`;
+  }
+  const rows = keys.map(k => _renderPluginField(name, k, schema, merged)).join('');
+  return `
+    <details class="mt-3 plugin-settings-panel">
+      <summary class="cursor-pointer text-xs opacity-70 select-none">Settings</summary>
+      <div class="mt-2 grid grid-cols-1 gap-3 text-xs">
+        ${rows}
+      </div>
+      <div class="flex justify-end gap-2 mt-3">
+        <button type="button" class="btn btn-xs btn-ghost" data-role="plugin-reset">Reset to defaults</button>
+        <button type="button" class="btn btn-xs btn-primary" data-role="plugin-save">Save</button>
+      </div>
+    </details>`;
+}
+
+/* Render a single field row. `key` is the runtime knob; the schema's
+   value at `key` decides which control we draw. */
+function _renderPluginField(name, key, schema, merged) {
+  const onDisk = schema[key];
+  const current = (merged && key in merged) ? merged[key] : onDisk;
+  const doc = _pluginFieldDoc(schema, key);
+  const labelHtml = `
+    <div class="flex items-center gap-2">
+      <code class="font-mono text-xs opacity-80">${_esc(key)}</code>
+      ${doc ? `<span class="opacity-50 text-[11px]">— ${_esc(doc)}</span>` : ''}
+    </div>`;
+
+  const dataAttr = `data-plugin-field="${_esc(key)}"`;
+
+  if (typeof onDisk === 'boolean') {
+    return `
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input type="checkbox" class="checkbox checkbox-sm mt-0.5" ${dataAttr} data-plugin-type="bool" ${current ? 'checked' : ''} />
+        <div class="flex-1">${labelHtml}</div>
+      </label>`;
+  }
+  if (typeof onDisk === 'number' && Number.isInteger(onDisk)) {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="number" step="1" class="input input-bordered input-xs w-48 font-mono" ${dataAttr} data-plugin-type="int" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (typeof onDisk === 'number') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="number" step="any" class="input input-bordered input-xs w-48 font-mono" ${dataAttr} data-plugin-type="float" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (typeof onDisk === 'string') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <input type="text" class="input input-bordered input-xs w-full font-mono" ${dataAttr} data-plugin-type="string" value="${_esc(current)}" />
+      </div>`;
+  }
+  if (Array.isArray(onDisk)) {
+    const allStrings = onDisk.every(x => typeof x === 'string');
+    if (allStrings) {
+      const tags = Array.isArray(current) ? current : [];
+      return `
+        <div class="flex flex-col gap-1">
+          ${labelHtml}
+          <input type="text" class="input input-bordered input-xs w-full font-mono" ${dataAttr} data-plugin-type="list[str]" value="${_esc(tags.join(', '))}" placeholder="comma-separated values" />
+        </div>`;
+    }
+    // Non-string list → read-only JSON.
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+        <span class="opacity-50 text-[11px] italic">Read-only in v1 (edit <code>config.json</code> directly).</span>
+      </div>`;
+  }
+  if (onDisk && typeof onDisk === 'object') {
+    return `
+      <div class="flex flex-col gap-1">
+        ${labelHtml}
+        <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+        <span class="opacity-50 text-[11px] italic">Read-only in v1 (edit <code>config.json</code> directly).</span>
+      </div>`;
+  }
+  // Fallback: null / unsupported → show JSON preview.
+  return `
+    <div class="flex flex-col gap-1">
+      ${labelHtml}
+      <pre class="bg-base-200 rounded p-2 text-[11px] overflow-auto max-h-40 m-0" ${dataAttr} data-plugin-type="json-readonly">${_esc(JSON.stringify(current, null, 2))}</pre>
+    </div>`;
+}
+
+/* Wire toggle + Save + Reset for a single plugin card. */
+function _bindPluginCard(name) {
+  const card = document.querySelector(`[data-plugin-name="${CSS.escape(name)}"]`);
+  if (!card) return;
+
+  const toggle = card.querySelector('[data-role="plugin-enabled"]');
+  if (toggle && !toggle.dataset.bound) {
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('change', async () => {
+      const newVal = !!toggle.checked;
+      const ok = await _patchPluginConfig(name, { enabled: newVal });
+      if (!ok) {
+        // revert UI on failure
+        toggle.checked = !newVal;
+      } else {
+        showToast(`Plugin ${name}: ${newVal ? 'enabled' : 'disabled'}`, 'success');
+        // Refresh so badges + computed merged values stay in sync.
+        await loadSettings();
+      }
+    });
+  }
+
+  const saveBtn = card.querySelector('[data-role="plugin-save"]');
+  if (saveBtn && !saveBtn.dataset.bound) {
+    saveBtn.dataset.bound = '1';
+    saveBtn.addEventListener('click', async () => {
+      const diff = _collectPluginDiff(card, name);
+      if (diff === null) return; // collection error (toast already shown)
+      if (Object.keys(diff).length === 0) {
+        showToast('No changes to save', 'info');
+        return;
+      }
+      const ok = await _patchPluginConfig(name, diff);
+      if (ok) {
+        showToast(`Plugin ${name}: saved`, 'success');
+        await loadSettings();
+      }
+    });
+  }
+
+  const resetBtn = card.querySelector('[data-role="plugin-reset"]');
+  if (resetBtn && !resetBtn.dataset.bound) {
+    resetBtn.dataset.bound = '1';
+    resetBtn.addEventListener('click', async () => {
+      const schema = (_pluginsCache[name] || {}).config_schema || {};
+      // Build a payload of every editable runtime knob (skip `_<key>`
+      // description siblings) set back to its on-disk default. We
+      // include `enabled` so disabled→enabled also resets via the
+      // same call.
+      const defaults = {};
+      Object.keys(schema).forEach(k => {
+        if (k.startsWith('_')) return;
+        const v = schema[k];
+        // Skip dict / non-string list — they're read-only in v1, but
+        // sending the on-disk value back is still safe and keeps the
+        // override store clean.
+        defaults[k] = v;
+      });
+      const ok = await _patchPluginConfig(name, defaults);
+      if (ok) {
+        showToast(`Plugin ${name}: reset to defaults`, 'success');
+        await loadSettings();
+      }
+    });
+  }
+}
+
+/* Walk the form controls inside a card and collect a partial diff
+   against the currently-loaded merged values. Returns `null` on a
+   parse error (and toasts the user). */
+function _collectPluginDiff(card, name) {
+  const schema = (_pluginsCache[name] || {}).config_schema || {};
+  const merged = (_pluginsCache[name] || {}).config || {};
+  const diff = {};
+  const fields = card.querySelectorAll('[data-plugin-field]');
+  for (const el of fields) {
+    const key = el.getAttribute('data-plugin-field');
+    const type = el.getAttribute('data-plugin-type');
+    if (type === 'json-readonly') continue;
+    let value;
+    try {
+      if (type === 'bool') {
+        value = !!el.checked;
+      } else if (type === 'int') {
+        const raw = el.value.trim();
+        if (raw === '') continue; // skip empty -> treat as no change
+        value = parseInt(raw, 10);
+        if (Number.isNaN(value)) throw new Error(`"${key}" must be an integer`);
+      } else if (type === 'float') {
+        const raw = el.value.trim();
+        if (raw === '') continue;
+        value = parseFloat(raw);
+        if (Number.isNaN(value)) throw new Error(`"${key}" must be a number`);
+      } else if (type === 'string') {
+        value = el.value;
+      } else if (type === 'list[str]') {
+        value = el.value
+          .split(',')
+          .map(s => s.trim())
+          .filter(s => s.length > 0);
+      } else {
+        continue;
+      }
+    } catch (e) {
+      showToast(e.message || String(e), 'error');
+      return null;
+    }
+    const current = (key in merged) ? merged[key] : schema[key];
+    if (!_pluginValuesEqual(current, value)) {
+      diff[key] = value;
+    }
+  }
+  return diff;
+}
+
+function _pluginValuesEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/* PATCH /api/settings/plugins/<name>/config with a body, surfacing
+   server validation errors via a toast. Returns true on success. */
+async function _patchPluginConfig(name, body) {
+  try {
+    await apiFetch(`/api/settings/plugins/${encodeURIComponent(name)}/config`, {
+      method: 'PATCH',
+      body,
+    });
+    return true;
+  } catch (e) {
+    showToast(`Plugin ${name}: ${e.message || e}`, 'error');
+    return false;
+  }
 }
 
 function collectExtraSettings() {
@@ -3001,7 +3960,7 @@ document.addEventListener('click', e => {
   });
   updateDepthLabel();
 })();
-window.addEventListener('resize', () => { if(graphChart)graphChart.resize(); if(wordCloudChart)wordCloudChart.resize(); });
+window.addEventListener('resize', () => { if(graphChart)graphChart.resize(); if(graphChart2)graphChart2.resize(); if(wordCloudChart)wordCloudChart.resize(); });
 /* ── Tagify Mode Badge on Chat Input ───────────────────────────── */
 let chatTagify = null;
 let _chatSearchDebounce = null;
@@ -3189,23 +4148,868 @@ async function deleteIndex() {
       if (ev) ev.textContent = '0';
       if (graphChart) { graphChart.dispose(); graphChart = null; }
       currentGraph = null;
-      document.getElementById('status-nodes').textContent = '';
-      document.getElementById('status-edges').textContent = '';
+      const sn = document.getElementById('status-nodes');
+      if (sn) sn.textContent = '';
+      const se = document.getElementById('status-edges');
+      if (se) se.textContent = '';
       loadFolderTree();
     } else { showToast('Failed to delete index', 'error'); }
   } catch (e) { showToast('Error: ' + e.message, 'error'); }
   finally { btn.disabled = false; }
 }
 
+/* ══════════════════════════════════════════════════════════════
+   Annotations: text highlights, notes, bookmarks (Phase 11 UI)
+   ────────────────────────────────────────────────────────────
+   Backend storage lives in `_apollo/annotations.json` and is exposed
+   via /api/annotations*. This module wires up:
+     - text-selection toolbar inside #left-detail-content
+     - color highlights + note popover
+     - bookmark toggle on the active node
+     - sidebar list view (Notes / Bookmarks / Highlights)
+   ══════════════════════════════════════════════════════════════ */
+const Annotations = (function () {
+  let toolbar, editor, editorQuote, editorTextarea;
+  let pendingSel = null;          // {text, node_id, rect}
+  let editingNoteId = null;       // when set, save updates instead of creates
+  let _byNodeCache = {};          // node_id -> annotations[]
+  let currentTab = 'notes';
+
+  // Per-node note counts, fetched once via /api/annotations?type=note and used
+  // to render the daisyUI indicator dots on the file-tree sidebar and the
+  // node-detail page header.
+  let _noteCountsByNodeId = {};
+  let _noteCountsByFilePath = {};
+  let _noteIndexLoaded = false;
+
+  function init() {
+    toolbar = document.getElementById('selection-toolbar');
+    editor = document.getElementById('note-editor');
+    editorQuote = document.getElementById('note-editor-quote');
+    editorTextarea = document.getElementById('note-editor-textarea');
+    const detail = document.getElementById('left-detail-content');
+    if (!toolbar || !editor || !detail) return;
+
+    detail.addEventListener('mouseup', () => setTimeout(onSelection, 0));
+    detail.addEventListener('keyup', () => setTimeout(onSelection, 0));
+    document.addEventListener('mousedown', onDocMouseDown, true);
+    document.addEventListener('keydown', onDocKeyDown);
+    document.addEventListener('scroll', () => { hideToolbar(); }, true);
+
+    toolbar.querySelectorAll('.color-swatch').forEach(b => {
+      b.addEventListener('mousedown', e => e.preventDefault());
+      b.addEventListener('click', () => createHighlight(b.dataset.color));
+    });
+    toolbar.querySelector('[data-action="note"]').addEventListener('mousedown', e => e.preventDefault());
+    toolbar.querySelector('[data-action="note"]').addEventListener('click', openNoteEditor);
+    toolbar.querySelector('[data-action="close"]').addEventListener('click', () => {
+      hideToolbar();
+      window.getSelection().removeAllRanges();
+    });
+
+    editor.querySelector('[data-action="save"]').addEventListener('click', saveNote);
+    editor.querySelector('[data-action="cancel"]').addEventListener('click', hideEditor);
+  }
+
+  function onSelection() {
+    if (editor.classList.contains('visible')) return; // editor open: ignore new selections
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { hideToolbar(); return; }
+    const text = sel.toString().trim();
+    if (!text || text.length < 2) { hideToolbar(); return; }
+    if (!selectedNode) return;
+    const detail = document.getElementById('left-detail-content');
+    const range = sel.getRangeAt(0);
+    if (!detail.contains(range.commonAncestorContainer)) { hideToolbar(); return; }
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+    pendingSel = { text, node_id: selectedNode };
+    showToolbar(rect);
+  }
+
+  function showToolbar(rect) {
+    // Position above the selection if room, else below
+    toolbar.classList.add('visible');
+    const tbRect = toolbar.getBoundingClientRect();
+    let top = window.scrollY + rect.top - tbRect.height - 8;
+    if (top < window.scrollY + 4) top = window.scrollY + rect.bottom + 8;
+    let left = window.scrollX + rect.left + (rect.width / 2) - (tbRect.width / 2);
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth - tbRect.width - 8));
+    toolbar.style.left = left + 'px';
+    toolbar.style.top = top + 'px';
+  }
+
+  function hideToolbar() {
+    toolbar && toolbar.classList.remove('visible');
+  }
+
+  function hideEditor() {
+    editor && editor.classList.remove('visible');
+    editingNoteId = null;
+  }
+
+  function onDocMouseDown(e) {
+    if (toolbar && toolbar.classList.contains('visible')) {
+      if (toolbar.contains(e.target) || editor.contains(e.target)) return;
+      // If user clicks anywhere else, hide toolbar
+      hideToolbar();
+    }
+    if (editor && editor.classList.contains('visible')) {
+      if (editor.contains(e.target)) return;
+      // click outside editor: keep open if clicking inside toolbar; else close
+      if (toolbar.contains(e.target)) return;
+      hideEditor();
+    }
+  }
+
+  function onDocKeyDown(e) {
+    if (e.key === 'Escape') {
+      if (editor.classList.contains('visible')) hideEditor();
+      else if (toolbar.classList.contains('visible')) hideToolbar();
+    }
+  }
+
+  async function createHighlight(color) {
+    if (!pendingSel) return;
+    try {
+      await apiFetch('/api/annotations/create', {
+        method: 'POST',
+        body: {
+          type: 'highlight',
+          target: { type: 'node', node_id: pendingSel.node_id },
+          content: pendingSel.text,
+          color,
+        },
+      });
+      _byNodeCache[pendingSel.node_id] = null;
+      hideToolbar();
+      window.getSelection().removeAllRanges();
+      showToast('Highlight saved', 'success');
+      await applyToDetail(pendingSel.node_id);
+      pendingSel = null;
+    } catch (e) {
+      showToast('Failed to save highlight: ' + (e.message || e), 'error');
+    }
+  }
+
+  function openNoteEditor() {
+    if (!pendingSel) return;
+    editorQuote.textContent = pendingSel.text.length > 280 ? pendingSel.text.slice(0, 280) + '…' : pendingSel.text;
+    editorTextarea.value = '';
+    editingNoteId = null;
+    // Position the editor near the toolbar
+    const tbRect = toolbar.getBoundingClientRect();
+    editor.classList.add('visible');
+    let top = window.scrollY + tbRect.bottom + 6;
+    let left = window.scrollX + tbRect.left;
+    const eRect = editor.getBoundingClientRect();
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth - eRect.width - 8));
+    editor.style.top = top + 'px';
+    editor.style.left = left + 'px';
+    hideToolbar();
+    setTimeout(() => editorTextarea.focus(), 30);
+  }
+
+  async function saveNote() {
+    const body = (editorTextarea.value || '').trim();
+    if (!body) { showToast('Note is empty', 'info'); return; }
+    try {
+      if (editingNoteId) {
+        await apiFetch(`/api/annotations/${encodeURIComponent(editingNoteId)}`, {
+          method: 'PUT', body: { content: body },
+        });
+        showToast('Note updated', 'success');
+      } else {
+        if (!pendingSel) return;
+        // Save the selected text in the note body as a Markdown blockquote
+        const fullContent = `> ${pendingSel.text.replace(/\n/g, '\n> ')}\n\n${body}`;
+        await apiFetch('/api/annotations/create', {
+          method: 'POST',
+          body: {
+            type: 'note',
+            target: { type: 'node', node_id: pendingSel.node_id },
+            content: fullContent,
+            color: 'yellow',
+          },
+        });
+        _byNodeCache[pendingSel.node_id] = null;
+        showToast('Note saved', 'success');
+      }
+      hideEditor();
+      window.getSelection().removeAllRanges();
+      const nid = pendingSel ? pendingSel.node_id : null;
+      pendingSel = null;
+      // Refresh detail panel if visible
+      if (nid && selectedNode === nid) await applyToDetail(nid);
+      // Refresh list view if open
+      if (isHubAnnotationsVisible()) refreshList();
+      // Refresh sidebar dots and detail-header indicator
+      refreshIndicators();
+    } catch (e) {
+      showToast('Failed to save note: ' + (e.message || e), 'error');
+    }
+  }
+
+  // ── Bookmark toggle ────────────────────────────────────────────
+  async function toggleBookmark(nodeId, nodeName) {
+    try {
+      const ann = await getForNode(nodeId, false);
+      const existing = ann.find(a => a.type === 'bookmark');
+      if (existing) {
+        await apiFetch(`/api/annotations/${encodeURIComponent(existing.id)}`, { method: 'DELETE' });
+        showToast('Bookmark removed', 'success');
+      } else {
+        await apiFetch('/api/annotations/create', {
+          method: 'POST',
+          body: {
+            type: 'bookmark',
+            target: { type: 'node', node_id: nodeId },
+            content: nodeName || nodeId,
+          },
+        });
+        showToast('Bookmark added', 'success');
+      }
+      _byNodeCache[nodeId] = null;
+      await applyToDetail(nodeId);
+      if (isHubAnnotationsVisible()) refreshList();
+    } catch (e) {
+      showToast('Failed to toggle bookmark: ' + (e.message || e), 'error');
+    }
+  }
+
+  // ── Read annotations for a node ───────────────────────────────
+  async function getForNode(nodeId, useCache = true) {
+    if (!nodeId) return [];
+    if (useCache && _byNodeCache[nodeId]) return _byNodeCache[nodeId];
+    try {
+      const data = await apiFetch(`/api/annotations/by-target?node=${encodeURIComponent(nodeId)}`);
+      _byNodeCache[nodeId] = data.annotations || [];
+      return _byNodeCache[nodeId];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ── Render highlights + bookmark state into #left-detail-content
+  async function applyToDetail(nodeId) {
+    if (!nodeId) return;
+    const annotations = await getForNode(nodeId, false);
+    const detail = document.getElementById('left-detail-content');
+    if (!detail) return;
+
+    // Strip previously applied highlight wraps
+    detail.querySelectorAll('.user-highlight').forEach(el => {
+      const parent = el.parentNode;
+      while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      parent.removeChild(el);
+      parent.normalize();
+    });
+
+    // Refresh bookmark toggle button state
+    const bm = detail.querySelector('.bookmark-toggle');
+    if (bm) {
+      const has = annotations.some(a => a.type === 'bookmark');
+      bm.classList.toggle('active', has);
+      bm.setAttribute('aria-pressed', has ? 'true' : 'false');
+    }
+
+    // Track {annId -> note body} for the per-line dot popovers below.
+    const noteBodyById = {};
+
+    // Apply visual highlights for highlight + note types
+    for (const a of annotations) {
+      if (a.type === 'highlight' && a.content) {
+        wrapTextInElement(detail, a.content, a.color || 'yellow', a.id, false);
+      } else if (a.type === 'note' && a.content) {
+        // Pull the quoted selection from the front of the note body
+        const m = a.content.match(/^>\s?([\s\S]+?)\n\n/);
+        if (m) {
+          wrapTextInElement(detail, m[1].replace(/\n>\s?/g, '\n'), a.color || 'yellow', a.id, true);
+          noteBodyById[a.id] = m[2] || '';
+        } else {
+          noteBodyById[a.id] = a.content;
+        }
+      }
+    }
+
+    // Drop any line-note markers from a previous render, then add a dot
+    // marker for every note highlight. Code views (.code-line rows) get a
+    // right-margin dot per line; rendered prose (Markdown / HTML viewers
+    // under .md-content) gets an inline dot rendered immediately after
+    // the highlighted span. Either form shows a hover popover with the
+    // note body so the user can read a saved note in place.
+    detail.querySelectorAll('.line-note-marker').forEach(el => el.remove());
+    detail.querySelectorAll('.code-line').forEach(line => line.classList.remove('has-note'));
+    const seenAnnIds = new Set();
+    const buildMarker = (annId) => {
+      const body = noteBodyById[annId] || '';
+      const marker = document.createElement('span');
+      marker.className = 'line-note-marker';
+      marker.dataset.annId = annId;
+      marker.title = 'Note · click to view';
+      marker.innerHTML = `<span class="line-note-popover">${escapeHtml(body)}</span>`;
+      marker.addEventListener('click', e => onHighlightClick(e, annId, true));
+      return marker;
+    };
+    detail.querySelectorAll('.user-highlight.is-note').forEach(span => {
+      const annId = span.dataset.annId || '';
+      if (seenAnnIds.has(annId)) return;
+      seenAnnIds.add(annId);
+      const line = span.closest('.code-line');
+      if (line) {
+        if (line.querySelector('.line-note-marker')) return;
+        line.classList.add('has-note');
+        line.appendChild(buildMarker(annId));
+      } else {
+        // Inline placement for markdown / HTML viewers without code rows.
+        const marker = buildMarker(annId);
+        marker.classList.add('inline');
+        span.insertAdjacentElement('afterend', marker);
+      }
+    });
+
+    // Fallback for notes whose quote text couldn't be wrapped (e.g. the
+    // selection crossed nested elements in the markdown render).  Drop a
+    // single inline marker at the top of the detail body so the user can
+    // still see + open the note from the page.
+    for (const a of annotations) {
+      if (a.type !== 'note' || seenAnnIds.has(a.id)) continue;
+      seenAnnIds.add(a.id);
+      const marker = buildMarker(a.id);
+      marker.classList.add('inline', 'orphan');
+      detail.insertBefore(marker, detail.firstChild);
+    }
+
+    // Refresh the daisyUI note indicator in the detail header. Recompute the
+    // count from the per-node fetch so it stays in sync even before the
+    // global note index has refreshed.
+    const noteCount = annotations.filter(a => a.type === 'note').length;
+    _noteCountsByNodeId[nodeId] = noteCount;
+    updateDetailNoteIndicator(nodeId);
+
+    // Render the Google-Docs-style margin column with one card per note
+    // (anchored vertically next to the highlighted text).
+    renderMarginNotes(detail, annotations, noteBodyById, seenAnnIds);
+  }
+
+  // Build / update the right-margin notes column inside the detail panel.
+  // Each note gets a card whose top is aligned with its anchor span (or
+  // pinned to the top of the panel for "orphan" notes whose quote could
+  // not be located in the rendered DOM).
+  function renderMarginNotes(detail, annotations, noteBodyById, _seenAnnIds) {
+    if (!detail) return;
+    const notes = (annotations || []).filter(a => a.type === 'note');
+
+    // Tear down any previous margin column.
+    detail.querySelectorAll('.notes-margin').forEach(el => el.remove());
+    detail.classList.toggle('has-margin-notes', notes.length > 0);
+    if (!notes.length) return;
+
+    const margin = document.createElement('aside');
+    margin.className = 'notes-margin';
+    margin.setAttribute('aria-label', 'Notes for this view');
+
+    // Sort notes by vertical anchor position so they read top-to-bottom.
+    const detailRect = detail.getBoundingClientRect();
+    const placed = notes.map(a => {
+      const anchor = detail.querySelector(`.user-highlight.is-note[data-ann-id="${cssEscape(a.id)}"]`);
+      let top = 0;
+      let orphan = false;
+      if (anchor) {
+        const r = anchor.getBoundingClientRect();
+        top = (r.top - detailRect.top) + detail.scrollTop;
+      } else {
+        orphan = true;
+        top = detail.scrollTop + 4;
+      }
+      return { ann: a, anchor, top, orphan };
+    }).sort((x, y) => x.top - y.top);
+
+    // Render cards into the margin (initial top will be re-laid out).
+    placed.forEach(p => {
+      const a = p.ann;
+      const body = noteBodyById && noteBodyById[a.id] != null
+        ? noteBodyById[a.id]
+        : extractNoteBody(a.content || '');
+      const quote = extractNoteQuote(a.content || '');
+      const card = document.createElement('div');
+      card.className = 'notes-margin-card' + (p.orphan ? ' orphan' : '');
+      card.dataset.annId = a.id;
+      const colorAttr = a.color ? ` data-color="${escapeHtml(a.color)}"` : '';
+      card.innerHTML = `
+        <div class="nm-card-head">
+          <span class="nm-dot"${colorAttr}></span>
+          <span class="nm-time">${escapeHtml((a.created_at || '').split('T')[0] || '')}</span>
+          ${p.orphan ? '<span class="nm-orphan-tag" title="Original anchor not found in current view">orphan</span>' : ''}
+          <button type="button" class="nm-card-delete" title="Delete note" aria-label="Delete note">✕</button>
+        </div>
+        ${quote ? `<div class="nm-quote">${escapeHtml(quote)}</div>` : ''}
+        <div class="nm-body">${escapeHtml(body)}</div>
+      `;
+      card.addEventListener('click', e => {
+        if (e.target.closest('.nm-card-delete')) return;
+        if (p.anchor) {
+          p.anchor.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          flashAnchor(p.anchor);
+        }
+        // Open editor on click of body so the user can edit the note in place.
+        showNoteViewer(a, e.clientX, e.clientY);
+      });
+      card.querySelector('.nm-card-delete').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm('Delete this note?')) return;
+        try {
+          await apiFetch(`/api/annotations/${encodeURIComponent(a.id)}`, { method: 'DELETE' });
+          if (selectedNode) _byNodeCache[selectedNode] = null;
+          showToast('Note deleted', 'success');
+          if (selectedNode) await applyToDetail(selectedNode);
+          if (isHubAnnotationsVisible()) refreshList();
+          refreshIndicators();
+        } catch (err) {
+          showToast('Failed to delete note', 'error');
+        }
+      });
+      margin.appendChild(card);
+    });
+
+    detail.appendChild(margin);
+
+    // After cards are in the DOM we know their heights, so do a second
+    // pass to vertically stack them without overlapping.  Each card is
+    // pulled toward its anchor `top` but pushed down past the previous
+    // card if needed (Google-Docs-style "comment column").
+    requestAnimationFrame(() => layoutMarginCards(detail, margin, placed));
+  }
+
+  function layoutMarginCards(detail, margin, placed) {
+    const cards = Array.from(margin.querySelectorAll('.notes-margin-card'));
+    if (!cards.length) return;
+    const GAP = 8;
+    let cursor = 0;
+    cards.forEach((card, i) => {
+      const wanted = Math.max(placed[i] ? placed[i].top : 0, cursor);
+      card.style.top = wanted + 'px';
+      cursor = wanted + card.getBoundingClientRect().height + GAP;
+    });
+  }
+
+  function extractNoteQuote(content) {
+    const m = (content || '').match(/^>\s?([\s\S]+?)\n\n/);
+    return m ? m[1].replace(/\n>\s?/g, '\n') : '';
+  }
+  function extractNoteBody(content) {
+    const m = (content || '').match(/^>\s?[\s\S]+?\n\n([\s\S]*)$/);
+    return m ? m[1] : (content || '');
+  }
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  }
+  function flashAnchor(el) {
+    if (!el) return;
+    el.classList.remove('nm-flash');
+    // force reflow so the animation restarts
+    void el.offsetWidth;
+    el.classList.add('nm-flash');
+    setTimeout(() => el.classList.remove('nm-flash'), 1400);
+  }
+
+  // Walk text nodes building a flat character index, find the first
+  // occurrence of `text` (whitespace-normalised), and wrap each text-node
+  // fragment that participates in the match with a `.user-highlight` span
+  // sharing the same data-ann-id. Works across element boundaries (e.g.
+  // markdown <strong>, syntax-highlighted hljs spans).
+  function wrapTextInElement(root, text, color, annId, isNote) {
+    if (!text || text.trim().length < 2) return false;
+
+    // Collect candidate text nodes in document order, skipping nodes that
+    // already live inside a user-highlight / script / style block.
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+        if (!n.parentElement) return NodeFilter.FILTER_REJECT;
+        if (n.parentElement.closest('.user-highlight')) return NodeFilter.FILTER_REJECT;
+        if (n.parentElement.closest('script,style')) return NodeFilter.FILTER_REJECT;
+        // Skip our own gutter / line-number cells so we never highlight the
+        // line numbers in lined code blocks.
+        if (n.parentElement.closest('.ln,.line-note-marker,.notes-margin')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+
+    // Build a normalised string + offset map.  Every run of whitespace
+    // (including line breaks coming from <br>/markdown re-flow) collapses
+    // to a single space so the match survives wrapping differences.
+    const segments = [];           // {node, start, end} into normalized string
+    let normalized = '';
+    let prevWasSpace = true;       // collapse leading whitespace
+    let node;
+    while ((node = walker.nextNode())) {
+      const raw = node.nodeValue;
+      const segStart = normalized.length;
+      // Track per-character mapping back to the original node index.
+      const charMap = [];
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        const isWs = /\s/.test(ch);
+        if (isWs) {
+          if (prevWasSpace) continue;
+          normalized += ' ';
+          charMap.push(i);
+          prevWasSpace = true;
+        } else {
+          normalized += ch;
+          charMap.push(i);
+          prevWasSpace = false;
+        }
+      }
+      const segEnd = normalized.length;
+      segments.push({ node, start: segStart, end: segEnd, charMap });
+    }
+
+    const needle = text.replace(/\s+/g, ' ').trim();
+    if (!needle) return false;
+
+    // Strip leading whitespace from the normalized haystack for search but
+    // keep it for offset lookups.
+    const idx = normalized.indexOf(needle);
+    if (idx === -1) return false;
+    const matchStart = idx;
+    const matchEnd = idx + needle.length;
+
+    // Walk the segments, splitting and wrapping the slice that overlaps
+    // [matchStart, matchEnd).  Multiple spans share the same annId so the
+    // margin panel can find every fragment.
+    let wrappedAny = false;
+    for (const seg of segments) {
+      if (seg.end <= matchStart || seg.start >= matchEnd) continue;
+      const localFrom = Math.max(matchStart, seg.start) - seg.start;
+      const localTo   = Math.min(matchEnd,   seg.end)   - seg.start;
+      // Map from normalized-local offsets back to raw text-node offsets.
+      const rawFrom = seg.charMap[localFrom] != null ? seg.charMap[localFrom] : seg.node.nodeValue.length;
+      // localTo is exclusive; charMap[localTo-1]+1 is the right edge.
+      let rawTo;
+      if (localTo <= 0) continue;
+      if (localTo - 1 >= seg.charMap.length) {
+        rawTo = seg.node.nodeValue.length;
+      } else {
+        rawTo = seg.charMap[localTo - 1] + 1;
+      }
+      if (rawTo <= rawFrom) continue;
+      try {
+        const range = document.createRange();
+        range.setStart(seg.node, rawFrom);
+        range.setEnd(seg.node, rawTo);
+        const span = document.createElement('span');
+        span.className = 'user-highlight' + (isNote ? ' is-note' : '');
+        span.dataset.color = color;
+        span.dataset.annId = annId;
+        span.title = isNote ? 'Note · click to view' : 'Highlight · click to remove';
+        span.addEventListener('click', e => onHighlightClick(e, annId, isNote));
+        range.surroundContents(span);
+        wrappedAny = true;
+      } catch (e) {
+        // Boundary collision (rare here since we operate on a single text
+        // node at a time); skip this fragment but keep going.
+      }
+    }
+    return wrappedAny;
+  }
+
+  async function onHighlightClick(e, annId, isNote) {
+    e.stopPropagation();
+    if (isNote) {
+      try {
+        const ann = await apiFetch(`/api/annotations/${encodeURIComponent(annId)}`);
+        showNoteViewer(ann, e.clientX, e.clientY);
+      } catch (err) {
+        showToast('Failed to load note', 'error');
+      }
+    } else {
+      if (!confirm('Remove this highlight?')) return;
+      try {
+        await apiFetch(`/api/annotations/${encodeURIComponent(annId)}`, { method: 'DELETE' });
+        if (selectedNode) _byNodeCache[selectedNode] = null;
+        showToast('Highlight removed', 'success');
+        if (selectedNode) await applyToDetail(selectedNode);
+        if (isHubAnnotationsVisible()) refreshList();
+      } catch (err) {
+        showToast('Failed: ' + (err.message || err), 'error');
+      }
+    }
+  }
+
+  // Reuse the editor as a viewer/editor for an existing note
+  function showNoteViewer(ann, x, y) {
+    editingNoteId = ann.id;
+    pendingSel = null;
+    const m = (ann.content || '').match(/^>\s?([\s\S]+?)\n\n([\s\S]*)$/);
+    const quote = m ? m[1].replace(/\n>\s?/g, '\n') : '';
+    const body = m ? m[2] : (ann.content || '');
+    editorQuote.textContent = quote;
+    editorTextarea.value = body;
+    editor.classList.add('visible');
+    const eRect = editor.getBoundingClientRect();
+    let left = window.scrollX + (x || window.innerWidth / 2) - 20;
+    let top  = window.scrollY + (y || window.innerHeight / 2) + 12;
+    left = Math.max(8, Math.min(left, window.scrollX + window.innerWidth  - eRect.width  - 8));
+    top  = Math.max(8, Math.min(top,  window.scrollY + window.innerHeight - eRect.height - 8));
+    editor.style.left = left + 'px';
+    editor.style.top  = top  + 'px';
+    setTimeout(() => editorTextarea.focus(), 30);
+  }
+
+  // ── Annotations sub-tab inside My Hub ─────────────────────────
+  function openTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('#hub-pane-annotations .ann-tab').forEach(b => {
+      b.classList.toggle('active', b.dataset.annTab === tab);
+    });
+    refreshList();
+  }
+
+  function currentSubFilter() { return currentTab; }
+
+  function isHubAnnotationsVisible() {
+    const pane = document.getElementById('hub-pane-annotations');
+    return !!(pane && !pane.classList.contains('hidden'));
+  }
+
+  async function refreshList() {
+    const list = document.getElementById('annotations-list');
+    if (!list) return;
+    list.innerHTML = '<div class="ann-empty">Loading…</div>';
+    let typeFilter = currentTab === 'notes' ? 'note' : currentTab === 'bookmarks' ? 'bookmark' : 'highlight';
+    try {
+      const data = await apiFetch(`/api/annotations?type=${encodeURIComponent(typeFilter)}`);
+      const items = data.annotations || [];
+      if (!items.length) {
+        list.innerHTML = `<div class="ann-empty">No ${currentTab} yet.<br>Select text in a node detail panel to create one.</div>`;
+        return;
+      }
+      list.innerHTML = items.map(renderRow).join('');
+      list.querySelectorAll('[data-go-node]').forEach(el => {
+        el.addEventListener('click', () => {
+          const nid = el.dataset.goNode;
+          switchView('graph');
+          setTimeout(() => { focusNodeInGraph(nid); selectNode(nid); }, 80);
+        });
+      });
+      list.querySelectorAll('[data-delete-id]').forEach(el => {
+        el.addEventListener('click', async () => {
+          const id = el.dataset.deleteId;
+          if (!confirm('Delete this annotation?')) return;
+          try {
+            await apiFetch(`/api/annotations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            const nid = el.dataset.deleteNode;
+            if (nid) _byNodeCache[nid] = null;
+            if (nid && selectedNode === nid) await applyToDetail(nid);
+            refreshList();
+            refreshIndicators();
+          } catch (e) {
+            showToast('Failed to delete', 'error');
+          }
+        });
+      });
+    } catch (e) {
+      list.innerHTML = `<div class="ann-empty">Failed to load annotations.<br>${escapeHtml(e.message || String(e))}</div>`;
+    }
+  }
+
+  function renderRow(a) {
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const when = (a.created_at || '').split('T')[0] || '';
+    const colorDot = a.color
+      ? `<span class="ann-row-color-dot" data-color="${escapeHtml(a.color)}" title="${escapeHtml(a.color)}"></span>`
+      : '';
+    const stale = a.stale ? `<span class="badge badge-xs badge-warning">stale</span>` : '';
+    let body = '';
+    if (a.type === 'note' && a.content) {
+      const m = a.content.match(/^>\s?([\s\S]+?)\n\n([\s\S]*)$/);
+      const quote = m ? m[1].replace(/\n>\s?/g, '\n') : '';
+      const note = m ? m[2] : a.content;
+      body = `${quote ? `<div class="ann-row-content" style="opacity:0.7;border-left:3px solid oklch(var(--p));padding-left:8px;margin-bottom:4px">${escapeHtml(quote)}</div>` : ''}<div class="ann-row-content">${escapeHtml(note)}</div>`;
+    } else if (a.content) {
+      body = `<div class="ann-row-content">${escapeHtml(a.content)}</div>`;
+    }
+    const goAttr = tgt.type === 'node' && tgt.node_id ? `data-go-node="${escapeHtml(tgt.node_id)}"` : '';
+    return `
+      <div class="ann-row">
+        <div class="ann-row-head">
+          <span class="ann-row-type">${escapeHtml(a.type)}</span>
+          ${colorDot}
+          <span class="ann-row-target" ${goAttr} title="${escapeHtml(tgtLabel)}">${escapeHtml(tgtLabel)}</span>
+          ${stale}
+          <span class="ann-row-time">${escapeHtml(when)}</span>
+        </div>
+        ${body}
+        <div class="ann-row-actions">
+          ${tgt.type === 'node' && tgt.node_id ? `<button type="button" class="ann-action" ${goAttr}>Open</button>` : ''}
+          <button type="button" class="ann-action danger" data-delete-id="${escapeHtml(a.id)}" data-delete-node="${escapeHtml(tgt.node_id || '')}">Delete</button>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Note index (powers tree dots + detail-header indicator) ─────
+  async function loadNoteIndex() {
+    try {
+      const data = await apiFetch('/api/annotations?type=note');
+      const items = data.annotations || [];
+      const byNode = {};
+      const byFile = {};
+      for (const a of items) {
+        const t = a.target || {};
+        if (t.type === 'node' && t.node_id) {
+          byNode[t.node_id] = (byNode[t.node_id] || 0) + 1;
+        } else if (t.type === 'file' && t.file_path) {
+          byFile[t.file_path] = (byFile[t.file_path] || 0) + 1;
+        }
+      }
+      _noteCountsByNodeId = byNode;
+      _noteCountsByFilePath = byFile;
+      _noteIndexLoaded = true;
+    } catch (e) {
+      _noteCountsByNodeId = {};
+      _noteCountsByFilePath = {};
+      _noteIndexLoaded = true;
+    }
+  }
+
+  function noteCountForNode(nodeId) {
+    return _noteCountsByNodeId[nodeId] || 0;
+  }
+
+  // Decorate every file row in the sidebar tree with a daisyUI indicator dot
+  // when the corresponding node has at least one saved note.
+  function applyTreeIndicators() {
+    const rows = document.querySelectorAll('#folder-tree .tree-row.is-file');
+    rows.forEach(row => {
+      // The node id was stashed on the row's click handler; we need a stable
+      // way to recover it, so we re-derive from the title (full path) instead.
+      // The renderer doesn't put node-id on the DOM, so we tag it via a
+      // dataset attribute below.
+      const nid = row.dataset.nodeId;
+      const existing = row.querySelector('.tree-row-note-dot');
+      const count = nid ? noteCountForNode(nid) : 0;
+      if (count > 0) {
+        if (!existing) {
+          const dot = document.createElement('span');
+          dot.className = 'tree-row-note-dot';
+          dot.title = count === 1 ? '1 note' : `${count} notes`;
+          dot.setAttribute('aria-label', dot.title);
+          row.appendChild(dot);
+        } else {
+          existing.title = count === 1 ? '1 note' : `${count} notes`;
+        }
+      } else if (existing) {
+        existing.remove();
+      }
+    });
+  }
+
+  async function refreshIndicators() {
+    await loadNoteIndex();
+    applyTreeIndicators();
+    if (selectedNode) updateDetailNoteIndicator(selectedNode);
+  }
+
+  // Toggle the visibility of per-line note markers + the inline note
+  // highlights inside the detail panel so the user can read the source
+  // unobstructed and bring the notes back with a single click.
+  function toggleNotesVisibility() {
+    const detail = document.getElementById('left-detail-content');
+    if (!detail) return;
+    const hidden = detail.classList.toggle('notes-hidden');
+    const label = document.querySelector('#detail-note-indicator .notes-toggle-label');
+    if (label) label.textContent = hidden ? 'show notes' : 'notes';
+  }
+
+  // Update / inject the indicator badge in the detail header. The header is
+  // re-rendered on every showDetail() call, so this just patches the count
+  // when notes change without rerendering everything else.
+  function updateDetailNoteIndicator(nodeId) {
+    if (!nodeId) return;
+    const wrap = document.getElementById('detail-note-indicator');
+    if (!wrap) return;
+    const count = noteCountForNode(nodeId);
+    const badge = wrap.querySelector('.indicator-item');
+    if (count > 0) {
+      wrap.classList.remove('hidden');
+      if (badge) badge.textContent = String(count);
+    } else {
+      wrap.classList.add('hidden');
+    }
+  }
+
+  // Reset every in-memory cache. Annotations are stored per-project
+  // (`<project>/_apollo/annotations.json`), but node IDs collide across
+  // projects (e.g. `file::index.html` exists in many projects), so any
+  // cache keyed by node id will leak entries between projects unless
+  // we explicitly drop it on every project switch. Call this from the
+  // `/api/projects/open` flow.
+  function reset() {
+    _byNodeCache = {};
+    _noteCountsByNodeId = {};
+    _noteCountsByFilePath = {};
+    _noteIndexLoaded = false;
+    editingNoteId = null;
+    pendingSel = null;
+  }
+
+  return {
+    init,
+    reset,
+    applyToDetail,
+    toggleBookmark,
+    getForNode,
+    openTab,
+    refreshList,
+    currentSubFilter,
+    loadNoteIndex,
+    noteCountForNode,
+    applyTreeIndicators,
+    refreshIndicators,
+    updateDetailNoteIndicator,
+    toggleNotesVisibility,
+  };
+})();
+
+/* Build the bookmark-star button HTML for a node detail header. */
+function bookmarkButtonHtml(nodeId, nodeName) {
+  const safeId = String(nodeId || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  const safeName = String(nodeName || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  return `<button type="button" class="bookmark-toggle" title="Toggle bookmark" aria-pressed="false" onclick="Annotations.toggleBookmark('${safeId}', '${safeName}')">★</button>`;
+}
+
+/* Build the daisyUI indicator showing how many notes target this node.
+   Hidden by default; populated lazily by Annotations.updateDetailNoteIndicator()
+   so we don't have to await the index before rendering the header.
+   Clicking it toggles the visibility of the per-line note dots / popovers. */
+function noteIndicatorHtml(nodeId) {
+  const count = (typeof Annotations !== 'undefined' && Annotations.noteCountForNode)
+    ? Annotations.noteCountForNode(nodeId) : 0;
+  const hidden = count > 0 ? '' : ' hidden';
+  const noteIcon = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-3 h-3"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" /></svg>';
+  return `
+    <div id="detail-note-indicator" class="indicator${hidden}" title="Click to show/hide notes on this page">
+      <span class="indicator-item badge badge-primary badge-xs">${count}</span>
+      <button type="button" class="badge badge-sm badge-ghost gap-1" onclick="Annotations.toggleNotesVisibility()">${noteIcon} <span class="notes-toggle-label">notes</span></button>
+    </div>`;
+}
+
 /* ── Init ──────────────────────────────────────────────────────── */
 const IS_DEV_MODE = new URLSearchParams(location.search).get('dev') === 'true';
 if (IS_DEV_MODE) {
   document.getElementById('dev-toolbar')?.classList.remove('hidden');
+  // Reveal Graph 1 / Graph 2 variant tabs above the graph chart so we
+  // can A/B test stable-layout (Graph 2) vs. force-directed (Graph 1).
+  document.getElementById('graph-variant-tabs')?.classList.remove('hidden');
 }
 fetchIndexCount(); checkChatStatus(); loadFolderTree();
 // Load the graph on startup, but show the Welcome tab by default
 // (no auto-selection of the largest node).
-const _boot = () => { showWelcomePanel(); loadGraph(); };
+const _boot = () => { showWelcomePanel(); loadGraph(); Annotations.init(); };
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', _boot);
 } else {

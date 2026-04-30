@@ -30,7 +30,7 @@ tailwind.config = {
 <nav class="nav-sidebar bg-base-200 border-r border-base-300 flex flex-col" id="nav-sidebar">
   <div class="nav-header">
     <div class="nav-logo-icon bg-primary text-primary-content cursor-pointer" onclick="toggleNav()">AP</div>
-    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer</div></div>
+    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer · <span id="app-version">v1.1.0</span></div></div>
     <button type="button" class="btn btn-ghost btn-square btn-sm nav-collapse-btn" onclick="toggleNav()" aria-label="Collapse sidebar">
       <svg id="nav-collapse-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" /></svg>
     </button>
@@ -135,7 +135,15 @@ tailwind.config = {
       <div class="split-right flex-1" id="split-right">
         <div class="vsplit-pane flex-1">
           <div class="vsplit-top" id="vsplit-top">
+            <!-- Graph variant tabs — dev mode only (?dev=true). Lets us A/B
+                 test the current force-directed graph (Graph 1) against the
+                 stable-layout ECharts variant (Graph 2). -->
+            <div id="graph-variant-tabs" class="graph-variant-tabs hidden bg-base-200/85 border border-base-300" role="tablist">
+              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab active" data-graph-variant="1" onclick="switchGraphVariant('1')">Graph 1</button>
+              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab" data-graph-variant="2" onclick="switchGraphVariant('2')">Graph 2</button>
+            </div>
             <div id="graph-chart"></div>
+            <div id="graph-chart-2" class="hidden"></div>
             <div id="loading-overlay" class="bg-base-100/90 text-base-content/50 text-sm">Loading graph...</div>
             <div class="depth-control bg-base-200/85 border border-base-300" title="Control how many nodes are displayed">
               <label for="depth-slider" class="text-[10px] font-semibold uppercase tracking-wider opacity-70 whitespace-nowrap">Depth</label>
@@ -160,7 +168,8 @@ tailwind.config = {
           <div class="vsplit-handle bg-base-300" id="vsplit-handle"></div>
           <div class="vsplit-bottom" id="vsplit-bottom">
             <div id="wordcloud-container"></div>
-            <button type="button" id="wordcloud-toggle" class="btn btn-xs btn-outline btn-primary hidden" onclick="toggleWordCloud()">Show More</button>
+            <div id="wordcloud-legend" class="hidden"></div>
+            <button type="button" id="wordcloud-toggle" class="btn btn-xs btn-outline btn-primary hidden" onclick="toggleWordCloud()" title="Cycle: Strong → Show More → Show All Relationships">Show More</button>
             <button type="button" class="pane-expand-btn btn btn-ghost btn-xs" onclick="togglePaneFullscreen('vsplit-bottom')" title="Expand">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" /></svg>
             </button>
@@ -454,7 +463,7 @@ tailwind.config = {
       <section class="settings-tab-panel hidden" data-panel="plugins">
         <div class="mb-8">
           <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Installed Plugins</h3>
-          <p class="text-xs opacity-50 mb-3">Plugins detected on disk under <code class="font-mono">plugins/</code>. This list is read-only — drop a new folder/file in <code class="font-mono">plugins/</code> and reload to install. See <code class="font-mono">guides/making_plugins.md</code>.</p>
+          <p class="text-xs opacity-50 mb-3">Plugins detected on disk under <code class="font-mono">plugins/</code>. Use the toggle on each card to enable / disable a plugin live, or expand <em>Settings</em> to edit its <code class="font-mono">config.json</code> knobs without restarting the server. New plugins are picked up by dropping a new folder/file under <code class="font-mono">plugins/</code> and reloading. See <code class="font-mono">guides/making_plugins.md</code>.</p>
           <div id="plugins-list" class="text-xs">
             <span class="opacity-50">Loading…</span>
           </div>
@@ -463,15 +472,7 @@ tailwind.config = {
     </div>
   </div>
 
-  <!-- ── Status Bar ──────────────────────────────────────────── -->
-  <footer class="h-6 bg-base-200 border-t border-base-300 flex items-center px-3 text-[10px] opacity-50 gap-4 flex-shrink-0">
-    <div class="flex items-center gap-1">
-      <span class="w-1.5 h-1.5 rounded-full bg-base-content/30" id="status-dot"></span>
-      <span id="status-text">Ready</span>
-    </div>
-    <span id="status-nodes"></span>
-    <span id="status-edges"></span>
-  </footer>
+
 </main>
 
 <!-- ═══ INDEXING PROGRESS MODAL ═══ -->
@@ -614,6 +615,30 @@ tailwind.config = {
     </div>
   </div>
 </dialog>
+
+<!-- ═══ FLOATING SELECTION TOOLBAR (highlights & notes) ═══ -->
+<div id="selection-toolbar" role="toolbar" aria-label="Highlight selection">
+  <button type="button" class="color-swatch" data-color="yellow" title="Yellow"></button>
+  <button type="button" class="color-swatch" data-color="green"  title="Green"></button>
+  <button type="button" class="color-swatch" data-color="blue"   title="Blue"></button>
+  <button type="button" class="color-swatch" data-color="red"    title="Red"></button>
+  <button type="button" class="color-swatch" data-color="purple" title="Purple"></button>
+  <button type="button" class="color-swatch" data-color="gray"   title="Gray"></button>
+  <span class="sel-divider"></span>
+  <button type="button" class="sel-btn" data-action="note" title="Add Note">📝 Note</button>
+  <button type="button" class="sel-btn" data-action="close" title="Close" aria-label="Close">✕</button>
+</div>
+
+<!-- ═══ NOTE EDITOR POPOVER ═══ -->
+<div id="note-editor" role="dialog" aria-label="Add note">
+  <div class="text-xs opacity-60 font-semibold uppercase tracking-wider">Note</div>
+  <div class="note-quote" id="note-editor-quote"></div>
+  <textarea id="note-editor-textarea" placeholder="Write your note in Markdown…"></textarea>
+  <div class="editor-actions">
+    <button type="button" class="sel-btn" data-action="cancel">Cancel</button>
+    <button type="button" class="sel-btn btn btn-primary btn-xs" data-action="save">Save</button>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

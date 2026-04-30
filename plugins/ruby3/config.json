@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "extensions": [".rb"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot).",
+  "extract_comments": true,
+  "_extract_comments": "Extract `# TODO`-style comment nodes from each file.",
+  "comment_tags": ["TODO", "FIXME", "NOTE", "HACK", "XXX"],
+  "_comment_tags": "Tags surfaced as comment nodes when `extract_comments` is true.",
+  "extract_calls": true,
+  "_extract_calls": "Walk method bodies for callsites. Disable on large codebases for faster indexing.",
+  "ignore_dirs": [
+    "vendor",
+    "tmp",
+    "log",
+    ".bundle",
+    "coverage"
+  ],
+  "_ignore_dirs": "Folder names the indexer skips when this plugin is enabled.",
+  "ignore_files": [
+    "*.gem",
+    "*.rbc"
+  ],
+  "_ignore_files": "Glob patterns for files the indexer should skip."
+}

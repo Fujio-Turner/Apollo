@@ -72,6 +72,18 @@ body { font-family: 'Inter', sans-serif; display: flex; }
 .tree-row .tree-icon { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.7; }
 .tree-row .tree-label { overflow: hidden; text-overflow: ellipsis; }
 .tree-row.is-file .tree-icon { color: oklch(var(--p)); }
+/* Note-indicator dot rendered on file rows that have at least one saved note.
+   Uses the daisyUI primary color so it matches the existing accent palette. */
+.tree-row .tree-row-note-dot {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: oklch(var(--p));
+  box-shadow: 0 0 0 1.5px oklch(var(--b1));
+}
+.tree-row.tree-row-active .tree-row-note-dot { background: oklch(var(--pc)); }
 .file-badge {
   flex-shrink: 0;
   width: 18px;
@@ -167,6 +179,20 @@ body { font-family: 'Inter', sans-serif; display: flex; }
 .vsplit-bottom { flex: 1; min-height: 80px; overflow: hidden; position: relative; }
 #wordcloud-container { width: 100%; height: 100%; }
 #wordcloud-toggle { position: absolute; bottom: 6px; right: 6px; z-index: 5; }
+#wordcloud-legend {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  z-index: 5;
+  font-size: 10px;
+  font-family: 'Inter', sans-serif;
+  color: oklch(var(--bc) / 0.6);
+  background: oklch(var(--b1) / 0.7);
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+}
 
 /* ── Pane Expand Button ──────────────────────────────────────── */
 .pane-expand-btn { position: absolute; top: 6px; left: 6px; z-index: 10; opacity: 0.5; transition: opacity 0.15s; }
@@ -258,8 +284,32 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 
 /* ── Graph / Charts ──────────────────────────────────────────── */
 #graph-chart { width: 100%; height: 100%; }
+#graph-chart-2 { width: 100%; height: 100%; }
+#graph-chart-2.hidden { display: none; }
 #loading-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 5; }
 #loading-overlay.hidden { display: none; }
+
+/* ── Dev-mode Graph Variant Tabs ─────────────────────────────── */
+.graph-variant-tabs {
+  position: absolute;
+  top: 6px;
+  left: 44px;          /* sits right of .pane-expand-btn (top:6px,left:6px) */
+  z-index: 11;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  opacity: 0.85;
+  transition: opacity 0.15s;
+}
+.graph-variant-tabs:hover { opacity: 1; }
+.graph-variant-tabs.hidden { display: none; }
+.graph-variant-tab.active {
+  background: oklch(var(--p));
+  color: oklch(var(--pc));
+}
 
 /* ── Markdown Content ────────────────────────────────────────── */
 .md-content { font-size: 13px; line-height: 1.7; }
@@ -407,6 +457,73 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 .rr-confidence.high::before { background: #22c55e; }
 .rr-confidence.med::before  { background: #eab308; }
 .rr-confidence.low::before  { background: #ef4444; }
+
+/* AI trace panel — collapsible per-message audit of every step the AI
+   took (request → tool calls → final stream / done). Lives just under
+   the assistant bubble so the user can verify what the model actually
+   did, with what arguments, and how long each tool took.
+
+   The panel is rendered as a sibling of the daisyUI `.chat` wrapper (not
+   a child) because the wrapper is a CSS grid with reserved cells; a bare
+   child would land in the avatar column. We then indent it to match the
+   bubble's column via the immediately-preceding `.chat-start` selector. */
+.chat-trace {
+  display: block;
+  margin: 2px 0 6px 0;
+}
+/* Trace belongs to the assistant bubble that immediately precedes it.
+   daisyUI `.chat-start` aligns the bubble to the left edge of the
+   message column, so no extra inset is needed; the existing left padding
+   of `#chat-messages` already gives us breathing room. */
+.chat.chat-start + .chat-trace { margin-left: 0; }
+/* User bubbles (`.chat-end`) never spawn a trace; if one ever does end
+   up here, hide it so it doesn't clutter the layout. */
+.chat.chat-end + .chat-trace { display: none; }
+.chat-trace .chat-trace-toggle {
+  font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size: 10px;
+  opacity: 0.7;
+  text-transform: none;
+}
+.chat-trace .chat-trace-toggle:hover { opacity: 1; }
+.chat-trace .chat-trace-caret { display: inline-block; width: 9px; }
+.chat-trace .chat-trace-body {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 6px;
+  background: rgba(0,0,0,0.04);
+  font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow-y: auto;
+}
+[data-theme="dark"] .chat-trace .chat-trace-body {
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.10);
+}
+.chat-trace .chat-trace-row {
+  display: flex; gap: 6px; align-items: flex-start;
+  padding: 1px 0;
+  word-break: break-word;
+}
+.chat-trace .chat-trace-icon {
+  flex: 0 0 14px;
+  text-align: center;
+  opacity: 0.85;
+}
+.chat-trace .chat-trace-text { flex: 1 1 auto; min-width: 0; }
+.chat-trace .trace-preview {
+  margin-top: 2px;
+  padding: 2px 6px;
+  border-left: 2px solid rgba(0,0,0,0.15);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+[data-theme="dark"] .chat-trace .trace-preview {
+  border-left-color: rgba(255,255,255,0.20);
+}
 #chat-messages .chat-bubble { font-size: 12px; line-height: 1.6; max-width: 100%; }
 #chat-messages .chat-bubble .md-content { font-size: 12px; line-height: 1.7; }
 #chat-messages .chat-bubble .md-content p { margin: 4px 0; }
@@ -492,3 +609,252 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 .tagify { --tag-pad: 0.25em 0.5em; }
 .tagify__tag[data-exclude] > div { background: var(--er); }
 .tagify__tag[data-include] > div { background: var(--su); }
+
+/* ── User Annotations: Highlights / Notes / Bookmarks ─────────── */
+.user-highlight { padding: 0 1px; border-radius: 2px; cursor: pointer; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.user-highlight[data-color="red"]    { background: rgba(239, 68, 68,  0.35); }
+.user-highlight[data-color="yellow"] { background: rgba(250, 204, 21, 0.45); }
+.user-highlight[data-color="green"]  { background: rgba(34, 197, 94,  0.35); }
+.user-highlight[data-color="blue"]   { background: rgba(59, 130, 246, 0.35); }
+.user-highlight[data-color="purple"] { background: rgba(168, 85, 247, 0.35); }
+.user-highlight[data-color="gray"]   { background: rgba(156, 163, 175,0.45); }
+.user-highlight.is-note { box-shadow: inset 0 -2px 0 oklch(var(--p)); }
+.user-highlight:hover { filter: brightness(1.15); }
+
+/* ── Per-line note marker (right-margin dot + hover popover) ───────
+   A small light-purple dot pinned to the right edge of any .code-line
+   that carries a note. Hovering reveals a popover with the note body
+   so you can read a saved note without opening the full editor. */
+.code-line { position: relative; }
+.code-line.has-note { background: rgba(168, 85, 247, 0.06); }
+.line-note-marker {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: rgba(168, 85, 247, 0.85); /* light purple */
+  box-shadow: 0 0 0 2px oklch(var(--b1)), 0 0 6px rgba(168, 85, 247, 0.4);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.line-note-marker:hover { background: rgba(168, 85, 247, 1); }
+/* Inline variant rendered after a highlight span inside .md-content
+   (markdown / HTML file viewers) where there is no .code-line gutter. */
+.line-note-marker.inline {
+  position: relative;
+  display: inline-block;
+  vertical-align: middle;
+  margin: 0 4px;
+  top: -1px;
+  right: auto;
+  transform: none;
+}
+.line-note-marker.inline.orphan {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0 8px 0;
+}
+.line-note-popover {
+  display: none;
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  max-width: 320px;
+  min-width: 160px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: oklch(var(--b2));
+  color: oklch(var(--bc));
+  border: 1px solid oklch(var(--p) / 0.4);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  z-index: 30;
+  pointer-events: none;
+}
+.line-note-marker:hover .line-note-popover,
+.line-note-marker:focus .line-note-popover { display: block; }
+
+/* When the user toggles notes off, hide the markers, drop the line tint,
+   and strip the inline note styling so the source reads cleanly. */
+#left-detail-content.notes-hidden .line-note-marker { display: none; }
+#left-detail-content.notes-hidden .code-line.has-note { background: transparent; }
+#left-detail-content.notes-hidden .user-highlight.is-note[data-color] {
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+#left-detail-content.notes-hidden .notes-margin { display: none; }
+
+/* ── Google-Docs-style margin notes overlay ───────────────────
+   Cards float on top of the right edge of the document instead of
+   reflowing the content into a narrower column.  They stay translucent
+   until hovered so they don't fight the underlying text for attention. */
+#left-detail-content { position: relative; }
+.notes-margin {
+  position: absolute;
+  top: 0;
+  right: 8px;
+  width: 240px;
+  max-width: 35%;                 /* never claim more than 35% of detail */
+  pointer-events: none;          /* let clicks fall through except on cards */
+  z-index: 5;
+}
+.notes-margin-card {
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: auto;
+  background: oklch(var(--b1) / 0.78);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid oklch(var(--b3) / 0.7);
+  border-left: 3px solid rgba(168, 85, 247, 0.85);
+  border-radius: 6px;
+  padding: 6px 8px 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  font-size: 11px;
+  line-height: 1.45;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease, top 0.18s ease;
+}
+.notes-margin-card:hover {
+  opacity: 1;
+  transform: translateX(-2px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.30);
+  background: oklch(var(--b1));
+  z-index: 6;
+}
+.notes-margin-card.orphan { border-left-color: oklch(var(--wa)); }
+.notes-margin-card .nm-card-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10px; opacity: 0.75; margin-bottom: 4px;
+}
+.notes-margin-card .nm-dot {
+  width: 8px; height: 8px; border-radius: 9999px;
+  background: rgba(168, 85, 247, 0.85);
+  flex-shrink: 0;
+}
+.notes-margin-card .nm-dot[data-color="red"]    { background: #ef4444; }
+.notes-margin-card .nm-dot[data-color="yellow"] { background: #facc15; }
+.notes-margin-card .nm-dot[data-color="green"]  { background: #22c55e; }
+.notes-margin-card .nm-dot[data-color="blue"]   { background: #3b82f6; }
+.notes-margin-card .nm-dot[data-color="purple"] { background: #a855f7; }
+.notes-margin-card .nm-dot[data-color="gray"]   { background: #9ca3af; }
+.notes-margin-card .nm-time { font-family: 'JetBrains Mono','Fira Code',monospace; }
+.notes-margin-card .nm-orphan-tag {
+  font-size: 9px; padding: 1px 5px; border-radius: 9999px;
+  background: oklch(var(--wa) / 0.18); color: oklch(var(--wa));
+  border: 1px solid oklch(var(--wa) / 0.4);
+}
+.notes-margin-card .nm-card-delete {
+  margin-left: auto;
+  background: transparent; border: none; color: inherit;
+  opacity: 0.45; cursor: pointer; font-size: 12px; line-height: 1;
+  padding: 0 2px;
+}
+.notes-margin-card .nm-card-delete:hover { opacity: 1; color: oklch(var(--er)); }
+.notes-margin-card .nm-quote {
+  border-left: 2px solid oklch(var(--p) / 0.5);
+  padding: 2px 0 2px 6px; margin-bottom: 6px;
+  font-size: 10.5px; opacity: 0.75;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 60px; overflow: hidden;
+}
+.notes-margin-card .nm-body {
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 200px; overflow: auto;
+}
+
+/* Brief flash when a margin card scrolls its anchor into view. */
+.user-highlight.nm-flash {
+  animation: nm-flash-anim 1.2s ease-out;
+}
+@keyframes nm-flash-anim {
+  0%   { box-shadow: 0 0 0 3px oklch(var(--p) / 0.0), inset 0 -2px 0 oklch(var(--p)); }
+  30%  { box-shadow: 0 0 0 3px oklch(var(--p) / 0.7), inset 0 -2px 0 oklch(var(--p)); }
+  100% { box-shadow: 0 0 0 3px oklch(var(--p) / 0.0), inset 0 -2px 0 oklch(var(--p)); }
+}
+
+/* On narrow split panes the overlay cards shrink so they cover less of
+   the underlying document. */
+@media (max-width: 900px) {
+  .notes-margin { width: 190px; }
+}
+
+/* Floating selection toolbar */
+#selection-toolbar { position: absolute; z-index: 9999; display: none; padding: 5px 6px; border-radius: 8px; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); box-shadow: 0 4px 16px rgba(0,0,0,0.18); gap: 5px; align-items: center; }
+#selection-toolbar.visible { display: inline-flex; }
+#selection-toolbar .color-swatch { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.18); cursor: pointer; padding: 0; }
+#selection-toolbar .color-swatch:hover { transform: scale(1.18); }
+#selection-toolbar .color-swatch[data-color="red"]    { background: #ef4444; }
+#selection-toolbar .color-swatch[data-color="yellow"] { background: #facc15; }
+#selection-toolbar .color-swatch[data-color="green"]  { background: #22c55e; }
+#selection-toolbar .color-swatch[data-color="blue"]   { background: #3b82f6; }
+#selection-toolbar .color-swatch[data-color="purple"] { background: #a855f7; }
+#selection-toolbar .color-swatch[data-color="gray"]   { background: #9ca3af; }
+#selection-toolbar .sel-btn { font-size: 11px; padding: 2px 8px; border-radius: 4px; border: 1px solid oklch(var(--b3)); background: transparent; color: oklch(var(--bc)); cursor: pointer; }
+#selection-toolbar .sel-btn:hover { background: oklch(var(--b2)); }
+#selection-toolbar .sel-divider { width: 1px; height: 18px; background: oklch(var(--b3)); margin: 0 2px; }
+
+/* Note editor popover */
+#note-editor { position: absolute; z-index: 9999; display: none; flex-direction: column; gap: 6px; padding: 10px; min-width: 280px; max-width: 380px; border-radius: 8px; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); box-shadow: 0 6px 24px rgba(0,0,0,0.22); }
+#note-editor.visible { display: flex; }
+#note-editor .note-quote { font-size: 11px; padding: 4px 8px; border-left: 3px solid oklch(var(--p)); background: oklch(var(--b2)); border-radius: 0 4px 4px 0; max-height: 60px; overflow-y: auto; opacity: 0.85; white-space: pre-wrap; word-break: break-word; }
+#note-editor textarea { width: 100%; min-height: 80px; padding: 6px; font-size: 12px; border-radius: 4px; border: 1px solid oklch(var(--b3)); background: oklch(var(--b1)); color: oklch(var(--bc)); resize: vertical; font-family: inherit; box-sizing: border-box; }
+#note-editor .editor-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* Bookmark toggle in node detail header */
+.bookmark-toggle { background: transparent; border: none; cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1; opacity: 0.45; transition: opacity 0.15s, transform 0.15s; }
+.bookmark-toggle:hover { opacity: 0.9; transform: scale(1.1); }
+.bookmark-toggle.active { opacity: 1; color: #f59e0b; }
+
+/* Annotations sub-tab (lives inside My Hub) */
+.ann-tab { font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: oklch(var(--bc)); cursor: pointer; }
+.ann-tab:hover { background: oklch(var(--b3)); }
+.ann-tab.active { background: oklch(var(--p)); color: oklch(var(--pc)); }
+.ann-tab.active:hover { background: oklch(var(--p)); }
+.ann-list { overflow-y: auto; }
+.ann-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid oklch(var(--b3)); border-radius: 6px; background: oklch(var(--b1)); }
+.ann-row + .ann-row { margin-top: 8px; }
+.ann-row-head { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.ann-row-type { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: oklch(var(--b3)); text-transform: uppercase; letter-spacing: 0.04em; }
+.ann-row-target { flex: 1; font-family: ui-monospace, SFMono-Regular, monospace; opacity: 0.8; cursor: pointer; color: oklch(var(--p)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ann-row-target:hover { text-decoration: underline; }
+.ann-row-time { font-size: 10px; opacity: 0.55; flex-shrink: 0; }
+.ann-row-content { font-size: 12px; white-space: pre-wrap; word-break: break-word; padding: 4px 0; }
+.ann-row-color-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.ann-row-color-dot[data-color="red"]    { background: #ef4444; }
+.ann-row-color-dot[data-color="yellow"] { background: #facc15; }
+.ann-row-color-dot[data-color="green"]  { background: #22c55e; }
+.ann-row-color-dot[data-color="blue"]   { background: #3b82f6; }
+.ann-row-color-dot[data-color="purple"] { background: #a855f7; }
+.ann-row-color-dot[data-color="gray"]   { background: #9ca3af; }
+.ann-row-actions { display: flex; gap: 8px; margin-top: 4px; }
+.ann-row-actions .ann-action { font-size: 11px; padding: 2px 8px; border-radius: 4px; border: 1px solid oklch(var(--b3)); background: transparent; color: oklch(var(--bc)); cursor: pointer; }
+.ann-row-actions .ann-action:hover { background: oklch(var(--b2)); }
+.ann-row-actions .ann-action.danger:hover { background: rgba(239,68,68,0.15); border-color: #ef4444; color: #ef4444; }
+.ann-empty { text-align: center; padding: 60px 20px; opacity: 0.55; font-size: 12px; }
+
+/* ── My Hub: Recent activity list ──────────────────────────────── */
+#hub-recent { display: flex; flex-direction: column; gap: 6px; }
+.recent-item { padding: 8px 10px; border-radius: 6px; border: 1px solid oklch(var(--b3) / 0.5); cursor: pointer; transition: background 0.12s, border-color 0.12s; }
+.recent-item:hover { border-color: oklch(var(--p) / 0.6); }
+.recent-item.recent-chat { background: oklch(var(--p) / 0.08); }
+.recent-item.recent-chat:hover { background: oklch(var(--p) / 0.16); }
+.recent-item.recent-note { background: oklch(var(--wa, var(--p)) / 0.18); }
+.recent-item.recent-note:hover { background: oklch(var(--wa, var(--p)) / 0.28); }
+.recent-row { display: flex; align-items: center; gap: 8px; }
+.recent-tag { font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 3px; letter-spacing: 0.06em; flex-shrink: 0; }
+.recent-chat .recent-tag { background: oklch(var(--p) / 0.35); color: oklch(var(--pc)); }
+.recent-note .recent-tag { background: oklch(var(--wa, var(--p)) / 0.5); color: oklch(var(--bc)); }
+.recent-title { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-time { font-size: 10px; opacity: 0.55; flex-shrink: 0; }
+.recent-sub { font-size: 10px; opacity: 0.6; font-family: ui-monospace, SFMono-Regular, monospace; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

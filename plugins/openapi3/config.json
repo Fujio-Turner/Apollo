@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "extensions": [".yaml", ".yml", ".json"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot).",
+  "openapi_pattern": "openapi|swagger",
+  "_openapi_pattern": "Regex pattern to identify OpenAPI spec files by name.",
+  "ignore_dirs": [
+    ".git",
+    "node_modules",
+    "dist"
+  ],
+  "_ignore_dirs": "Folder names the indexer skips when this plugin is enabled.",
+  "ignore_files": [],
+  "_ignore_files": "Glob patterns for files the indexer should skip."
+}

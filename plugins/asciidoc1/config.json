@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "extensions": [".adoc", ".asciidoc"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot)."
+}

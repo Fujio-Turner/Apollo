@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing and PDF files are not indexed.",
+  "extensions": [".pdf"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot).",
+  "max_file_size_bytes": 52428800,
+  "_max_file_size_bytes": "Skip PDF files larger than this many bytes (default 50 MB) to keep indexing snappy on huge documents.",
+  "extract_pages": true,
+  "_extract_pages": "Index each page's text as a `page` node.",
+  "extract_outline": true,
+  "_extract_outline": "Walk the PDF's bookmark/outline tree and emit each entry as a section node.",
+  "extract_metadata": true,
+  "_extract_metadata": "Pull document-level metadata (Title, Author, Subject, Keywords) into a `frontmatter` node.",
+  "decrypt_with_empty_password": true,
+  "_decrypt_with_empty_password": "Try decrypting password-protected PDFs with an empty password (handles the common case where a PDF is technically encrypted but no password was set).",
+  "ignore_dirs": [],
+  "_ignore_dirs": "Folder names the indexer skips when this plugin is enabled.",
+  "ignore_files": [],
+  "_ignore_files": "Glob patterns for files the indexer should skip.",
+  "ignore_dir_markers": [],
+  "_ignore_dir_markers": "Sentinel file names that mark an entire directory as ignorable."
+}

@@ -1,0 +1,4 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch for .env file parsing."
+}

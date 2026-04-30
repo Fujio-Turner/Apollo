@@ -19,6 +19,7 @@ import asyncio
 import json as json_mod
 import logging
 import os
+import threading
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -130,11 +131,27 @@ def _load_settings():
         settings = dict(DEFAULT_SETTINGS)
     # Refresh the plugins section from the live plugins/ directory so
     # settings.json is always an accurate mirror of what's installed.
+    # IMPORTANT: the ``config`` slot inside each plugin entry is reserved
+    # for **user overrides** written by ``PATCH /api/settings/plugins/
+    # <name>/config`` (Phase 2B). We must therefore strip the on-disk
+    # ``config.json`` mirror that ``detect_installed_plugins()`` puts
+    # into that slot — otherwise the next call to ``_load_settings``
+    # would stomp anything the user just patched. The on-disk values
+    # are still available live via ``detect_installed_plugins()`` /
+    # ``load_plugin_config()``; we just don't *persist* them here.
     try:
         from apollo.projects.settings import detect_installed_plugins
         detected = detect_installed_plugins()
-        if settings.get("plugins") != detected:
-            settings["plugins"] = detected
+        existing = settings.get("plugins") or {}
+        new_plugins: dict = {}
+        for name, meta in detected.items():
+            entry = {k: v for k, v in meta.items() if k != "config"}
+            user_override = (existing.get(name) or {}).get("config")
+            if isinstance(user_override, dict) and user_override:
+                entry["config"] = user_override
+            new_plugins[name] = entry
+        if new_plugins != settings.get("plugins"):
+            settings["plugins"] = new_plugins
             _save_settings(settings)
     except Exception:
         # Detection is best-effort; never block settings load on it.
@@ -146,6 +163,27 @@ def _save_settings(settings):
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
         json_mod.dump(settings, f, indent=2)
+
+
+def _record_last_project(path):
+    """Persist the absolute path of the most recently opened project so we
+    can auto-restore it on server restart. Used to keep project-scoped
+    features (annotations, etc.) working without forcing the user to
+    re-open the folder via the UI after every restart."""
+    try:
+        settings = _load_settings()
+        settings["last_open_project"] = str(path)
+        _save_settings(settings)
+    except Exception:
+        # Best-effort; never block project open on a settings write failure.
+        pass
+
+
+def _get_last_project():
+    try:
+        return _load_settings().get("last_open_project") or None
+    except Exception:
+        return None
 
 
 def _mask_key(key: str) -> str:
@@ -180,6 +218,23 @@ class ConnectionManager:
             self.disconnect(ws)
 
 
+def _build_active_parsers() -> list:
+    """Construct the active parser list from plugin discovery.
+
+    Re-runs :func:`apollo.plugins.discover_plugins` (which honours each
+    plugin's ``config.json`` ``enabled`` flag and merged user overrides
+    from ``data/settings.json``) and appends a ``TextFileParser`` fallback
+    so plain text / data files are still indexed when no plugin claims
+    them.
+    """
+    from apollo.plugins import discover_plugins
+    from apollo.parser import TextFileParser
+    found = list(discover_plugins())
+    if not any(isinstance(p, TextFileParser) for p in found):
+        found.append(TextFileParser())
+    return found
+
+
 def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
     """Create and configure the FastAPI application."""
     # Bring up logging early using whatever the user has saved in
@@ -203,7 +258,24 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     
     # Initialize ProjectManager for project lifecycle management
     project_manager = ProjectManager(version=version)
-    
+
+    # Auto-open the project on startup so project-scoped features
+    # (annotations, etc.) work without forcing the user to re-open the
+    # folder via the UI after every restart. We try, in order:
+    #   1) the directory the server was launched against (--watch-dir)
+    #   2) the path recorded in settings.json by the previous session
+    # Either path needs an `_apollo/apollo.json` manifest to count.
+    from pathlib import Path as _Path
+    _candidates = [p for p in (root_dir, _get_last_project()) if p]
+    for _candidate in _candidates:
+        try:
+            if (_Path(_candidate) / "_apollo" / "apollo.json").exists():
+                project_manager.open(_candidate)
+                _record_last_project(_candidate)
+                break
+        except Exception:
+            logger.exception("failed to auto-open project at startup for %s", _candidate)
+
     # Initialize ReindexService for background graph freshness
     reindex_service: Optional[ReindexService] = None
     if root_dir:
@@ -297,6 +369,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         chat_service = ChatService(
             graph, search=search, embedder=embedder, root_dir=root_dir,
             settings_provider=_load_settings,
+            project_manager=project_manager,
         )
     except Exception:
         chat_service = None
@@ -323,18 +396,51 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     except Exception:
         pass
 
-    # Set up chat history persistence
+    # Set up chat history persistence.
+    #
+    # ``project_manager`` is wired in so that thread storage is scoped to
+    # the active project: each folder gets its own _apollo/chat_history.json
+    # (JSON backend) or filtered by project_id (CBL backend). Without this
+    # the My Hub "Recents" panel would leak chats from one folder to the
+    # next when the user switches projects.
     chat_history = None
     try:
         from apollo.chat.history import ChatHistory
-        chat_history = ChatHistory(cbl_store=store if backend == "cblite" else None)
+        chat_history = ChatHistory(
+            cbl_store=store if backend == "cblite" else None,
+            project_manager=project_manager,
+        )
     except Exception:
         from apollo.chat.history import ChatHistory
-        chat_history = ChatHistory()
+        chat_history = ChatHistory(project_manager=project_manager)
 
     ws_manager = ConnectionManager()
     watcher = None
     _event_loop = None
+
+    # ── Active parser list (Phase 2B) ────────────────────────────
+    # `parsers` is the back-compat argument from CLI callers. The
+    # internal `_active_parsers` list is what `/api/index` and the
+    # PATCH-driven `_reload_parsers()` mutate at runtime so a plugin
+    # config flip takes effect with no server restart. We seed it from
+    # plugin discovery; a lock guards in-place mutation so a reload
+    # cannot race with an in-flight indexing pass.
+    _parsers_lock = threading.Lock()
+    _active_parsers: list = _build_active_parsers()
+
+    def _reload_parsers() -> int:
+        """Re-run plugin discovery and atomically swap ``_active_parsers``.
+
+        Mutates the list in place under ``_parsers_lock`` so any caller
+        that captured the reference (e.g. the running file watcher) sees
+        the new contents next time it iterates. Returns the new parser
+        count.
+        """
+        new_list = _build_active_parsers()
+        with _parsers_lock:
+            _active_parsers[:] = new_list
+        logger.info("plugin parsers reloaded: %d active", len(new_list))
+        return len(new_list)
 
     def _ws_on_update(update: dict):
         """Called from watcher thread — schedule async broadcast on event loop."""
@@ -358,7 +464,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logging.warning(f"Failed to start reindex service: {e}")
 
     # ── Register project management routes ────────────────────────
-    register_project_routes(app, project_manager, store, backend)
+    register_project_routes(app, project_manager, store, backend, on_project_open=_record_last_project)
 
     # ------------------------------------------------------------------ API --
 
@@ -440,6 +546,21 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         # absolute path) regardless of which directory nodes were indexed.
         root_dir = target
 
+        # Ensure a project manifest is bound to this target so project-scoped
+        # endpoints (annotations, etc.) work even when /api/index is called
+        # without going through /api/projects/open first.
+        try:
+            already_open = (
+                project_manager.manifest is not None
+                and project_manager.root_dir is not None
+                and os.path.abspath(str(project_manager.root_dir)) == os.path.abspath(target)
+            )
+            if not already_open:
+                project_manager.open(target)
+            _record_last_project(target)
+        except Exception:
+            logger.exception("failed to auto-open project for %s", target)
+
         _indexing_status = {
             "active": True,
             "directory": target,
@@ -463,12 +584,19 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             if parsers:
                 build_parsers = parsers
             else:
-                build_parsers = [PythonParser(), TextFileParser()]
-                try:
-                    from apollo.parser import TreeSitterParser
-                    build_parsers.insert(0, TreeSitterParser())
-                except Exception:
-                    pass
+                # Snapshot the live plugin-driven parser list under the
+                # lock so a concurrent _reload_parsers() can't mutate it
+                # mid-build. Falls back to the legacy hard-coded set
+                # only if discovery returned nothing (no plugins).
+                with _parsers_lock:
+                    build_parsers = list(_active_parsers)
+                if not build_parsers:
+                    build_parsers = [PythonParser(), TextFileParser()]
+                    try:
+                        from apollo.parser import TreeSitterParser
+                        build_parsers.insert(0, TreeSitterParser())
+                    except Exception:
+                        pass
 
             t0 = time.time()
             logger.info("indexing step 1/4: parsing files in %s", target)
@@ -553,6 +681,24 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 n_files, n_nodes, n_edges, total,
             )
 
+            # Persist final stats to the project manifest so the bootstrap
+            # wizard's "Project ready!" page (and /api/projects/current)
+            # reports accurate counts instead of the zero defaults.
+            try:
+                if (
+                    project_manager.manifest is not None
+                    and project_manager.root_dir is not None
+                    and os.path.abspath(str(project_manager.root_dir)) == os.path.abspath(target)
+                ):
+                    project_manager.mark_index_complete(
+                        files_indexed=n_files,
+                        nodes=n_nodes,
+                        edges=n_edges,
+                        elapsed_seconds=total,
+                    )
+            except Exception:
+                logger.exception("failed to persist project index stats")
+
             _indexing_status.update(
                 active=False, step=4, step_label="Complete",
                 detail=f"{n_files} files, {n_nodes} nodes, {n_edges} edges in {total:.1f}s",
@@ -578,7 +724,11 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
        if chat_service is not None:
            try:
                from apollo.chat.service import ChatService
-               chat_service = ChatService(graph, search=None, embedder=embedder, root_dir=root_dir)
+               chat_service = ChatService(
+                   graph, search=None, embedder=embedder, root_dir=root_dir,
+                   settings_provider=_load_settings,
+                   project_manager=project_manager,
+               )
            except Exception:
                chat_service = None
        return {"status": "deleted", "total_nodes": 0, "total_edges": 0}
@@ -699,7 +849,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
         cat_index = {name: idx for idx, name in enumerate(category_set)}
 
-        max_deg = max(degree[n] for n in node_ids) if node_ids else 1
+        max_deg = max((degree[n] for n in node_ids), default=1) or 1
 
         nodes_out = []
         for nid in node_ids:
@@ -1018,7 +1168,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         node_id: str,
         depth: int = Query(1, ge=1, le=5),
         edge_types: Optional[str] = Query(None, description="Comma-separated edge types"),
-        direction: str = Query("both", regex="^(in|out|both)$"),
+        direction: str = Query("both", pattern="^(in|out|both)$"),
     ):
         """BFS-walk the graph from `node_id`. Mirrors the AI's `get_neighbors` tool.
 
@@ -1139,19 +1289,63 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
 
     @app.get("/api/wordcloud")
-    def wordcloud(path: Optional[str] = Query(None)):
+    def wordcloud(
+        path: Optional[str] = Query(None),
+        mode: str = Query("strong"),
+    ):
+        """
+        Idea Cloud weighted by graph strength (in + out degree), aggregated
+        across nodes sharing the same display name. The `mode` parameter
+        controls how aggressively the long tail is hidden:
+
+          - strong   : top 30, strength >= 2  (default; readable headline)
+          - relevant : top 100, strength >= 2 (compact "Show More" view)
+          - all      : everything, capped at 500 (full "show every relationship")
+        """
+        strengths: dict[str, float] = defaultdict(float)
         counts: dict[str, int] = defaultdict(int)
-        for _, data in graph.nodes(data=True):
+        for nid, data in graph.nodes(data=True):
             ntype = data.get("type", "")
             if ntype in EXCLUDE_TYPES_WORDCLOUD:
                 continue
             if path and not data.get("path", "").startswith(path):
                 continue
             name = data.get("name", "")
-            if name:
-                counts[name] += 1
+            if not name:
+                continue
+            try:
+                deg = graph.degree(nid)
+            except Exception:
+                deg = 0
+            strengths[name] += deg
+            counts[name] += 1
 
-        return [{"name": name, "value": count} for name, count in counts.items()]
+        items = [
+            {"name": n, "value": float(strengths[n]), "count": counts[n]}
+            for n in strengths
+        ]
+        items.sort(key=lambda x: x["value"], reverse=True)
+        total = len(items)
+
+        mode_norm = (mode or "strong").lower()
+        if mode_norm == "all":
+            items = items[:500]
+            min_strength = 0
+        elif mode_norm == "relevant":
+            items = [i for i in items if i["value"] >= 2][:100]
+            min_strength = 2
+        else:  # "strong" or anything unknown
+            mode_norm = "strong"
+            items = [i for i in items if i["value"] >= 2][:30]
+            min_strength = 2
+
+        return {
+            "items": items,
+            "total": total,
+            "shown": len(items),
+            "mode": mode_norm,
+            "min_strength": min_strength,
+        }
 
     @app.get("/api/tree")
     def tree():
@@ -1223,6 +1417,10 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     @app.get("/api/settings")
     def get_settings():
         from apollo.chat.providers import PROVIDERS, public_registry
+        from apollo.projects.settings import (
+            detect_installed_plugins,
+            load_plugin_config,
+        )
         settings = _load_settings()
         # API keys live exclusively in env vars (.env). Surface them masked
         # so the UI can show "set" vs "empty" without leaking secrets.
@@ -1236,6 +1434,35 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             base = dict(DEFAULT_SETTINGS.get(section, {}))
             base.update(settings.get(section, {}) or {})
             return base
+
+        # Compose the per-plugin payload the Settings → Plugins UI needs:
+        #   * everything _load_settings() persists (installed/version/sha256/
+        #     plus any user override under "config"),
+        #   * a fresh ``config_schema`` field — the raw on-disk
+        #     ``config.json`` including ``_<key>`` description siblings —
+        #     so the UI can auto-render labels and tooltips,
+        #   * a fresh ``config`` field — the merged effective values
+        #     (on-disk defaults ⊕ user overrides, ``_<key>`` stripped) —
+        #     so the form controls can be populated without the client
+        #     having to do the merge itself.
+        plugins_out: dict = {}
+        try:
+            installed = detect_installed_plugins()
+        except Exception:
+            installed = {}
+        for name, entry in (settings.get("plugins") or {}).items():
+            out = dict(entry)
+            schema = (installed.get(name) or {}).get("config") or {}
+            if schema:
+                out["config_schema"] = schema
+            try:
+                merged = load_plugin_config(name)
+            except Exception:
+                merged = {}
+            if merged or schema:
+                out["config"] = merged
+            plugins_out[name] = out
+
         return {
             "providers": public_registry(),
             "api_keys": api_keys,
@@ -1246,8 +1473,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "reindex": _merged("reindex"),
             "captures": _merged("captures"),
             "logging": _merged("logging"),
-            # Read-only: which plugins are present under ``plugins/``.
-            "plugins": settings.get("plugins") or {},
+            # Read-only metadata + on-disk schema + merged effective config
+            # for every plugin present under ``plugins/``.
+            "plugins": plugins_out,
         }
 
     @app.put("/api/settings")
@@ -1362,6 +1590,159 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
         return {"status": "saved"}
 
+    # -------------------------------------------------- Plugin config (2B) --
+
+    # JSON value types we accept in a per-plugin config override. Anything
+    # else (e.g. an arbitrary class instance) is rejected as a 400 so the
+    # settings file stays JSON-serializable round-trip.
+    _PLUGIN_CONFIG_TYPES = (bool, int, float, str, list, dict, type(None))
+
+    def _validate_plugin_value(key: str, value, expected) -> None:
+        """Raise HTTPException(400) when ``value`` is not type-compatible
+        with the on-disk default ``expected`` for ``key``.
+
+        ``enabled`` is special-cased as a strict ``bool``. For everything
+        else we require the value to be the same broad JSON kind as the
+        on-disk default (so a config that ships ``"comment_tags": []``
+        accepts any list, even an empty one).
+        """
+        if key == "enabled":
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`enabled` must be a bool, got {type(value).__name__}",
+                )
+            return
+        if not isinstance(value, _PLUGIN_CONFIG_TYPES):
+            raise HTTPException(
+                status_code=400,
+                detail=f"`{key}` has unsupported value type: {type(value).__name__}",
+            )
+        # Allow null to clear a key only when the on-disk default is
+        # also null (rare); otherwise require a matching kind.
+        if expected is None:
+            return
+        # bool is a subclass of int — disallow that conflation.
+        if isinstance(expected, bool):
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a bool, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a number, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, str):
+            if not isinstance(value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a string, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, list):
+            if not isinstance(value, list):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be a list, got {type(value).__name__}",
+                )
+            return
+        if isinstance(expected, dict):
+            if not isinstance(value, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"`{key}` must be an object, got {type(value).__name__}",
+                )
+            return
+
+    @app.patch("/api/settings/plugins/{name}/config")
+    async def patch_plugin_config(name: str, request: Request):
+        """Apply a partial config override for plugin *name* and reload.
+
+        Body is a partial dict of overrides (a strict subset of keys
+        present in the plugin's on-disk ``config.json``). Validates:
+        - the plugin exists on disk,
+        - every key is known (rejects typos / stale fields),
+        - every value's type matches the on-disk default,
+        - ``enabled`` is a bool when present.
+
+        On success the override is persisted to ``data/settings.json``
+        under ``plugins[<name>].config`` and ``_reload_parsers()`` swaps
+        the live parser list so subsequent requests see the new config.
+        """
+        from apollo.projects.settings import detect_installed_plugins
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        installed = detect_installed_plugins()
+        if name not in installed:
+            raise HTTPException(status_code=404, detail=f"Unknown plugin: {name}")
+
+        on_disk = installed[name].get("config") or {}
+        if not on_disk:
+            # Plugin has no config.json; refuse to invent keys for it.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Plugin {name!r} ships no config.json; nothing to override",
+            )
+
+        # Validate keys + types up-front so a bad request never persists.
+        for k, v in body.items():
+            # Reject `_<key>` description siblings — they are docs for
+            # the Settings UI, not runtime knobs, and editing them via
+            # the API would just confuse the schema. The on-disk
+            # config.json is the source of truth for descriptions.
+            if isinstance(k, str) and k.startswith("_"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot patch description sibling {k!r}: "
+                        "keys starting with '_' are read-only docs."
+                    ),
+                )
+            if k not in on_disk:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown config key for plugin {name!r}: {k!r}",
+                )
+            _validate_plugin_value(k, v, on_disk[k])
+
+        # Persist the merged override under plugins[name].config. We
+        # merge over any existing override so a partial patch doesn't
+        # erase keys the user previously set.
+        current = _load_settings()
+        plugins_section = current.setdefault("plugins", {})
+        plugin_entry = plugins_section.setdefault(name, {})
+        existing_override = plugin_entry.get("config") or {}
+        if not isinstance(existing_override, dict):
+            existing_override = {}
+        existing_override.update(body)
+        plugin_entry["config"] = existing_override
+        _save_settings(current)
+
+        # Hot-swap the active parser list so the change takes effect
+        # immediately without a server restart.
+        try:
+            n = _reload_parsers()
+        except Exception:
+            logger.exception("failed to reload parsers after plugin config patch")
+            n = -1
+
+        return {
+            "status": "saved",
+            "plugin": name,
+            "config": existing_override,
+            "active_parsers": n,
+        }
+
     # ---------------------------------------------------------------- Chat --
 
     @app.get("/api/chat/status")
@@ -1398,16 +1779,56 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if not message.strip():
             raise HTTPException(status_code=400, detail="Empty message")
 
+        import time as _time
+        import uuid as _uuid
+        import json as _json
+        sse_id = _uuid.uuid4().hex[:8]
+        logger.info(
+            "sse.open id=%s message_len=%d history=%d ctx=%s",
+            sse_id, len(message), len(history or []), context_node,
+        )
+
         def generate():
+            t_open = _time.time()
+            tokens = 0
+            byte_count = 0
+            steps = 0
             try:
-                for token in chat_service.chat_stream(
+                for ev in chat_service.chat_stream(
                     message, history=history, context_node_id=context_node, model=model
                 ):
-                    # Escape so multi-line tokens survive the SSE wire format
-                    safe = token.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
-                    yield f"data: {safe}\n\n"
+                    if isinstance(ev, dict):
+                        kind = ev.get("type")
+                        if kind == "text":
+                            content = ev.get("content", "")
+                            tokens += 1
+                            byte_count += len(content)
+                            # Escape so multi-line tokens survive the SSE wire format
+                            safe = content.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+                            yield f"data: {safe}\n\n"
+                            continue
+                        if kind == "step":
+                            steps += 1
+                            # JSON one-liner; SSE values cannot contain raw newlines.
+                            payload = _json.dumps(ev, default=str)
+                            yield f"data: [STEP] {payload}\n\n"
+                            continue
+                    # Back-compat: treat any plain string as a text token.
+                    if isinstance(ev, str):
+                        tokens += 1
+                        byte_count += len(ev)
+                        safe = ev.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+                        yield f"data: {safe}\n\n"
                 yield "data: [DONE]\n\n"
+                logger.info(
+                    "sse.close id=%s reason=done tokens=%d bytes=%d steps=%d dt=%.2fs",
+                    sse_id, tokens, byte_count, steps, _time.time() - t_open,
+                )
             except Exception as e:
+                logger.exception(
+                    "sse.close id=%s reason=error tokens=%d bytes=%d steps=%d dt=%.2fs",
+                    sse_id, tokens, byte_count, steps, _time.time() - t_open,
+                )
                 yield f"data: [ERROR] {e}\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
@@ -1554,6 +1975,31 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if not favicon_file.exists():
             raise HTTPException(status_code=404, detail="favicon not found")
         return FileResponse(favicon_file, media_type="image/svg+xml")
+
+    # ── Hand-maintained OpenAPI spec + viewer ─────────────────────────
+    # FastAPI already exposes its own auto-generated spec at /openapi.json
+    # (and Swagger UI at /docs, ReDoc at /redoc). The endpoints below
+    # serve the curated docs/openapi.yaml — the human-maintained source
+    # of truth referenced by docs/API.md and guides/API_OPENAPI.md — so
+    # that external clients and the in-app viewer can consume it without
+    # leaving the running server.
+
+    _OPENAPI_SPEC = (Path(__file__).parent.parent / "docs" / "openapi.yaml").resolve()
+
+    @app.get("/openapi.yaml", include_in_schema=False)
+    def openapi_yaml():
+        """Serve the hand-maintained OpenAPI 3.1 spec verbatim."""
+        if not _OPENAPI_SPEC.exists():
+            raise HTTPException(status_code=404, detail="openapi.yaml not found")
+        return FileResponse(_OPENAPI_SPEC, media_type="application/yaml")
+
+    @app.get("/api-docs", include_in_schema=False)
+    def api_docs():
+        """Render docs/openapi.yaml with Swagger UI."""
+        page = STATIC_DIR / "api-docs.html"
+        if not page.exists():
+            raise HTTPException(status_code=404, detail="api-docs.html not found")
+        return FileResponse(page, media_type="text/html")
 
     @app.get("/")
     def index():
