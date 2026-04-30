@@ -1,5 +1,37 @@
 # Release Notes
 
+## v1.1.0 — 2026-04-30
+
+### New Features
+
+- **Massive Plugin Expansion** — Apollo now ships with **49 language and format plugins** (up from 8), covering virtually any project type. New plugins include:
+  - **Programming Languages:** TypeScript, C, C++17, C# 12, Dart, Elixir, Java 17, JavaScript, Kotlin, Lua, Node.js 20, PHP 8, PowerShell 7, R, Ruby 3, Rust, Scala 3, Shell, Swift 5
+  - **Structured Data:** JSON, YAML, TOML, XML, OpenAPI 3, JSON Schema, CSV
+  - **Document Formats:** AsciiDoc, Org Mode, reStructuredText
+  - **Notebooks:** Jupyter, R Markdown
+  - **Build/Ops:** Dockerfile, docker-compose, Makefile, CMake, Maven (pom.xml), Gradle, Terraform, Kubernetes YAML
+  - **CI/CD & Config:** GitHub Actions, EditorConfig, .gitignore, .env / .properties
+  - **Database:** SQL
+- **API Docs Endpoint** — New `/api-docs` static page rendering the OpenAPI 3.1 spec, plus expanded REST API reference (`docs/API.md`).
+- **Optimized Chat Pipeline** — Refactored `chat/service.py` with externalized request/response schemas (`ai/chat_request.json`, `ai/chat_request_v1.json`) and a leaner tool-calling loop.
+- **Chat Tracing** — End-to-end trace capture for chat interactions (timing, tool calls, rounds) surfaced in both the API and browser UI.
+- **Improved Idea Cloud** — Better word cloud generation, layout, and styling for the unified browser dashboard.
+- **Notes & Bookmarks Search** — Annotations, highlights, and bookmarks are now fully searchable alongside graph nodes.
+- **HTML5 Plugin** — Built-in HTML parsing with element/attribute extraction and link/import edge detection.
+- **Plugin Configuration UI** — Per-plugin configuration loader, ignore-dirs settings, and admin API for plugin management.
+- **Expanded Settings** — `data/settings.json` now exposes plugin-level configuration, ignore-dir overrides, and additional chat provider options.
+
+### Changes
+
+- **Web UI Overhaul** — `web/static/app.js` rewritten with new graph rendering, chat trace panel, and plugin/version display in the sidebar. `app.css` redesigned for plugin badges and trace UI. `index.html` updated with new entry points.
+- **Server Expansion** — `web/server.py` adds plugin config endpoints, indexing-status improvements, chat trace propagation, and the `/api-docs` route.
+- **Documentation** — Added `docs/work/PLUGINS_CREATED.md`, `docs/work/PLUGINS_CHECKLIST.md`, `docs/work/PLUGIN_BIG_BUILD_IMPLEMENTATION_SUMMARY.md`, `docs/AI_MORE_LOCAL_FUNCTIONS.md`, expanded `docs/DESIGN.md` and `guides/making_plugins.md`.
+- **Tests** — New test suites: `tests/test_plugin_config_api.py`, `tests/test_plugin_config_loader.py`, `tests/test_plugin_ignore_dirs.py`, plus per-plugin test files (one `test_parser.py` per plugin).
+- **Dependencies** — Updated `requirements.txt` with new packages required for chat tracing and additional parsers.
+- **Version bump** — All version references updated from v1.0.0 to v1.1.0.
+
+---
+
 ## v1.0.0 — 2026-04-27
 
 ### 🎉 Initial Release
