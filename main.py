@@ -15,7 +15,7 @@ Usage:
     python main.py status
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import json
