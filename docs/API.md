@@ -2,7 +2,12 @@
 
 Quick reference for the Graph Search REST API.
 For the full machine-readable spec see [`openapi.yaml`](openapi.yaml).
-FastAPI also serves interactive docs at [`/docs`](http://localhost:8000/docs) (Swagger UI) and [`/redoc`](http://localhost:8000/redoc).
+
+The running server exposes three interactive views:
+
+- [`/api-docs`](http://localhost:8080/api-docs) — Swagger UI rendering of the **hand-maintained** [`docs/openapi.yaml`](openapi.yaml) (curated descriptions, examples, schemas).
+- [`/openapi.yaml`](http://localhost:8080/openapi.yaml) — the raw YAML spec, served verbatim for external clients and codegen.
+- [`/docs`](http://localhost:8080/docs) and [`/redoc`](http://localhost:8080/redoc) — FastAPI's auto-generated views (derived from the route signatures in `server.py`).
 
 ---
 
@@ -15,6 +20,15 @@ Returns runtime environment capabilities.
 **Response**
 ```json
 { "native_picker": true }
+```
+
+### `GET /api/version`
+
+Returns the Apollo backend version (sourced from `main.__version__`).
+
+**Response**
+```json
+{ "version": "1.4.2" }
 ```
 
 ---
@@ -82,6 +96,67 @@ Deletes the current index.
 
 ---
 
+## Reindex
+
+Phase 9 incremental-reindex telemetry and configuration. All endpoints
+return `503 Service Unavailable` when the reindex service is not running.
+
+### `POST /api/index/sweep`
+
+Manually trigger a single background reindex sweep.
+
+**Response**
+```json
+{
+  "status": "success",
+  "message": "Sweep complete in 1234ms",
+  "stats": { "duration_ms": 1234, "files_parsed": 7, "nodes_added": 12,
+             "nodes_removed": 0, "edges_added": 18, "edges_removed": 0 }
+}
+```
+Returns `{ "status": "already_running" }` when a sweep is in progress.
+
+### `GET /api/index/history`
+
+Recent reindex runs.
+
+| Param   | Type | Default | Description                |
+|---------|------|---------|----------------------------|
+| `limit` | int  | `20`    | 1–100, most recent runs    |
+
+### `GET /api/index/last`
+
+Most recent reindex statistics.
+
+**Response**
+```json
+{ "has_run": true, "stats": { "duration_ms": 1234, "files_parsed": 7, "...": "..." } }
+```
+
+### `GET /api/index/summary`
+
+Aggregate activity summary plus the active configuration.
+
+### `GET /api/index/config`
+
+Current reindex configuration plus the effective foreground/background
+strategy.
+
+### `POST /api/index/config`
+
+Update one or more reindex configuration fields. All parameters are
+**query-string** values (not body).
+
+| Param                    | Type    | Description                                |
+|--------------------------|---------|--------------------------------------------|
+| `strategy`               | string  | `incremental_local` or `full`              |
+| `sweep_interval_minutes` | int     | Background sweep cadence                   |
+| `sweep_on_session_start` | bool    | Run a sweep on each new session            |
+| `local_max_hops`         | int     | BFS hops for `incremental_local`           |
+| `force_full_after_runs`  | int     | Force a full reindex every N runs          |
+
+---
+
 ## Graph
 
 ### `GET /api/graph`
@@ -105,6 +180,21 @@ Returns full detail for a single node, including incoming and outgoing edges.
 | Param     | Type   | Description |
 |-----------|--------|-------------|
 | `node_id` | string | Node ID     |
+
+### `GET /api/node/{node_id}/connections`
+
+Heavier variant of `/api/node/{node_id}` that also reads each connected
+node's source file and includes a small surrounding-line preview snippet
+for the call site or definition. Called on-demand by the Connections tab.
+
+**Response**
+```json
+{
+  "id": "func::main.py::main",
+  "edges_in":  [ { "source_id": "...", "source_snippet": { "start": 9, "end": 11, "lines": ["..."], "highlight": 10 }, "...": "..." } ],
+  "edges_out": [ { "target_id": "...", "target_snippet": { "...": "..." }, "...": "..." } ]
+}
+```
 
 ### `GET /api/neighbors/{node_id}`
 
@@ -209,6 +299,24 @@ Cheap structural summary of a file. Mirrors the AI's `file_stats` tool.
   "top_level_imports": ["import os", "from ast import parse"]
 }
 ```
+
+### `GET /api/file/content`
+
+Returns the full UTF-8 source of a sandboxed file. Read-only.
+
+| Param  | Type   | Description            |
+|--------|--------|------------------------|
+| `path` | string | File path *(required)* |
+
+### `GET /api/file/raw`
+
+Streams a sandboxed file as-is using its detected MIME type. Used by the
+Content view to render images and other binary assets referenced from
+indexed Markdown / HTML without base64-inlining them in JSON responses.
+
+| Param  | Type   | Description            |
+|--------|--------|------------------------|
+| `path` | string | File path *(required)* |
 
 ### `GET /api/file/section`
 
@@ -462,6 +570,11 @@ Delete a collection. Annotations inside the collection are **not** deleted.
 
 ## Settings
 
+### `GET /api/logging/info`
+
+Snapshot of Apollo's logging config plus on-disk file sizes. Powers the
+Settings → Logging tab. See [`guides/LOGGING.md`](../guides/LOGGING.md) § 9.
+
 ### `GET /api/settings`
 
 Returns current settings. API keys are masked.
@@ -573,6 +686,18 @@ Appends a message to an existing thread.
 { "role": "user", "content": "What does this function do?" }
 ```
 
+### `PUT /api/chat/threads/{thread_id}/messages/last`
+
+Replaces the last message in a thread. Used to commit the assistant's
+streamed reply at the end of an SSE stream so the saved thread reflects
+the final content (instead of any placeholder appended when streaming
+started).
+
+**Request**
+```json
+{ "role": "assistant", "content": "Final assembled reply" }
+```
+
 ---
 
 ## Images
@@ -611,6 +736,96 @@ Starts the file watcher. Returns `"started"` or `"already_running"`.
 ### `POST /api/watch/stop`
 
 Stops the file watcher. Returns `"stopped"` or `"not_running"`.
+
+---
+
+## Projects
+
+Manage Apollo projects (`apollo.json` manifests). The bootstrap wizard
+and the Projects sidebar are built on these endpoints.
+
+### `POST /api/projects/open`
+
+Open or switch to a project directory.
+
+**Request**
+```json
+{ "path": "/Users/me/projects/myapp" }
+```
+
+**Response** — project info; the `needs_bootstrap` flag tells the UI
+whether to show the wizard. Refuses `400` when opening a directory
+nested inside another initialized project.
+
+### `POST /api/projects/init`
+
+Initialize a project with custom inclusion / exclusion filters. Triggered
+when the bootstrap wizard submits its filter selections.
+
+**Request**
+```json
+{ "path": "/Users/me/projects/myapp", "filters": { "...": "..." } }
+```
+
+### `PUT /api/projects/filters`
+
+Update the active project's filters.
+
+**Request**
+```json
+{ "filters": { "include_dirs": ["src"], "exclude_dirs": ["dist"] } }
+```
+
+### `POST /api/projects/reprocess`
+
+Re-index the current project.
+
+**Request**
+```json
+{ "mode": "incremental" }
+```
+
+| Field  | Type   | Default        | Description                             |
+|--------|--------|----------------|-----------------------------------------|
+| `mode` | string | `incremental`  | `incremental` re-parses changed files; `full` rebuilds from scratch |
+
+### `POST /api/projects/leave`
+
+Remove the current project. Deletes `_apollo/` and `_apollo_web/`.
+
+**Request**
+```json
+{ "confirm": true }
+```
+
+**Response**
+```json
+{ "status": "removed", "deleted": ["_apollo/", "_apollo_web/"] }
+```
+
+### `GET /api/projects/current`
+
+Returns project info for the currently open project, or `null` when no
+project is open.
+
+### `GET /api/projects/tree`
+
+Folder tree of the current project, used by the bootstrap wizard.
+
+| Param   | Type | Default | Description                |
+|---------|------|---------|----------------------------|
+| `depth` | int  | `3`     | Maximum recursion depth    |
+
+---
+
+## Realtime
+
+### `WS /ws`
+
+WebSocket channel for live graph updates. Clients open a WebSocket
+connection at `/ws` and receive JSON frames pushed from the server when
+the file watcher detects changes (`graph_update` events). No client
+messages are required; received text frames are read but ignored.
 
 ---
 

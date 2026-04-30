@@ -15,10 +15,17 @@ tags:
   - name: System
   - name: Filesystem
   - name: Indexing
+  - name: Reindex
+    description: Telemetry and configuration for the incremental reindex service (Phase 9).
   - name: Graph
   - name: Search
   - name: Files
     description: Read-only file inspection (Phase 12.3a)
+  - name: Projects
+    description: >
+      Manage Apollo projects (`apollo.json` manifests). Open, initialize,
+      reprocess, or leave a project; query the current project and its
+      folder tree for the bootstrap wizard.
   - name: Annotations
     description: >
       User-authored highlights, **notes**, **bookmarks**, and tags attached
@@ -29,6 +36,8 @@ tags:
   - name: Chat
   - name: Images
   - name: Watch
+  - name: Realtime
+    description: WebSocket channel for live graph updates from the file watcher.
 
 paths:
   # ── System ──────────────────────────────────────────────────────────
@@ -50,6 +59,23 @@ paths:
                     type: boolean
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /api/version:
+    get:
+      operationId: getVersion
+      tags: [System]
+      summary: Return the Apollo backend version
+      responses:
+        "200":
+          description: Version string from `main.__version__`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version]
+                properties:
+                  version:
+                    type: string
 
   # ── Filesystem ──────────────────────────────────────────────────────
   /api/browse-folder:
@@ -176,6 +202,172 @@ paths:
                     type: integer
                     enum: [0]
 
+  # ── Reindex (Phase 9) ───────────────────────────────────────────────
+  /api/index/sweep:
+    post:
+      operationId: triggerReindexSweep
+      tags: [Reindex]
+      summary: Manually trigger a background reindex sweep
+      description: >
+        Runs a single sweep of the incremental reindexer immediately. Returns
+        `already_running` (200) if a sweep is in progress.
+      responses:
+        "200":
+          description: Sweep result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [success, already_running]
+                  message:
+                    type: string
+                  stats:
+                    $ref: "#/components/schemas/ReindexStats"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/index/history:
+    get:
+      operationId: getReindexHistory
+      tags: [Reindex]
+      summary: Get reindex telemetry for the last N runs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Recent reindex runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_runs:
+                    type: integer
+                  limit:
+                    type: integer
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ReindexStats"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/index/last:
+    get:
+      operationId: getLastReindex
+      tags: [Reindex]
+      summary: Get the most recent reindex statistics
+      responses:
+        "200":
+          description: Last reindex stats (if any)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  has_run:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [success, never_run]
+                  stats:
+                    $ref: "#/components/schemas/ReindexStats"
+                  last_stats:
+                    $ref: "#/components/schemas/ReindexStats"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/index/summary:
+    get:
+      operationId: getReindexSummary
+      tags: [Reindex]
+      summary: Aggregate reindex activity and active configuration
+      responses:
+        "200":
+          description: Summary of reindex activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configuration:
+                    $ref: "#/components/schemas/ReindexConfig"
+                  summary:
+                    type: object
+                    additionalProperties: true
+
+  /api/index/config:
+    get:
+      operationId: getReindexConfig
+      tags: [Reindex]
+      summary: Read the current reindex configuration
+      responses:
+        "200":
+          description: Reindex configuration plus the effective strategy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config:
+                    $ref: "#/components/schemas/ReindexConfig"
+                  effective_foreground_strategy:
+                    type: string
+                  effective_background_strategy:
+                    type: string
+    post:
+      operationId: updateReindexConfig
+      tags: [Reindex]
+      summary: Update one or more reindex configuration fields
+      parameters:
+        - name: strategy
+          in: query
+          schema:
+            type: string
+            enum: [incremental_local, full]
+        - name: sweep_interval_minutes
+          in: query
+          schema:
+            type: integer
+        - name: sweep_on_session_start
+          in: query
+          schema:
+            type: boolean
+        - name: local_max_hops
+          in: query
+          schema:
+            type: integer
+        - name: force_full_after_runs
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: boolean
+                  config:
+                    $ref: "#/components/schemas/ReindexConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
   # ── Graph ───────────────────────────────────────────────────────────
   /api/graph:
     get:
@@ -231,6 +423,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/node/{node_id}/connections:
+    get:
+      operationId: getNodeConnections
+      tags: [Graph]
+      summary: Get a node's edges with source-code preview snippets
+      description: >
+        Heavier variant of `/api/node/{node_id}` that reads each connected
+        node's source file and includes a small surrounding-line preview
+        for the call site or definition. Used on-demand by the
+        Connections tab.
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Edges with preview snippets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, edges_in, edges_out]
+                properties:
+                  id:
+                    type: string
+                  edges_in:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  edges_out:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -448,6 +680,59 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/file/content:
+    get:
+      operationId: getFileContent
+      tags: [Files]
+      summary: Return the full source of a sandboxed file
+      description: Reads the entire file as UTF-8 text. Read-only.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File contents
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/file/raw:
+    get:
+      operationId: getFileRaw
+      tags: [Files]
+      summary: Stream a sandboxed file as-is (binary or text)
+      description: >
+        Returns the file using its detected MIME type. Used by the Content
+        view to render images and other binary assets referenced from
+        indexed Markdown / HTML without base64-inlining them in JSON.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/file/section:
     get:
       operationId: getFileSection
@@ -620,6 +905,24 @@ paths:
           $ref: "#/components/responses/NotFound"
 
   # ── Settings ────────────────────────────────────────────────────────
+  /api/logging/info:
+    get:
+      operationId: getLoggingInfo
+      tags: [Settings]
+      summary: Snapshot of logging config and on-disk file sizes
+      description: >
+        Powers the Settings → Logging tab. Returns the active logging
+        configuration along with the size of the current log file and
+        any rotated siblings. See `guides/LOGGING.md` § 9.
+      responses:
+        "200":
+          description: Logging info
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
   /api/settings:
     get:
       operationId: getSettings
@@ -882,6 +1185,44 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/chat/threads/{thread_id}/messages/last:
+    put:
+      operationId: replaceLastMessage
+      tags: [Chat]
+      summary: Replace the last message in a thread
+      description: >
+        Used to commit the assistant's streamed reply at the end of an SSE
+        stream so the saved thread reflects the final content (instead of
+        the placeholder that was appended when streaming started).
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                role:
+                  type: string
+                  default: assistant
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Updated thread
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Thread"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   # ── Images ──────────────────────────────────────────────────────────
   /api/image/generate:
     post:
@@ -983,6 +1324,225 @@ paths:
                   status:
                     type: string
                     enum: [stopped, not_running]
+
+  # ── Projects ────────────────────────────────────────────────────────
+  /api/projects/open:
+    post:
+      operationId: openProject
+      tags: [Projects]
+      summary: Open or switch to a project directory
+      description: >
+        If `apollo.json` exists with `initial_index_completed=true`, returns
+        a project info payload with `needs_bootstrap=false`. Otherwise
+        signals the bootstrap wizard. Refuses to open a directory that
+        sits inside another already-initialized project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                  description: Absolute path to the project directory.
+      responses:
+        "200":
+          description: Project info
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /api/projects/init:
+    post:
+      operationId: initProject
+      tags: [Projects]
+      summary: Initialize a new project with custom filters
+      description: Triggered when the bootstrap wizard submits its filter selections.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                filters:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Project info
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/projects/filters:
+    put:
+      operationId: updateProjectFilters
+      tags: [Projects]
+      summary: Update inclusion/exclusion filters for the current project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filters]
+              properties:
+                filters:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Updated project info
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/projects/reprocess:
+    post:
+      operationId: reprocessProject
+      tags: [Projects]
+      summary: Trigger a full or incremental re-index of the open project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [incremental, full]
+                  default: incremental
+      responses:
+        "200":
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, mode, project_id]
+                properties:
+                  status:
+                    type: string
+                    enum: [queued]
+                  mode:
+                    type: string
+                    enum: [incremental, full]
+                  project_id:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/projects/leave:
+    post:
+      operationId: leaveProject
+      tags: [Projects]
+      summary: Remove the current project (deletes `_apollo/` and `_apollo_web/`)
+      description: Requires `confirm=true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+      responses:
+        "200":
+          description: Project removed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [removed]
+                  deleted:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/projects/current:
+    get:
+      operationId: getCurrentProject
+      tags: [Projects]
+      summary: Get info about the currently open project
+      responses:
+        "200":
+          description: Project info or null when no project is open
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: "null"
+                  - type: object
+                    additionalProperties: true
+
+  /api/projects/tree:
+    get:
+      operationId: getProjectTree
+      tags: [Projects]
+      summary: Folder tree of the current project (for bootstrap wizard)
+      parameters:
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 3
+            description: Maximum recursion depth.
+      responses:
+        "200":
+          description: Tree node with `name`, `path`, `type`, `children`, and per-directory counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ── Realtime (WebSocket) ────────────────────────────────────────────
+  /ws:
+    get:
+      operationId: websocket
+      tags: [Realtime]
+      summary: WebSocket channel for live graph updates
+      description: >
+        **WebSocket endpoint, not HTTP.** Clients open a WebSocket
+        connection at `/ws` to receive `graph_update` events emitted by
+        the file watcher. Documented here for discoverability — the
+        OpenAPI 3.1 schema does not yet have first-class WebSocket
+        support, so this is rendered as a placeholder GET. The wire
+        protocol is plain JSON frames pushed from server → client.
+      responses:
+        "101":
+          description: Switching protocols (WebSocket handshake).
 
   # ── Annotations (Notes & Bookmarks) ─────────────────────────────────
   /api/annotations:
@@ -1322,6 +1882,46 @@ components:
           type: object
           additionalProperties:
             type: integer
+
+    # ── Reindex (Phase 9) ─────────────────────────────────────────────
+    ReindexStats:
+      type: object
+      description: One reindex run's telemetry.
+      properties:
+        duration_ms:
+          type: integer
+        files_parsed:
+          type: integer
+        nodes_added:
+          type: integer
+        nodes_removed:
+          type: integer
+        edges_added:
+          type: integer
+        edges_removed:
+          type: integer
+        timestamp:
+          type:
+            - string
+            - "null"
+        strategy:
+          type: string
+
+    ReindexConfig:
+      type: object
+      description: Configuration for the incremental reindex orchestrator.
+      properties:
+        strategy:
+          type: string
+          enum: [incremental_local, full]
+        sweep_interval_minutes:
+          type: integer
+        sweep_on_session_start:
+          type: boolean
+        local_max_hops:
+          type: integer
+        force_full_after_runs:
+          type: integer
 
     # ── Graph ─────────────────────────────────────────────────────────
     GraphNode:

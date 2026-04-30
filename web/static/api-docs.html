@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Apollo API — OpenAPI Reference</title>
+
+  <!-- Swagger UI v5 (CDN) -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"
+  />
+
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body { background: #fafafa; }
+
+    /* Top banner so users know which spec they're viewing and where the
+       hand-maintained source lives. */
+    .apollo-banner {
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 14px 20px;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #1e293b;
+    }
+    .apollo-banner strong { color: #fef08a; }
+    .apollo-banner a {
+      color: #93c5fd;
+      text-decoration: none;
+      margin-left: 12px;
+    }
+    .apollo-banner a:hover { text-decoration: underline; }
+    .apollo-banner .links { font-size: 13px; }
+    .apollo-banner code {
+      background: #1e293b;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="apollo-banner">
+    <div>
+      <strong>Apollo API</strong> — rendered from the hand-maintained
+      <code>docs/openapi.yaml</code>.
+    </div>
+    <div class="links">
+      <a href="/openapi.yaml" target="_blank" rel="noopener">openapi.yaml</a>
+      <a href="/docs" target="_blank" rel="noopener">FastAPI Swagger UI</a>
+      <a href="/redoc" target="_blank" rel="noopener">FastAPI ReDoc</a>
+      <a href="/" >← Back to app</a>
+    </div>
+  </div>
+
+  <div id="swagger-ui"></div>
+
+  <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.addEventListener("load", function () {
+      window.ui = SwaggerUIBundle({
+        url: "/openapi.yaml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset,
+        ],
+        plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+        layout: "StandaloneLayout",
+        // Sort tags + operations alphabetically so the menu is stable
+        // regardless of authoring order in the YAML.
+        tagsSorter: "alpha",
+        operationsSorter: "alpha",
+        // Keep the URL bar / address swap disabled so refreshing the page
+        // doesn't dump the user back to the /openapi.yaml raw spec.
+        defaultModelsExpandDepth: 0,
+        docExpansion: "list",
+      });
+    });
+  </script>
+</body>
+</html>
