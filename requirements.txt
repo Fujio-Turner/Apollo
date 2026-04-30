@@ -6,6 +6,11 @@ uvicorn[standard]>=0.20.0
 numpy
 sentence-transformers
 openai>=1.0.0
+# TOON (Token-Oriented Object Notation) — encodes tool results sent back to
+# the LLM in a CSV/YAML-hybrid format that uses 30-60% fewer tokens than JSON
+# for tabular results. Lets the model fit more tool rounds before hitting the
+# context limit. See chat/service.py:_to_toon_for_llm.
+python-toon>=0.1.3
 watchdog>=3.0.0
 pytest>=7.0
 jsonschema>=4.0

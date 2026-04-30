@@ -1779,16 +1779,56 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if not message.strip():
             raise HTTPException(status_code=400, detail="Empty message")
 
+        import time as _time
+        import uuid as _uuid
+        import json as _json
+        sse_id = _uuid.uuid4().hex[:8]
+        logger.info(
+            "sse.open id=%s message_len=%d history=%d ctx=%s",
+            sse_id, len(message), len(history or []), context_node,
+        )
+
         def generate():
+            t_open = _time.time()
+            tokens = 0
+            byte_count = 0
+            steps = 0
             try:
-                for token in chat_service.chat_stream(
+                for ev in chat_service.chat_stream(
                     message, history=history, context_node_id=context_node, model=model
                 ):
-                    # Escape so multi-line tokens survive the SSE wire format
-                    safe = token.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
-                    yield f"data: {safe}\n\n"
+                    if isinstance(ev, dict):
+                        kind = ev.get("type")
+                        if kind == "text":
+                            content = ev.get("content", "")
+                            tokens += 1
+                            byte_count += len(content)
+                            # Escape so multi-line tokens survive the SSE wire format
+                            safe = content.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+                            yield f"data: {safe}\n\n"
+                            continue
+                        if kind == "step":
+                            steps += 1
+                            # JSON one-liner; SSE values cannot contain raw newlines.
+                            payload = _json.dumps(ev, default=str)
+                            yield f"data: [STEP] {payload}\n\n"
+                            continue
+                    # Back-compat: treat any plain string as a text token.
+                    if isinstance(ev, str):
+                        tokens += 1
+                        byte_count += len(ev)
+                        safe = ev.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+                        yield f"data: {safe}\n\n"
                 yield "data: [DONE]\n\n"
+                logger.info(
+                    "sse.close id=%s reason=done tokens=%d bytes=%d steps=%d dt=%.2fs",
+                    sse_id, tokens, byte_count, steps, _time.time() - t_open,
+                )
             except Exception as e:
+                logger.exception(
+                    "sse.close id=%s reason=error tokens=%d bytes=%d steps=%d dt=%.2fs",
+                    sse_id, tokens, byte_count, steps, _time.time() - t_open,
+                )
                 yield f"data: [ERROR] {e}\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")

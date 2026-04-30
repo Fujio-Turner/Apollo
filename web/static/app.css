@@ -457,6 +457,73 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 .rr-confidence.high::before { background: #22c55e; }
 .rr-confidence.med::before  { background: #eab308; }
 .rr-confidence.low::before  { background: #ef4444; }
+
+/* AI trace panel — collapsible per-message audit of every step the AI
+   took (request → tool calls → final stream / done). Lives just under
+   the assistant bubble so the user can verify what the model actually
+   did, with what arguments, and how long each tool took.
+
+   The panel is rendered as a sibling of the daisyUI `.chat` wrapper (not
+   a child) because the wrapper is a CSS grid with reserved cells; a bare
+   child would land in the avatar column. We then indent it to match the
+   bubble's column via the immediately-preceding `.chat-start` selector. */
+.chat-trace {
+  display: block;
+  margin: 2px 0 6px 0;
+}
+/* Trace belongs to the assistant bubble that immediately precedes it.
+   daisyUI `.chat-start` aligns the bubble to the left edge of the
+   message column, so no extra inset is needed; the existing left padding
+   of `#chat-messages` already gives us breathing room. */
+.chat.chat-start + .chat-trace { margin-left: 0; }
+/* User bubbles (`.chat-end`) never spawn a trace; if one ever does end
+   up here, hide it so it doesn't clutter the layout. */
+.chat.chat-end + .chat-trace { display: none; }
+.chat-trace .chat-trace-toggle {
+  font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size: 10px;
+  opacity: 0.7;
+  text-transform: none;
+}
+.chat-trace .chat-trace-toggle:hover { opacity: 1; }
+.chat-trace .chat-trace-caret { display: inline-block; width: 9px; }
+.chat-trace .chat-trace-body {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 6px;
+  background: rgba(0,0,0,0.04);
+  font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow-y: auto;
+}
+[data-theme="dark"] .chat-trace .chat-trace-body {
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.10);
+}
+.chat-trace .chat-trace-row {
+  display: flex; gap: 6px; align-items: flex-start;
+  padding: 1px 0;
+  word-break: break-word;
+}
+.chat-trace .chat-trace-icon {
+  flex: 0 0 14px;
+  text-align: center;
+  opacity: 0.85;
+}
+.chat-trace .chat-trace-text { flex: 1 1 auto; min-width: 0; }
+.chat-trace .trace-preview {
+  margin-top: 2px;
+  padding: 2px 6px;
+  border-left: 2px solid rgba(0,0,0,0.15);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+[data-theme="dark"] .chat-trace .trace-preview {
+  border-left-color: rgba(255,255,255,0.20);
+}
 #chat-messages .chat-bubble { font-size: 12px; line-height: 1.6; max-width: 100%; }
 #chat-messages .chat-bubble .md-content { font-size: 12px; line-height: 1.7; }
 #chat-messages .chat-bubble .md-content p { margin: 4px 0; }

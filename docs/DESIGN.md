@@ -772,6 +772,124 @@ Files referenced:
 → System gathers all email-related nodes + their dependency graph + source code.
 → Grok suggests refactoring strategies based on the actual code structure.
 
+### 8.7 TOON-Encoded Tool Results
+
+Every tool result returned to the LLM is re-encoded from JSON to **TOON**
+(Token-Oriented Object Notation) before being appended to the message
+history. TOON is a CSV/YAML hybrid optimised for LLM context: arrays of
+uniform objects collapse from `[{id:1,name:"f"},{id:2,name:"g"}]` into a
+header-once table:
+
+```
+results[2,]{id,name,type,path,line_start}:
+  "func::a.py::f",f,function,a.py,1
+  "func::a.py::g",g,function,a.py,5
+```
+
+In practice we see **30–50% byte reduction** on `search_graph`,
+`search_graph_multi`, `get_neighbors`, `get_wordcloud`, `list_notes`,
+and similar tabular tools. That directly translates into more tool
+rounds fitting under the model's context window before
+`rounds_exhausted` kicks in.
+
+The conversion lives in `chat.service._to_toon_for_llm`. It is
+defensively wrapped: if `python-toon` is not installed, the JSON
+isn't parseable, the encoder raises, *or* the TOON output would be
+*larger* than the JSON (rare, happens for very small / heterogeneous
+payloads), the original JSON string is passed through unchanged.
+
+The trace panel (§8.8) shows both numbers per tool call:
+
+```
+↩ search_graph → 1513 B · 6.9s · toon 921 B (-39.1%)
+```
+
+The system prompt tells the model to expect TOON, so it can read the
+header line for field names and treat each subsequent row as one
+object positionally mapped to those fields.
+
+### 8.8 AI Trace Panel & Step-Event Protocol
+
+Because chat is the primary way users interact with the indexed graph, every
+assistant response carries a **per-message audit trail** so the user — and the
+developer triaging a bug report — can see exactly what the model did.
+
+#### What the user sees
+
+Directly under each assistant bubble there is a thin collapsible strip:
+
+```
+▸ Trace · 7 steps · 3 tool calls · 2.41s
+```
+
+Clicking it expands a monospaced log with one row per pipeline step:
+
+| Icon | Phase             | Shows                                                              |
+|------|-------------------|---------------------------------------------------------------------|
+| ➤    | `request`         | provider/model, history length, currently-selected graph node      |
+| ↻    | `round`           | LLM round index, finish reason, dt, # tool calls returned          |
+| 🔧   | `tool_call`       | tool name + truncated JSON args                                    |
+| ↩    | `tool_return`     | tool name, byte size, dt, 240-char preview of the JSON result      |
+| ✓    | `return_result`   | counts of files / node refs / confidence / total elapsed           |
+| ✎    | `stream_begin`    | timestamp the final SSE stream started                             |
+| ●    | `done`            | tokens, bytes, stream_dt, total_dt, terminal `reason`              |
+| ⚠    | `rounds_exhausted`| 5-round cap hit; falls through to a tool-less stream               |
+| ✗    | `error`           | which phase blew up (`tools` / `stream`) and the exception message |
+
+The summary line and the body are updated live as events arrive, so the user
+gets immediate feedback ("the model is now calling `search_graph`…") instead
+of staring at a typing-dots animation.
+
+#### Wire format
+
+`chat.service.chat_stream` no longer yields raw strings — it yields tagged
+event dicts:
+
+```python
+{"type": "text", "content": "..."}                  # final-answer token
+{"type": "step", "phase": "request", ...}           # pipeline trace
+{"type": "step", "phase": "tool_call", "name": "search_graph", "args_preview": "..."}
+{"type": "step", "phase": "tool_return", "name": "search_graph",
+ "bytes": 1234, "dt": 0.51, "preview": "..."}
+{"type": "step", "phase": "done", "reason": "stream",
+ "tokens": 42, "bytes": 1024, "total_dt": 1.2}
+```
+
+The `/api/chat` SSE endpoint serializes them as two distinct frame kinds:
+
+```
+data: <escaped text token>\n\n             ← regular token (existing format)
+data: [STEP] {"type":"step","phase":"...",...}\n\n
+data: [DONE]\n\n
+data: [ERROR] <exception>\n\n               ← only on backend failure
+```
+
+The client SSE parser (`_streamAssistantResponse` in `web/static/app.js`) is
+line-buffered across `read()` chunk boundaries so a `[DONE]` or `[STEP]` frame
+that straddles a TCP packet boundary is never dropped (this used to make the
+UI hang forever with the typing-dots indicator).
+
+#### Server-side correlation
+
+Each request gets an 8-char `rid` (e.g. `id=a1b2c3d4`) that appears on every
+`apollo.log` line *and* on every step event sent to the UI:
+
+```
+chat.request id=a1b2c3d4 mode=stream provider=xai model=grok-4-1-fast-… msg=...
+tool.call    name=search_graph args={"query":"emails"}
+tool.return  name=search_graph bytes=872 dt=0.41s preview={"results":[...]}
+chat.round   id=a1b2c3d4 round=0 finish=tool_calls dt=1.22s tool_calls=1
+chat.stream_begin id=a1b2c3d4 elapsed=1.74s
+chat.done    id=a1b2c3d4 reason=stream tokens=87 bytes=412 total_dt=2.41s
+sse.close    id=a1b2c3d4 reason=done tokens=87 bytes=412 steps=6 dt=2.41s
+```
+
+Filter the log with `tail -f .apollo/logs/apollo.log | grep -E 'chat\.|tool\.|sse\.'`
+to watch a live request, or grep by `id=…` to follow a single conversation
+turn end-to-end. When a user reports "the AI got stuck", the `rid` shown in
+their browser console (printed as `[chat] stream closed { … }`) is the same
+ID the operator can grep in the server log.
+
 ---
 
 ## 9. Structured Indexing — Smarter Classification
