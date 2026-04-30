@@ -396,14 +396,23 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     except Exception:
         pass
 
-    # Set up chat history persistence
+    # Set up chat history persistence.
+    #
+    # ``project_manager`` is wired in so that thread storage is scoped to
+    # the active project: each folder gets its own _apollo/chat_history.json
+    # (JSON backend) or filtered by project_id (CBL backend). Without this
+    # the My Hub "Recents" panel would leak chats from one folder to the
+    # next when the user switches projects.
     chat_history = None
     try:
         from apollo.chat.history import ChatHistory
-        chat_history = ChatHistory(cbl_store=store if backend == "cblite" else None)
+        chat_history = ChatHistory(
+            cbl_store=store if backend == "cblite" else None,
+            project_manager=project_manager,
+        )
     except Exception:
         from apollo.chat.history import ChatHistory
-        chat_history = ChatHistory()
+        chat_history = ChatHistory(project_manager=project_manager)
 
     ws_manager = ConnectionManager()
     watcher = None

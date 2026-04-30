@@ -197,8 +197,23 @@ class SpatialMapper:
         except ImportError:
             pass
 
+        n_samples = matrix.shape[0]
+        if n_samples < 2 or matrix.ndim != 2 or matrix.shape[1] == 0:
+            return np.zeros(n_samples)
+
+        # Sanitize non-finite values to keep PCA numerically stable.
+        if not np.isfinite(matrix).all():
+            matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
         centered = matrix - matrix.mean(axis=0)
-        cov = np.cov(centered, rowvar=False)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        pc1 = eigenvectors[:, -1]
-        return centered @ pc1
+        if np.allclose(centered, 0):
+            return np.zeros(n_samples)
+
+        # SVD-based PCA is more numerically stable than eigh(cov) and avoids
+        # the divide-by-zero / overflow warnings that occur on degenerate inputs.
+        try:
+            u, s, _ = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return np.zeros(n_samples)
+
+        return u[:, 0] * s[0]

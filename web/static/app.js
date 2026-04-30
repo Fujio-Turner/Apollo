@@ -684,12 +684,12 @@ function openFolderPicker() {
 function _openNativePicker() {
   const dot = document.getElementById('status-dot');
   const txt = document.getElementById('status-text');
-  dot.className = 'w-1.5 h-1.5 rounded-full bg-warning animate-pulse';
-  txt.textContent = 'Select a folder…';
+  if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-warning animate-pulse';
+  if (txt) txt.textContent = 'Select a folder…';
   fetch('/api/browse-folder', { method: 'POST' })
     .then(r => { if (!r.ok) throw new Error('Cancelled'); return r.json(); })
     .then(async data => {
-      if (!data.path) { dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; txt.textContent = 'Ready'; return; }
+      if (!data.path) { if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; if (txt) txt.textContent = 'Ready'; return; }
       // Route through /api/projects/open so first-time folders trigger the
       // bootstrap wizard (file/folder/file-type filters) instead of
       // unconditionally indexing the entire folder.
@@ -698,26 +698,30 @@ function _openNativePicker() {
           method: 'POST',
           body: { path: data.path }
         });
+        // Drop per-project caches (notes, bookmarks, chat thread, hub
+        // recents) so the new project's data never collides with the
+        // previous one's.
+        _onProjectSwitched();
         if (proj && proj.needs_bootstrap) {
-          dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
-          txt.textContent = 'Configure project…';
+          if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+          if (txt) txt.textContent = 'Configure project…';
           openBootstrapWizard(data.path);
           return;
         }
       } catch (e) {
         showToast(formatApiError(e), 'error');
-        dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
-        txt.textContent = 'Ready';
+        if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30';
+        if (txt) txt.textContent = 'Ready';
         return;
       }
       // Already-bootstrapped project → reindex normally.
-      txt.textContent = 'Indexing ' + data.path + '…';
+      if (txt) txt.textContent = 'Indexing ' + data.path + '…';
       showIndexingModal(data.path);
       return fetch('/api/index', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ directory: data.path }) })
         .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.detail || `Error ${r.status}`); }); return r.json(); })
-        .then(() => { graphCacheClear(); fetchIndexCount(); dot.className = 'w-1.5 h-1.5 rounded-full bg-success'; txt.textContent = 'Indexed ' + data.path; });
+        .then(() => { graphCacheClear(); fetchIndexCount(); if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-success'; if (txt) txt.textContent = 'Indexed ' + data.path; });
     })
-    .catch(() => { dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; txt.textContent = 'Ready'; });
+    .catch(() => { if (dot) dot.className = 'w-1.5 h-1.5 rounded-full bg-base-content/30'; if (txt) txt.textContent = 'Ready'; });
 }
 function _openBrowserPicker() {
   const modal = document.getElementById('folder-picker-modal');
@@ -725,6 +729,8 @@ function _openBrowserPicker() {
   document.getElementById('folder-picker-loading').classList.add('hidden');
   document.getElementById('folder-picker-go').disabled = false;
   modal.showModal();
+  // Try common defaults, but always fall back to "/" so the user can
+  // navigate from somewhere even when the preferred seed path is missing.
   _browseLoadDir('/data');
 }
 function closeFolderPicker() { document.getElementById('folder-picker-modal').close(); }
@@ -735,8 +741,24 @@ function _browseLoadDir(path) {
   pathEl.textContent = path;
   listEl.innerHTML = '<li class="text-xs opacity-50 p-2">Loading…</li>';
   fetch('/api/browse-dir?path=' + encodeURIComponent(path))
-    .then(r => r.json())
+    .then(async r => {
+      if (!r.ok) {
+        // Path is invalid (e.g. `/data` doesn't exist on this host).
+        // Recover by loading "/" so the user can navigate from there
+        // instead of getting stuck on a broken listing.
+        let detail = '';
+        try { const j = await r.json(); detail = j.detail || ''; } catch (_) {}
+        if (path !== '/') {
+          listEl.innerHTML = `<li class="text-xs text-warning p-2">${detail || 'Path not found'} — falling back to /</li>`;
+          setTimeout(() => _browseLoadDir('/'), 400);
+          return null;
+        }
+        throw new Error(detail || `Error ${r.status}`);
+      }
+      return r.json();
+    })
     .then(data => {
+      if (!data) return;  // fallback already kicked in
       _browseCurrentPath = data.path;
       pathEl.textContent = data.path;
       let html = '';
@@ -744,15 +766,34 @@ function _browseLoadDir(path) {
         const parent = data.path.replace(/\/[^/]+\/?$/, '') || '/';
         html += `<li><button type="button" class="btn btn-ghost btn-xs w-full justify-start gap-2 font-normal" onclick="_browseLoadDir('${parent.replace(/'/g, "\\'")}')">📁 ..</button></li>`;
       }
-      data.dirs.forEach(d => {
+      (data.dirs || []).forEach(d => {
         const full = (data.path === '/' ? '/' : data.path + '/') + d;
         html += `<li><button type="button" class="btn btn-ghost btn-xs w-full justify-start gap-2 font-normal" onclick="_browseLoadDir('${full.replace(/'/g, "\\'")}')">📁 ${d}</button></li>`;
       });
-      if (!data.dirs.length && data.path === '/') html = '<li class="text-xs opacity-50 p-2">No folders found</li>';
+      if (!(data.dirs || []).length && data.path === '/') html = '<li class="text-xs opacity-50 p-2">No folders found</li>';
       listEl.innerHTML = html;
     })
-    .catch(() => { listEl.innerHTML = '<li class="text-xs text-error p-2">Failed to load</li>'; });
+    .catch((e) => { listEl.innerHTML = `<li class="text-xs text-error p-2">Failed to load${e && e.message ? ': ' + e.message : ''}</li>`; });
 }
+/* Centralised cleanup that fires whenever the active project changes
+ * (My Files → different folder). Drops per-project UI caches and
+ * reloads the My Hub "Recents" so chats/notes shown there belong to
+ * the newly-opened folder, not the previous one. */
+function _onProjectSwitched() {
+  // Per-project annotation cache.
+  if (typeof Annotations !== 'undefined' && Annotations.reset) {
+    try { Annotations.reset(); } catch (_) {}
+  }
+  // Forget the active chat thread — it belonged to the prior project
+  // and the backend now scopes /api/chat/threads to the new folder.
+  try { currentThreadId = null; } catch (_) {}
+  // Refresh My Hub Recents (chats + notes) for the new folder. The
+  // function itself no-ops when the welcome tab isn't mounted.
+  if (typeof loadHubRecent === 'function') {
+    try { loadHubRecent(); } catch (_) {}
+  }
+}
+
 async function submitFolderPicker() {
   const errEl = document.getElementById('folder-picker-error');
   const loadEl = document.getElementById('folder-picker-loading');
@@ -767,7 +808,11 @@ async function submitFolderPicker() {
       method: 'POST',
       body: { path: _browseCurrentPath }
     });
-    
+    // Drop per-project caches (notes, bookmarks, chat thread, hub
+    // recents) so the new project's data never collides with the
+    // previous one's.
+    _onProjectSwitched();
+
     if (data.needs_bootstrap) {
       // Open bootstrap wizard
       openBootstrapWizard(_browseCurrentPath);
@@ -1050,16 +1095,20 @@ async function loadGraph() {
     currentGraph = data;
     renderGraph(data);
     const shown = (data.nodes||[]).length, total = data.total_nodes||shown;
-    document.getElementById('status-nodes').textContent = data.truncated ? `Nodes: ${shown}/${total}` : `Nodes: ${shown}`;
+    const sn = document.getElementById('status-nodes');
+    if (sn) sn.textContent = data.truncated ? `Nodes: ${shown}/${total}` : `Nodes: ${shown}`;
     const edgeShown = (data.edges||[]).length, edgeTotal = data.total_edges||edgeShown;
-    document.getElementById('status-edges').textContent = data.edges_truncated ? `Edges: ${edgeShown}/${edgeTotal}` : `Edges: ${edgeShown}`;
-    document.getElementById('status-dot').classList.add('bg-success');
-    document.getElementById('status-text').textContent = 'Connected';
+    const se = document.getElementById('status-edges');
+    if (se) se.textContent = data.edges_truncated ? `Edges: ${edgeShown}/${edgeTotal}` : `Edges: ${edgeShown}`;
+    const sd = document.getElementById('status-dot');
+    if (sd) sd.classList.add('bg-success');
+    const st = document.getElementById('status-text');
+    if (st) st.textContent = 'Connected';
     fetchIndexCount();
     setTimeout(loadWordCloud, 200);
     // No longer auto-select the largest node on load — leave the graph
     // unselected so the Welcome tab remains visible by default.
-  } catch (e) { console.error(e); document.getElementById('status-text').textContent = 'Error'; }
+  } catch (e) { console.error(e); const st = document.getElementById('status-text'); if (st) st.textContent = 'Error'; }
   finally { overlay.classList.add('hidden'); }
 }
 
@@ -3872,8 +3921,10 @@ async function deleteIndex() {
       if (ev) ev.textContent = '0';
       if (graphChart) { graphChart.dispose(); graphChart = null; }
       currentGraph = null;
-      document.getElementById('status-nodes').textContent = '';
-      document.getElementById('status-edges').textContent = '';
+      const sn = document.getElementById('status-nodes');
+      if (sn) sn.textContent = '';
+      const se = document.getElementById('status-edges');
+      if (se) se.textContent = '';
       loadFolderTree();
     } else { showToast('Failed to delete index', 'error'); }
   } catch (e) { showToast('Error: ' + e.message, 'error'); }
@@ -4664,8 +4715,24 @@ const Annotations = (function () {
     }
   }
 
+  // Reset every in-memory cache. Annotations are stored per-project
+  // (`<project>/_apollo/annotations.json`), but node IDs collide across
+  // projects (e.g. `file::index.html` exists in many projects), so any
+  // cache keyed by node id will leak entries between projects unless
+  // we explicitly drop it on every project switch. Call this from the
+  // `/api/projects/open` flow.
+  function reset() {
+    _byNodeCache = {};
+    _noteCountsByNodeId = {};
+    _noteCountsByFilePath = {};
+    _noteIndexLoaded = false;
+    editingNoteId = null;
+    pendingSel = null;
+  }
+
   return {
     init,
+    reset,
     applyToDetail,
     toggleBookmark,
     getForNode,

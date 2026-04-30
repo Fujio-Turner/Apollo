@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch for Terraform file parsing.",
+  "extensions": [".tf"],
+  "_extensions": "File extensions this plugin claims."
+}

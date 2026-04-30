@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, Jupyter notebooks fall through to the generic text indexer.",
+  "extensions": [".ipynb"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot)."
+}
