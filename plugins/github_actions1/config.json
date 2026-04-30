@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch for GitHub Actions workflow parsing.",
+  "extensions": [".yml", ".yaml"],
+  "_extensions": "File extensions this plugin claims."
+}

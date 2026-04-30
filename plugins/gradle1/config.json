@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch for Gradle build script parsing.",
+  "extensions": [".gradle", ".gradle.kts"],
+  "_extensions": "File extensions this plugin claims."
+}

@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch — when false, this plugin is skipped during indexing.",
+  "filenames": ["CMakeLists.txt"],
+  "_filenames": "Exact filename matches to parse.",
+  "extensions": [".cmake"],
+  "_extensions": "File extensions this plugin claims (lower-case, leading dot)."
+}

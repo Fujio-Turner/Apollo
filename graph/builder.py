@@ -626,22 +626,29 @@ class GraphBuilder:
                 if base in self._symbol_table:
                     self.graph.add_edge(class_id, self._symbol_table[base], type="inherits")
 
-        # Imports
+        # Imports. Plugin emit shapes vary: the python3 plugin always
+        # ships a ``names`` list, but doc-style plugins (markdown_gfm,
+        # html5, …) emit ``{module, alias, line, kind}`` without
+        # ``names``. Read defensively so any plugin's import contract
+        # works without crashing the build.
         self._file_imports[rel_path] = parsed["imports"]
         for imp in parsed["imports"]:
-            if imp["names"]:
-                label = f"from {imp['module']} import {', '.join(imp['names'])}"
+            names = imp.get("names") or []
+            module = imp.get("module", "")
+            line = imp.get("line", 0)
+            if names:
+                label = f"from {module} import {', '.join(names)}"
             else:
-                label = f"import {imp['module']}"
-            imp_id = f"import::{rel_path}::{imp['module']}::L{imp['line']}"
+                label = f"import {module}"
+            imp_id = f"import::{rel_path}::{module}::L{line}"
             self.graph.add_node(
                 imp_id,
                 type="import",
                 name=label,
                 path=rel_path,
-                module=imp["module"],
-                names=imp["names"],
-                line=imp["line"],
+                module=module,
+                names=names,
+                line=line,
                 level=imp.get("level", 0),
             )
             self.graph.add_edge(file_id, imp_id, type="imports")
@@ -812,16 +819,20 @@ class GraphBuilder:
         """Resolve function calls to their targets using the symbol table."""
         rel_path = parsed["rel_path"]
 
-        # Build a local import map: short_name -> qualified module path
+        # Build a local import map: short_name -> qualified module path.
+        # Read import fields defensively because non-Python plugins
+        # (markdown_gfm, html5) omit ``names`` from their import dicts.
         import_map: dict[str, str] = {}
         for imp in parsed["imports"]:
-            if imp["names"]:
-                for name in imp["names"]:
-                    import_map[name] = f"{imp['module']}.{name}"
+            names = imp.get("names") or []
+            module = imp.get("module", "")
+            if names:
+                for name in names:
+                    import_map[name] = f"{module}.{name}"
             else:
-                parts = imp["module"].split(".")
-                short = imp["alias"] or parts[-1]
-                import_map[short] = imp["module"]
+                parts = module.split(".")
+                short = imp.get("alias") or (parts[-1] if parts else module)
+                import_map[short] = module
 
         # Resolve calls in functions
         for func in parsed["functions"]:

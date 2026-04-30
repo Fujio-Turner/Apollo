@@ -2,7 +2,14 @@
 Chat history persistence — stores conversation threads.
 
 Uses Couchbase Lite when available (collection: "chat_threads"),
-falls back to a JSON file at .apollo/chat_history.json.
+falls back to a JSON file at <project>/_apollo/chat_history.json
+(or .apollo/chat_history.json when no project is open).
+
+When a ``project_manager`` is supplied, thread storage is scoped to the
+currently-open project so each folder keeps its own "Recents":
+  * JSON backend: storage path follows the active project root.
+  * CBL backend:  thread docs are tagged with ``project_id`` and
+                  ``list_threads`` / ``get_thread`` filter on it.
 """
 from __future__ import annotations
 
@@ -13,20 +20,48 @@ from pathlib import Path
 from typing import Optional
 
 
+# Global fallback used when no project is open. Tests monkeypatch this.
 HISTORY_PATH = Path(".apollo/chat_history.json")
 
 
 class ChatHistory:
     """Manages chat thread persistence."""
 
-    def __init__(self, cbl_store=None):
+    def __init__(self, cbl_store=None, project_manager=None):
         self._cbl = cbl_store
         self._collection = None
+        self._project_manager = project_manager
         if self._cbl:
             try:
                 self._collection = self._cbl.cbl.get_or_create_collection("chat_threads")
             except Exception:
                 self._cbl = None
+
+    # ── Project-scoping helpers ─────────────────────────────────
+    def _current_project_id(self) -> Optional[str]:
+        """Return the active project's id, or None if no project is open."""
+        pm = self._project_manager
+        if pm is None:
+            return None
+        try:
+            manifest = pm.manifest
+            if manifest is None:
+                return None
+            return getattr(manifest, "project_id", None)
+        except Exception:
+            return None
+
+    def _history_path(self) -> Path:
+        """Resolve the JSON history path, preferring the active project."""
+        pm = self._project_manager
+        if pm is not None:
+            try:
+                root = pm.root_dir
+                if root is not None:
+                    return Path(root) / "_apollo" / "chat_history.json"
+            except Exception:
+                pass
+        return HISTORY_PATH
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -41,6 +76,13 @@ class ChatHistory:
             "model": model,
             "messages": [],
         }
+        # Tag with the active project_id so listings can be scoped per
+        # folder. Threads created before a project is opened (or with
+        # no ProjectManager wired in) get an empty tag and remain
+        # visible to "global" listings only.
+        pid = self._current_project_id()
+        if pid:
+            thread["project_id"] = pid
         self._save_thread(thread)
         return thread
 
@@ -80,7 +122,8 @@ class ChatHistory:
         return thread
 
     def get_thread(self, thread_id: str) -> dict | None:
-        """Load a single thread by ID."""
+        """Load a single thread by ID (scoped to the active project)."""
+        active_pid = self._current_project_id()
         if self._cbl and self._collection:
             try:
                 doc_json = self._cbl.cbl.get_document_json(self._collection, thread_id)
@@ -88,6 +131,13 @@ class ChatHistory:
                     data = json.loads(doc_json)
                     data["id"] = thread_id
                     data.pop("_id", None)
+                    # Project scoping: if a project is open, only return
+                    # threads belonging to it (untagged threads are
+                    # treated as global and remain visible).
+                    if active_pid:
+                        tpid = data.get("project_id")
+                        if tpid and tpid != active_pid:
+                            return None
                     return data
             except Exception:
                 pass
@@ -98,12 +148,29 @@ class ChatHistory:
         return threads.get(thread_id)
 
     def list_threads(self) -> list[dict]:
-        """Return all threads (summary only: id, title, created_at, updated_at, model, message_count)."""
+        """Return all threads (summary only: id, title, created_at, updated_at, model, message_count).
+
+        When a project is open, the listing is filtered to threads
+        belonging to that project (legacy untagged threads are excluded
+        from per-project listings to avoid leaking history between
+        folders).
+        """
+        active_pid = self._current_project_id()
         if self._cbl and self._collection:
             try:
-                rows = self._cbl.cbl.execute_query(
-                    "SELECT META().id AS _id, title, created_at, updated_at, model, ARRAY_LENGTH(messages) AS message_count FROM chat_threads ORDER BY updated_at DESC"
-                )
+                if active_pid:
+                    rows = self._cbl.cbl.execute_query(
+                        "SELECT META().id AS _id, title, created_at, updated_at, model, project_id, "
+                        "ARRAY_LENGTH(messages) AS message_count "
+                        "FROM chat_threads WHERE project_id = $pid ORDER BY updated_at DESC",
+                        {"pid": active_pid},
+                    )
+                else:
+                    rows = self._cbl.cbl.execute_query(
+                        "SELECT META().id AS _id, title, created_at, updated_at, model, project_id, "
+                        "ARRAY_LENGTH(messages) AS message_count "
+                        "FROM chat_threads ORDER BY updated_at DESC"
+                    )
                 result = []
                 for row in rows:
                     result.append({
@@ -116,9 +183,39 @@ class ChatHistory:
                     })
                 return result
             except Exception:
-                return []
+                # Older Apollo CBL stores may not support parameterised
+                # queries; fall back to in-memory filtering.
+                try:
+                    rows = self._cbl.cbl.execute_query(
+                        "SELECT META().id AS _id, title, created_at, updated_at, model, project_id, "
+                        "ARRAY_LENGTH(messages) AS message_count "
+                        "FROM chat_threads ORDER BY updated_at DESC"
+                    )
+                    result = []
+                    for row in rows:
+                        if active_pid:
+                            row_pid = row.get("project_id")
+                            if row_pid and row_pid != active_pid:
+                                continue
+                            if not row_pid:
+                                # Legacy untagged thread: hide from
+                                # project-scoped listings.
+                                continue
+                        result.append({
+                            "id": row.get("_id"),
+                            "title": row.get("title", ""),
+                            "created_at": row.get("created_at", ""),
+                            "updated_at": row.get("updated_at", ""),
+                            "model": row.get("model", ""),
+                            "message_count": row.get("message_count", 0),
+                        })
+                    return result
+                except Exception:
+                    return []
 
-        # JSON fallback
+        # JSON fallback — the on-disk file already lives inside the
+        # active project's _apollo/ directory (see _history_path()), so
+        # everything in it belongs to that project by construction.
         threads = self._load_json()
         result = []
         for tid, t in threads.items():
@@ -167,15 +264,17 @@ class ChatHistory:
         self._save_json(threads)
 
     def _load_json(self) -> dict:
-        if HISTORY_PATH.exists():
+        path = self._history_path()
+        if path.exists():
             try:
-                with open(HISTORY_PATH) as f:
+                with open(path) as f:
                     return json.load(f)
             except Exception:
                 pass
         return {}
 
     def _save_json(self, threads: dict) -> None:
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(HISTORY_PATH, "w") as f:
+        path = self._history_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
             json.dump(threads, f, separators=(",", ":"))

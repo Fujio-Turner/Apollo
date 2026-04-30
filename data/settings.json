@@ -26,6 +26,134 @@
   "cblite_storage_root": null,
   "recent_projects": [],
   "plugins": {
+    "asciidoc1": {
+      "installed": true,
+      "description": "AsciiDoc plugin for Apollo. Parses .adoc/.asciidoc files to extract sections, includes, cross-references, links, code blocks, and document attributes.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/asciidoc1",
+      "author": "Fujio Turner",
+      "sha256": "95e9abae324056963d82dd3f952d27f810090e2a721109bc6fbadb5b5d382817"
+    },
+    "c1": {
+      "installed": true,
+      "description": "C source-file plugin for Apollo. Parses .c/.h files to extract functions, structs, and includes.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/c1",
+      "author": "Fujio Turner",
+      "sha256": "8d70e2d0d762927b9d69cf46f22dae1016286a6851df93c7d40e07f3b7f593e8"
+    },
+    "cmake1": {
+      "installed": true,
+      "description": "CMake plugin for Apollo. Parses CMakeLists.txt and .cmake files to extract targets, functions, variables, includes, and module dependencies.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/cmake1",
+      "author": "Fujio Turner",
+      "sha256": "1a29030d11a32d96c617ca67003b625a6e33a040edd78db63f8df6f93d36b6c3"
+    },
+    "cpp17": {
+      "installed": true,
+      "description": "C++17 source-file plugin for Apollo. Parses .cpp/.hpp files to extract classes, functions, methods, macros, and includes.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/cpp17",
+      "author": "Fujio Turner",
+      "sha256": "b66cc9756171b99bc4a77770722ec8a1fab9762e28adfe4c44957d77d5131a70"
+    },
+    "csharp12": {
+      "installed": true,
+      "description": "C# 12 source-file plugin for Apollo. Parses .cs files to extract classes, interfaces, methods, properties, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/csharp12",
+      "author": "Fujio Turner",
+      "sha256": "823728fb3dca5e4e997cb45c33ea4e73934d354c1ac5776e53680ae572eaedb6"
+    },
+    "csv1": {
+      "installed": true,
+      "description": "CSV file plugin for Apollo. Parses .csv files to extract headers, row counts, and structured table data for data documentation and dataset analysis.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/csv1",
+      "author": "Fujio Turner",
+      "sha256": "a0645fdf3ea1ed5704e9dfff074c97c606b1bdb71621abf704bbd959f34c982d"
+    },
+    "dart3": {
+      "installed": true,
+      "description": "Dart 3 plugin for Apollo. Parses .dart files to extract classes, methods, functions, imports/exports, and call sites with null-safety and async markers.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/dart3",
+      "author": "Fujio Turner",
+      "sha256": "0567e3a0121d2a4903b085eda720737590dc2344c17c9b10f7d71d4f07d2e5fe"
+    },
+    "docker_compose1": {
+      "installed": true,
+      "description": "Docker Compose plugin for Apollo. Parses docker-compose.yml/compose.yml files to extract services, image references, depends_on edges, volumes, and environment variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/docker_compose1",
+      "author": "Fujio Turner",
+      "sha256": "6c0786e3243887f58cbdaafb870a63d75417bbf46014a428bf5e6676c5405e79"
+    },
+    "dockerfile1": {
+      "installed": true,
+      "description": "Dockerfile plugin for Apollo. Parses Dockerfile files to extract FROM image references, RUN/COPY/ADD steps, ENV/ARG variables, and multi-stage build relationships.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/dockerfile1",
+      "author": "Fujio Turner",
+      "sha256": "43bb1292d9f1cadf6203df02b00f0578cabb605a0092cdd5d32f0f9e40c5b775"
+    },
+    "editorconfig1": {
+      "installed": true,
+      "description": "EditorConfig plugin for Apollo. Parses .editorconfig files to extract sections and properties as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/editorconfig1",
+      "author": "Fujio Turner",
+      "sha256": "b5779318222d763b15e8e35f57bae00b7a9b76f7cd4c4c04978ac1a47437c306"
+    },
+    "elixir1": {
+      "installed": true,
+      "description": "Elixir plugin for Apollo. Parses .ex/.exs files to extract modules, def/defp functions, import/alias statements, pipe chains, and macro/guard patterns.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/elixir1",
+      "author": "Fujio Turner",
+      "sha256": "3356716bcd9115b004b8967e5a4e926266289c4c478359b187a6fbb4fd2f3faf"
+    },
+    "env1": {
+      "installed": true,
+      "description": "Environment variables plugin for Apollo. Parses .env files to extract KEY=value pairs as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/env1",
+      "author": "Fujio Turner",
+      "sha256": "cd988d7bf2b8acb3deadf8c835215816d1dcca9f3a67c9b6c3b1a0dede53f1ea"
+    },
+    "github_actions1": {
+      "installed": true,
+      "description": "GitHub Actions plugin for Apollo. Parses .github/workflows/*.yml files to extract jobs as functions, uses declarations as imports, and environment variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/github_actions1",
+      "author": "Fujio Turner",
+      "sha256": "a4364e82ae0924d1a25f482469e511cca642ea745664fd210184c0152e0efec7"
+    },
+    "gitignore1": {
+      "installed": true,
+      "description": "Gitignore plugin for Apollo. Parses .gitignore files to extract ignore patterns and comments as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/gitignore1",
+      "author": "Fujio Turner",
+      "sha256": "adae1627b15a370912cfa7b608d0d2f8e20da3f4d12ffe75c51789ef1552f613"
+    },
+    "go1": {
+      "installed": true,
+      "description": "Go 1.x source-file plugin for Apollo. Parses .go files to extract packages, functions, structs, interfaces, methods, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/go1",
+      "author": "Fujio Turner",
+      "sha256": "8f6819147d1b25c0f8df46ec97df3eda41391e709a2007f8ef550b9b6be28d8b"
+    },
+    "gradle1": {
+      "installed": true,
+      "description": "Gradle plugin for Apollo. Parses build.gradle and build.gradle.kts files to extract dependencies as imports, tasks as functions, and versions as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/gradle1",
+      "author": "Fujio Turner",
+      "sha256": "1fdf583bd93403e19d47f03373f1886ffdafed6e5d5f49be90f8d97c1d6aa9a4"
+    },
     "html5": {
       "installed": true,
       "description": "HTML5 plugin for Apollo. Uses the Python standard library `html.parser` (zero third-party deps) to extract `<title>`, h1\u2013h6 sections with body text and parent/child hierarchy, asset import edges (`<script src>`, `<link rel=stylesheet>`, `<img>`, `<iframe>`, `<source>`), inline `<script>` / `<style>` / `<pre><code class=\"language-\u2026\">` code blocks, anchor + image links, `<meta>` tags, and tagged `<!-- TODO/FIXME -->` HTML comments from `.html` / `.htm` / `.xhtml` files.",
@@ -78,6 +206,78 @@
         "ignore_dir_markers": []
       }
     },
+    "java17": {
+      "installed": true,
+      "description": "Java 17 source-file plugin for Apollo. Parses .java files to extract classes, interfaces, methods, fields, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/java17",
+      "author": "Fujio Turner",
+      "sha256": "05a09ac6c982d1f0064c15a4f5b0254b207654d9540daacfc5a449f140f382e9"
+    },
+    "javascript1": {
+      "installed": true,
+      "description": "JavaScript 1.x source-file plugin for Apollo. Parses .js, .jsx, and .mjs files to extract functions, classes, imports, and variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/javascript1",
+      "author": "Fujio Turner",
+      "sha256": "c856573b6b39b9b4fe33680df3858954644e6c647bdc26fdcbfebededad048c1"
+    },
+    "json1": {
+      "installed": true,
+      "description": "JSON file plugin for Apollo. Parses .json files to extract top-level keys as variables, detects $ref schema references, and analyzes JSON structure for knowledge graph integration.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/json1",
+      "author": "Fujio Turner",
+      "sha256": "46d507cae636efa625b646cb98ae0c38f54a79723218e95b3d7d825dbad73a5e"
+    },
+    "jsonschema": {
+      "installed": true,
+      "description": "JSON Schema plugin for Apollo. Parses .schema.json files to extract schema definitions, $ref relationships, type hierarchies, and property specifications for data validation documentation.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/jsonschema",
+      "author": "Fujio Turner",
+      "sha256": "d9887245aa8af16e2aa21d5602cf3e61872e76b32732546474c60e67e7346de6"
+    },
+    "jupyter1": {
+      "installed": true,
+      "description": "Jupyter notebook plugin for Apollo. Parses .ipynb files to extract code cells as functions, markdown cells as sections, and imports/calls.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/jupyter1",
+      "author": "Fujio Turner",
+      "sha256": "7f67e22553e085d94d3a52af28d3b26fd5e8bcbf686607227e037b66b9635a8a"
+    },
+    "k8s_manifest1": {
+      "installed": true,
+      "description": "Kubernetes manifest plugin for Apollo. Parses K8s YAML to extract Deployments/Pods/Services as classes, containers as methods, environment variables, and image references as imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/k8s_manifest1",
+      "author": "Fujio Turner",
+      "sha256": "c592b6684ec4f7f9ffd1ddb7fd1f19c045ee87d2a5449a081a7144a99c1930e8"
+    },
+    "kotlin2": {
+      "installed": true,
+      "description": "Kotlin source-file plugin for Apollo. Parses .kt/.kts files to extract classes, interfaces, functions, methods, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/kotlin2",
+      "author": "Fujio Turner",
+      "sha256": "d13e215cfb72a91d300014ad6f35ad1484655938ee1cd3a05cffc846d9f0bfe1"
+    },
+    "lua5": {
+      "installed": true,
+      "description": "Lua 5 plugin for Apollo. Parses .lua files to extract functions, tables, require() statements, and module assignments.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/lua5",
+      "author": "Fujio Turner",
+      "sha256": "c051765c3c840cc359c4574ede2e5cab8f2c32e7e45b66c8495e8f2b694a3846"
+    },
+    "makefile1": {
+      "installed": true,
+      "description": "Makefile plugin for Apollo. Parses Makefile/GNUmakefile/.mk files to extract targets, prerequisites, recipes, variables, and include directives.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/makefile1",
+      "author": "Fujio Turner",
+      "sha256": "a972e47c6254e567a6d8704f165a84d966e74034097b4abe50025621631c8b76"
+    },
     "markdown_gfm": {
       "installed": true,
       "description": "GitHub Flavored Markdown plugin for Apollo. Uses `mistune` (with the `table` and `task_lists` extensions) plus `python-frontmatter` to extract sections (with body content, parent/child hierarchy, and anchor ids), code blocks, links, cross-doc imports, `[[wikilinks]]`, GFM/MkDocs/Pandoc callouts, tagged TODO/FIXME comments, tables, task items, and YAML/TOML frontmatter from `.md` / `.markdown` files.",
@@ -116,6 +316,38 @@
         "ignore_dir_markers": []
       }
     },
+    "maven1": {
+      "installed": true,
+      "description": "Maven plugin for Apollo. Parses pom.xml files to extract dependencies as imports, modules, and properties as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/maven1",
+      "author": "Fujio Turner",
+      "sha256": "1d8f1f78244bb8c074ff713d218680915bb987f2ec511926603a7883dbacd8a9"
+    },
+    "node20": {
+      "installed": true,
+      "description": "Node.js 20 source-file plugin for Apollo. Parses .js, .mjs, and .cjs files to extract functions, classes, requires, imports, exports, and dependencies.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/node20",
+      "author": "Fujio Turner",
+      "sha256": "ce8ece731e3f8886683ea58aaa143394959deb9f9e8b30237fcd6872462a1f1e"
+    },
+    "openapi3": {
+      "installed": true,
+      "description": "OpenAPI 3 plugin for Apollo. Parses OpenAPI 3.x YAML/JSON specs to extract endpoints, schemas, parameters, and $ref relationships for API documentation integration.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/openapi3",
+      "author": "Fujio Turner",
+      "sha256": "31f02716e0db32c7b5586d499136fd4d82d26bacda372cd18d81e2a1bd43ab8e"
+    },
+    "org1": {
+      "installed": true,
+      "description": "Org Mode plugin for Apollo. Parses .org files to extract headings, links, code blocks, properties, and TODO/task items.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/org1",
+      "author": "Fujio Turner",
+      "sha256": "7dc2ba8e45247f507d77a41288dd02c98b276d09e8401e3d431a84445e21ff3b"
+    },
     "pdf_pypdf": {
       "installed": true,
       "description": "PDF plugin for Apollo, powered by the `pypdf` library. Extracts page text from `.pdf` files and self-disables (falls back to the generic text indexer) when `pypdf` is not importable.",
@@ -137,6 +369,30 @@
         "ignore_files": [],
         "ignore_dir_markers": []
       }
+    },
+    "php8": {
+      "installed": true,
+      "description": "PHP 8 source-file plugin for Apollo. Parses .php files to extract classes, interfaces, functions, methods, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/php8",
+      "author": "Fujio Turner",
+      "sha256": "fffd78c2de30ed3925d4fb1bbbd6cb11c4beda73b067a7a16cf5c89fc26fc93f"
+    },
+    "powershell7": {
+      "installed": true,
+      "description": "PowerShell 7 plugin for Apollo. Parses .ps1 files to extract function definitions, dot-sourced scripts, cmdlet calls, module imports, and parameter declarations.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/powershell7",
+      "author": "Fujio Turner",
+      "sha256": "4e1cbfb1339a860f84c5a7fcd362426a2836931009695836a6a89cade1c796fc"
+    },
+    "properties1": {
+      "installed": true,
+      "description": "Java properties files plugin for Apollo. Parses .properties and .props files to extract key=value pairs as variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/properties1",
+      "author": "Fujio Turner",
+      "sha256": "9ed7cd477822243dff0a1cf91881dc26e3b383a96d152861749fd406e538309a"
     },
     "python3": {
       "installed": true,
@@ -213,6 +469,118 @@
           "conda-meta"
         ]
       }
+    },
+    "r1": {
+      "installed": true,
+      "description": "R plugin for Apollo. Parses .R/.r files to extract functions defined via <- and =, library()/require() calls, and assignments.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/r1",
+      "author": "Fujio Turner",
+      "sha256": "a69e779e3354d5a1d16a6d67416569904e51695f565a0f604354c34e8cd3022d"
+    },
+    "rmarkdown1": {
+      "installed": true,
+      "description": "R Markdown plugin for Apollo. Parses .Rmd files to extract R code chunks as functions, markdown sections, and R imports/calls.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/rmarkdown1",
+      "author": "Fujio Turner",
+      "sha256": "4eee8dd1e30f08ecfa098849c137f1637daeb5ed711f1deae4ab2d948b32a1e2"
+    },
+    "rst1": {
+      "installed": true,
+      "description": "reStructuredText plugin for Apollo. Parses .rst files to extract sections, directives, internal/external links, code blocks, and Sphinx cross-references.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/rst1",
+      "author": "Fujio Turner",
+      "sha256": "bd7c0fe9d31c879f83a2743a3b66fd78c69ff5a80c08026ed4871673a707732c"
+    },
+    "ruby3": {
+      "installed": true,
+      "description": "Ruby source-file plugin for Apollo. Parses .rb files to extract classes, modules, methods, functions, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/ruby3",
+      "author": "Fujio Turner",
+      "sha256": "46b24c3a1135d512418e1c3136fdca32725535c2b0e3144038b66931a0da4288"
+    },
+    "rust1": {
+      "installed": true,
+      "description": "Rust source-file plugin for Apollo. Parses .rs files to extract structs, enums, traits, functions, methods, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/rust1",
+      "author": "Fujio Turner",
+      "sha256": "43623b95b96a681318dec76d277bf4dfa5fd29105201d17930ce0a7be2828de0"
+    },
+    "scala3": {
+      "installed": true,
+      "description": "Scala 3 plugin for Apollo. Parses .scala files to extract classes, objects, traits, methods, import statements, and call sites.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/scala3",
+      "author": "Fujio Turner",
+      "sha256": "f0d4be78a7dcfb6bed3571287a622f21fa8dfd1849ea8c4a6e3b307722fb2940"
+    },
+    "shell1": {
+      "installed": true,
+      "description": "Bash/Shell plugin for Apollo. Parses .sh/.bash files to extract function definitions, sourced files (`. file.sh`), called commands, and variables.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/shell1",
+      "author": "Fujio Turner",
+      "sha256": "1a984f61885dafa1afae253818181804c3a828cac289a52ca8cb53870075c9ab"
+    },
+    "sql1": {
+      "installed": true,
+      "description": "SQL plugin for Apollo. Parses .sql files to extract CREATE TABLE/VIEW/FUNCTION/PROCEDURE definitions, column declarations, and table/view references from queries.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/sql1",
+      "author": "Fujio Turner",
+      "sha256": "247a11f49120d5545ebb98c33a77282810d13684cd756c6c69c9eeb4a9d19869"
+    },
+    "swift5": {
+      "installed": true,
+      "description": "Swift source-file plugin for Apollo. Parses .swift files to extract classes, structs, enums, protocols, functions, and methods.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/swift5",
+      "author": "Fujio Turner",
+      "sha256": "c6e0ca0f22d007fa5e252e3927992b4e3cfa03357139d6c389b49faf3c5bf312"
+    },
+    "terraform1": {
+      "installed": true,
+      "description": "Terraform plugin for Apollo. Parses .tf files to extract resources as functions, data sources as classes, variables as variables, and module sources as imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/terraform1",
+      "author": "Fujio Turner",
+      "sha256": "e3cf2b83c03fcb2fcaec49d6d3068e3cfd9992182a664dd8ac92f383a5859fe3"
+    },
+    "toml1": {
+      "installed": true,
+      "description": "TOML file plugin for Apollo. Parses .toml files to extract tables, keys, and dependency lists from Rust Cargo.toml, Python pyproject.toml, and other TOML configurations.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/toml1",
+      "author": "Fujio Turner",
+      "sha256": "46aed67c9d950d85a44fb9a724aea45f1d96e4a1ffa96b35a32195a73682c868"
+    },
+    "typescript1": {
+      "installed": true,
+      "description": "TypeScript source-file plugin for Apollo. Parses .ts/.tsx files to extract classes, interfaces, functions, methods, and imports.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/typescript1",
+      "author": "Fujio Turner",
+      "sha256": "1bcd31db977c96450b0f4f1ed9bb1e652e8ddf9d34f5707d440032e99a7ef187"
+    },
+    "xml1": {
+      "installed": true,
+      "description": "XML file plugin for Apollo. Parses .xml files to extract elements, attributes, namespace declarations, and internal id/href references for document structure analysis.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/xml1",
+      "author": "Fujio Turner",
+      "sha256": "985dbbfd2e6007d9c3546c87971173a96d673a6c0f68bd4e9d050cdad7ec05b0"
+    },
+    "yaml1": {
+      "installed": true,
+      "description": "YAML file plugin for Apollo. Parses .yaml/.yml files to extract keys, anchors/aliases, !include directives, and references for configuration documentation.",
+      "version": "1.0.0",
+      "url": "https://github.com/fujio-turner/Apollo/tree/main/plugins/yaml1",
+      "author": "Fujio Turner",
+      "sha256": "06ee60702027ad79cad48584829eb566508ba86f32bff2bc1e040e9425cda8bc"
     }
   },
   "appearance": {
@@ -247,5 +615,5 @@
     "max_age_days": 7,
     "rotated_total_mb": 1024
   },
-  "last_open_project": "/Users/fujioturner/Documents/git_folders/fujio-turner/grok_ai_coder"
+  "last_open_project": "/Users/fujioturner/Documents/git_folders/fujio-turner/sg-log-reader-demo"
 }

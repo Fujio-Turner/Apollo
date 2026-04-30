@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "_enabled": "Master switch for Maven pom.xml parsing.",
+  "extensions": ["pom.xml"],
+  "_extensions": "Filenames this plugin claims."
+}
