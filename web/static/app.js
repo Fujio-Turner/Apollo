@@ -2744,6 +2744,126 @@ async function sendChatMessage() {
   }
 }
 
+/* ── AI trace panel ────────────────────────────────────────────────
+   Insert a thin collapsible "Show trace" strip directly below the
+   assistant bubble. It records every event the backend emits — request
+   metadata, each tool-calling round, every tool call/return with timings
+   and a result preview, the final stream summary, and any errors — so
+   the user can audit exactly what the AI did to produce the answer
+   without leaving the chat. */
+function _ensureTracePanel(bubble) {
+  const wrapper = bubble.closest('.chat') || bubble.parentElement;
+  if (!wrapper) return null;
+  // The daisyUI `.chat` element is a CSS-grid with reserved cells for
+  // `chat-image` / `chat-header` / `chat-bubble` / `chat-footer`. A bare
+  // child div ends up in the avatar column, NOT under the bubble. So we
+  // attach the trace as a SIBLING of the wrapper (immediately after it)
+  // and align its left edge to the bubble via `.chat-start + .chat-trace`
+  // styling so it visually reads as "underneath" the assistant bubble.
+  const parent = wrapper.parentElement;
+  if (!parent) return null;
+  let panel = wrapper.nextElementSibling;
+  if (panel && panel.classList && panel.classList.contains('chat-trace') &&
+      panel.dataset.forBubble === wrapper.dataset.bubbleId) {
+    return panel;
+  }
+  // Tag the wrapper so we can match its trace panel later (e.g. on regen).
+  if (!wrapper.dataset.bubbleId) {
+    wrapper.dataset.bubbleId = 'b' + Math.random().toString(36).slice(2, 9);
+  }
+  panel = document.createElement('div');
+  panel.className = 'chat-trace text-[10px]';
+  panel.dataset.expanded = '0';
+  panel.dataset.forBubble = wrapper.dataset.bubbleId;
+  panel.innerHTML =
+    '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
+    '<span class="chat-trace-caret">▸</span>' +
+    '<span class="chat-trace-summary">Trace</span>' +
+    '</button>' +
+    '<div class="chat-trace-body hidden"></div>';
+  parent.insertBefore(panel, wrapper.nextSibling);
+  panel.querySelector('.chat-trace-toggle').addEventListener('click', () => {
+    const expanded = panel.dataset.expanded === '1';
+    panel.dataset.expanded = expanded ? '0' : '1';
+    panel.querySelector('.chat-trace-toggle').setAttribute('aria-expanded', expanded ? 'false' : 'true');
+    panel.querySelector('.chat-trace-caret').textContent = expanded ? '▸' : '▾';
+    panel.querySelector('.chat-trace-body').classList.toggle('hidden', expanded);
+  });
+  return panel;
+}
+
+function _renderTracePanel(panel, steps) {
+  if (!panel) return;
+  // Live summary: count tool calls and total elapsed time we can derive.
+  const calls = steps.filter(s => s.phase === 'tool_call').length;
+  const done = steps.find(s => s.phase === 'done');
+  const errored = steps.find(s => s.phase === 'error');
+  const summaryEl = panel.querySelector('.chat-trace-summary');
+  const parts = [`${steps.length} step${steps.length === 1 ? '' : 's'}`];
+  if (calls) parts.push(`${calls} tool call${calls === 1 ? '' : 's'}`);
+  if (done && done.total_dt != null) parts.push(`${done.total_dt}s`);
+  if (errored) parts.push('⚠ error');
+  summaryEl.textContent = 'Trace · ' + parts.join(' · ');
+
+  const body = panel.querySelector('.chat-trace-body');
+  body.innerHTML = steps.map(_traceRowHtml).join('');
+}
+
+function _traceRowHtml(s) {
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ph = s.phase || '';
+  let icon = '·';
+  let line = ph;
+  let cls = '';
+  if (ph === 'request') {
+    icon = '➤';
+    line = `request <span class="opacity-70">${esc(s.provider)}/${esc(s.model)}</span>` +
+      (s.context_node ? ` <span class="opacity-50">ctx=${esc(s.context_node)}</span>` : '') +
+      (s.history_len ? ` <span class="opacity-50">hist=${s.history_len}</span>` : '');
+  } else if (ph === 'round') {
+    icon = '↻';
+    line = `round ${s.round} <span class="opacity-70">finish=${esc(s.finish)}</span>` +
+      ` <span class="opacity-50">${s.dt}s · ${s.tool_calls} tc</span>`;
+  } else if (ph === 'tool_call') {
+    icon = '🔧';
+    line = `<span class="font-semibold">${esc(s.name)}</span>` +
+      ` <span class="opacity-60">${esc(s.args_preview)}</span>`;
+  } else if (ph === 'tool_return') {
+    icon = '↩';
+    // If the JSON tool result was re-encoded as TOON before being sent
+    // back to the LLM, show the savings inline so the user can see how
+    // much context the optimization is buying them.
+    const toonTag = (s.toon_bytes != null && s.toon_saved_pct != null)
+      ? ` <span class="opacity-60">· toon ${s.toon_bytes} B (-${s.toon_saved_pct}%)</span>`
+      : '';
+    line = `<span class="font-semibold">${esc(s.name)}</span> ` +
+      `<span class="opacity-60">→ ${s.bytes} B · ${s.dt}s</span>${toonTag}` +
+      (s.preview ? `<div class="trace-preview opacity-60">${esc(s.preview)}</div>` : '');
+  } else if (ph === 'return_result') {
+    icon = '✓';
+    const files = (s.files || []).length;
+    const refs = (s.node_refs || []).length;
+    line = `return_result <span class="opacity-60">${files} file${files === 1 ? '' : 's'} · ${refs} ref${refs === 1 ? '' : 's'} · ${esc(s.confidence) || '—'} · ${s.total_dt}s</span>`;
+  } else if (ph === 'stream_begin') {
+    icon = '✎';
+    line = `stream begin <span class="opacity-50">elapsed=${s.elapsed}s</span>`;
+  } else if (ph === 'done') {
+    icon = '●';
+    line = `done <span class="opacity-70">reason=${esc(s.reason)}</span> ` +
+      `<span class="opacity-50">${s.tokens != null ? s.tokens + ' tok · ' : ''}${s.bytes != null ? s.bytes + ' B · ' : ''}${s.total_dt}s</span>`;
+  } else if (ph === 'rounds_exhausted') {
+    icon = '⚠'; cls = 'text-warning';
+    line = `rounds exhausted <span class="opacity-60">last=${esc(s.last_finish)}</span>`;
+  } else if (ph === 'error') {
+    icon = '✗'; cls = 'text-error';
+    line = `error in ${esc(s.where)}: ${esc(s.message)}`;
+  } else {
+    line = `${esc(ph)}`;
+  }
+  return `<div class="chat-trace-row ${cls}"><span class="chat-trace-icon">${icon}</span><span class="chat-trace-text">${line}</span></div>`;
+}
+
 /* Stream a chat response into the given bubble. Returns the full text on
    success, or null on error (the bubble is updated with the error message).
    `historyForCall` is the prior message history sent to /api/chat. */
@@ -2780,21 +2900,76 @@ async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
     if (e instanceof ApiError && e.status === 503) checkChatStatus();
     return null;
   }
+  // Per-message trace events the AI emits while it works. Rendered into a
+  // collapsible "Show trace" panel below the bubble so the user can see
+  // exactly which tools were called, with what args, and how long each took.
+  const steps = [];
+  const trace = _ensureTracePanel(ad);
   try {
-    const reader=res.body.getReader(), dec=new TextDecoder(); let full='';
-    while(true) { const {done,value}=await reader.read(); if(done)break; for(const line of dec.decode(value,{stream:true}).split('\n')) {
-      if(!line.startsWith('data: '))continue; const raw=line.slice(6);
-      if(raw==='[DONE]')continue; if(raw.startsWith('[ERROR]')){ad.innerHTML=`<span class="text-error">${raw}</span>`;return null;}
-      const d = raw.replace(/\\r/g,'\r').replace(/\\n/g,'\n').replace(/\\\\/g,'\\');
-      full+=d; ad.innerHTML='<div class="md-content">'+marked.parse(formatChatContent(full))+'</div>';
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let full = '';
+    // Buffer for incomplete SSE lines that straddle a `read()` chunk boundary.
+    // Without this, a chunk that ends mid-line silently drops the trailing
+    // tokens — including a possibly-truncated `[DONE]` — leaving the UI
+    // stuck on the typing indicator forever.
+    let buf = '';
+    let chunkCount = 0;
+    let tDone = false;
+    const t0 = performance.now();
+    console.log('[chat] stream open');
+    const handleLine = (line) => {
+      if (!line.startsWith('data: ')) return null;
+      const raw = line.slice(6);
+      if (raw === '[DONE]') { tDone = true; return 'done'; }
+      if (raw.startsWith('[ERROR]')) {
+        console.error('[chat] server error frame:', raw);
+        ad.innerHTML = `<span class="text-error">${raw}</span>`;
+        return 'error';
+      }
+      if (raw.startsWith('[STEP] ')) {
+        try {
+          const ev = JSON.parse(raw.slice(7));
+          steps.push(ev);
+          _renderTracePanel(trace, steps);
+        } catch (e) {
+          console.warn('[chat] bad STEP frame:', raw, e);
+        }
+        return 'step';
+      }
+      const d = raw.replace(/\\r/g, '\r').replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
+      full += d;
+      ad.innerHTML = '<div class="md-content">' + marked.parse(formatChatContent(full)) + '</div>';
       if (firstChunk) {
-        // First content arrived — anchor the viewport at the TOP of the
-        // assistant bubble so the user can read the response from line 1
-        // instead of being yanked to the bottom as it grows.
         firstChunk = false;
         scrollAssistantToTop();
       }
-    }}
+      return 'text';
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunkCount++;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        const r = handleLine(line);
+        if (r === 'error') return null;
+      }
+    }
+    // Flush any tail bytes the decoder is still holding (covers a final
+    // `data: …` line that arrived without a trailing newline).
+    buf += dec.decode();
+    if (buf) {
+      const r = handleLine(buf.replace(/\n+$/, ''));
+      if (r === 'error') return null;
+    }
+    console.log(
+      '[chat] stream closed',
+      { chunks: chunkCount, bytes: full.length, steps: steps.length, sawDone: tDone, ms: (performance.now() - t0) | 0 },
+    );
     ad.querySelectorAll('pre code:not(.hljs)').forEach(b => hljs.highlightElement(b));
     _wireChipHandlers(ad);
     // Re-anchor after the final render (heights may have shifted due to
