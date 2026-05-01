@@ -35,3 +35,4 @@ Thumbs.db
 _dev_only/
 *.log
 _apollo*
+data/index.json
