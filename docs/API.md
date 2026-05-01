@@ -348,6 +348,142 @@ AST-extract a function, method, or class by name. `name` may be `foo`, `MyClass.
 | `name` | string | Symbol name *(required)*                          |
 | `md5`  | string | Optional version check. 409 on mismatch.          |
 
+### `GET /api/files/declarations`
+
+List every top-level declaration in a file (functions, classes, methods, and `const/let/var/def` bindings — including `new Map()` / `WeakMap()` / `Set()` / `WeakSet()`). Reads from the parser's `defines` edges and falls back to a single regex pass for files indexed by `text_parser`. Mirrors the AI's `list_declarations` tool.
+
+| Param   | Type   | Default | Description                                                                                              |
+|---------|--------|---------|----------------------------------------------------------------------------------------------------------|
+| `path`  | string | —       | File path *(required)*                                                                                   |
+| `kinds` | string | —       | Comma-separated kind filter: `function,class,method,const,let,var,def,map_decl,weakmap_decl,set_decl,weakset_decl` |
+| `limit` | int    | `200`   | Max declarations to return (capped at 500)                                                               |
+
+**Response**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "accuracy": "ast",
+  "count": 5,
+  "truncated": false,
+  "declarations": [
+    { "name": "parseTimeCache", "kind": "map_decl", "line_start": 2, "line_end": 2, "is_exported": false, "parent": "" },
+    { "name": "clearCaches",    "kind": "function", "line_start": 5, "line_end": 8, "is_exported": true,  "parent": "" }
+  ]
+}
+```
+
+`accuracy` is one of `ast` (parser produced the rows), `regex` (regex fallback used), or `graph_only` (file unreadable; only graph rows returned).
+
+### `GET /api/files/usages`
+
+Every line in a file that references one or more symbols, classified as `declaration` / `read` / `write` / `call` / `comment` / `string`. Returns line numbers + a single trimmed line per hit, no surrounding context (~10× less data than `/api/file/search`). Mirrors the AI's `find_symbol_usages` tool.
+
+**Two input modes (pass exactly one):**
+
+- `symbol=foo` — single-symbol mode. Returns the legacy flat shape.
+- `symbols=foo,bar,baz` — **batch mode** (max 20). Reads the file ONCE
+  and classifies every line against every requested symbol. Strongly
+  preferred when checking ≥2 symbols in the same file: folds N
+  round-trips into 1. See [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+  for the benchmark trace that motivated this addition.
+
+| Param     | Type   | Description                                                                                  |
+|-----------|--------|----------------------------------------------------------------------------------------------|
+| `path`    | string | File path *(required)*                                                                       |
+| `symbol`  | string | Single symbol name. Use this **OR** `symbols` (one of the two is required)                   |
+| `symbols` | string | Comma-separated list (max 20). Triggers batch mode and returns the `results[]` shape         |
+| `kinds`   | string | Comma-separated kind filter: `declaration,read,write,call,comment,string` (applies to all)   |
+
+**Response — single-symbol mode (`symbol=…`)**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "symbol": "parseTimeCache",
+  "md5": "...",
+  "accuracy": "text",
+  "count": 4,
+  "usages": [
+    { "line_no": 2,  "kind": "declaration", "text": "const parseTimeCache = new Map();" },
+    { "line_no": 6,  "kind": "write",       "text": "parseTimeCache.clear();" },
+    { "line_no": 10, "kind": "read",        "text": "if (parseTimeCache.has(s)) return parseTimeCache.get(s);" },
+    { "line_no": 11, "kind": "write",       "text": "parseTimeCache.set(s, 0);" }
+  ]
+}
+```
+
+**Response — batch mode (`symbols=parseTimeCache,clearCaches`)**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "md5": "...",
+  "accuracy": "text",
+  "total": 5,
+  "results": [
+    {
+      "symbol": "parseTimeCache",
+      "count": 4,
+      "usages": [
+        { "line_no": 2,  "kind": "declaration", "text": "const parseTimeCache = new Map();" },
+        { "line_no": 6,  "kind": "write",       "text": "parseTimeCache.clear();" }
+      ]
+    },
+    {
+      "symbol": "clearCaches",
+      "count": 1,
+      "usages": [
+        { "line_no": 5, "kind": "declaration", "text": "function clearCaches() {" }
+      ]
+    }
+  ]
+}
+```
+
+### `GET /api/files/outline`
+
+Sub-second outline of a file. Source files: top-level declaration tree (kinds + line ranges, `accuracy: "ast"`). HTML: regex-derived tag tree of landmark elements (`head`/`body`/`script`/`style`/`<h1..h6>`/`<section>`/`<main>`/…) plus the JS function/class/const declarations found inside each `<script>` block (`accuracy: "regex"`). For other files outside the parser graph, returns `outline: []` and `accuracy: "none"` rather than guessing. Mirrors the AI's `outline_file` tool.
+
+| Param   | Type | Default | Description                                |
+|---------|------|---------|--------------------------------------------|
+| `path`  | string | — | File path *(required)*                       |
+| `depth` | int    | `2` | Max nesting depth to descend (max 6). For HTML, the depth caps tag nesting; JS decls inside `<script>` are emitted as content (one level deeper than the script row) whenever `depth ≥ 2`. |
+
+**Response — source file (`accuracy: "ast"`)**
+```json
+{
+  "path": "cache.js",
+  "accuracy": "ast",
+  "count": 2,
+  "depth": 2,
+  "outline": [
+    { "kind": "function", "name": "clearCaches",  "line_start": 5, "line_end": 8,  "depth": 1 },
+    { "kind": "function", "name": "getOperators", "line_start": 9, "line_end": 13, "depth": 1 }
+  ]
+}
+```
+
+**Response — HTML file (`accuracy: "regex"`)**
+
+Replaces `file_search` for "what's in this HTML?" — the [§8.13 benchmark trace](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md) showed the model burning a round on `get_function_source` (which can't parse HTML) before this fallback existed.
+
+```json
+{
+  "path": "en/index.html",
+  "accuracy": "regex",
+  "count": 6,
+  "depth": 3,
+  "outline": [
+    { "kind": "tag",      "name": "<head>",            "line_start": 3,  "line_end": 5,  "depth": 2 },
+    { "kind": "tag",      "name": "<body>",            "line_start": 6,  "line_end": 18, "depth": 2 },
+    { "kind": "heading",  "name": "<h1>",              "line_start": 7,  "line_end": 7,  "depth": 1 },
+    { "kind": "tag",      "name": "<section #main>",   "line_start": 8,  "line_end": 10, "depth": 3 },
+    { "kind": "script",   "name": "<script>",          "line_start": 11, "line_end": 17, "depth": 3 },
+    { "kind": "function", "name": "clearCaches",       "line_start": 12, "line_end": 12, "depth": 4 },
+    { "kind": "const",    "name": "operatorsCache",    "line_start": 15, "line_end": 15, "depth": 4 },
+    { "kind": "class",    "name": "Helper",            "line_start": 16, "line_end": 16, "depth": 4 }
+  ]
+}
+```
+
 ---
 
 ## Search
@@ -367,7 +503,23 @@ Full-text search over indexed symbols.
 { "results": [{ "id": "abc", "name": "parse_file", "type": "function", "path": "src/parser.py", "line_start": 12, "score": 0.95 }] }
 ```
 
-### `POST /api/project/search`
+### `POST /api/project/search` ⚠️ Deprecated for AI/LLM file-named queries
+
+> **Deprecated.** Prefer the Phase 8 endpoints when the user already
+> knows the target file or symbol:
+> - [`GET /api/files/outline`](#get-apifilesoutline) for "what's in file X"
+> - [`GET /api/files/declarations`](#get-apifilesdeclarations) for
+>   "list everything declared in file X" (replaces regexes like
+>   `function|class|def`)
+> - [`GET /api/files/usages`](#get-apifilesusages) for "where is symbol Y
+>   used in file X"
+>
+> The chat service now strips `project_search` and `file_search` from
+> the LLM tool catalog whenever the user names a specific file. See
+> [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+> for the trace that motivated the change. The HTTP route is still
+> served unchanged for non-LLM callers; there is no scheduled removal
+> date.
 
 Grep across the indexed project. Returns matches with file/line/context. Read-only. Mirrors the AI's `project_search` tool. Hard caps: 500 matches or 200 KB of snippet bytes (whichever first).
 
@@ -394,7 +546,23 @@ Grep across the indexed project. Returns matches with file/line/context. Read-on
 }
 ```
 
-### `POST /api/file/search`
+### `POST /api/file/search` ⚠️ Deprecated for AI/LLM file-named queries
+
+> **Deprecated.** Use one of the structured Phase 8 endpoints instead:
+> - [`GET /api/files/outline`](#get-apifilesoutline) — sub-second
+>   declaration tree of a file. Use this on first contact.
+> - [`GET /api/files/declarations`](#get-apifilesdeclarations) — exact
+>   list of every top-level declaration with line ranges.
+> - [`GET /api/files/usages`](#get-apifilesusages) — every line in a
+>   file that references a given symbol, classified as
+>   `declaration` / `read` / `write` / `call` / `comment` / `string`.
+>
+> The chat service now strips `file_search` and `project_search` from
+> the LLM tool catalog whenever the user names a specific file. See
+> [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+> for the rationale and the benchmark trace. The HTTP route is still
+> served unchanged for non-LLM callers; there is no scheduled removal
+> date.
 
 Grep within a single file. Read-only. Mirrors the AI's `file_search` tool. Cap: 200 matches.
 

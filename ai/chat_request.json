@@ -1,23 +1,132 @@
 {
-  "_comment": "Boilerplate request payload sent to OpenAI-compatible chat APIs (xAI/Grok, OpenAI, Gemini, Anthropic, Llama-via-Groq). The model, dynamic context hints, conversation history, and the user message are appended at request time. Edit this file to tune the system prompt or tool catalog without touching code. The original (pre-tuning) version is preserved in chat_request_v1.json for rollback.",
+  "_comment": "Boilerplate request payload sent to OpenAI-compatible chat APIs (xAI/Grok, OpenAI, Gemini, Anthropic, Llama-via-Groq). The model, dynamic context hints, conversation history, and the user message are appended at request time. Edit this file to tune the system prompt or tool catalog without touching code. Snapshots: chat_request_v1.json (original, pre-tuning), chat_request_v2.json (after PLAN_MORE_LOCAL_AI_FUNCTIONS phases 1-4), chat_request_v3.json (pre-Phase-8 baseline). Always copy the current chat_request.json to chat_request_v{next}.json BEFORE editing it, so each tuning round is rollback-able.",
   "messages": [
     {
       "role": "system",
-      "content": "You have no write access. Never attempt to modify files or run code.\n\nYou have tools to query the user's indexed graph. Use them when the question is about their files, code, functions, classes, imports, or project structure. For general questions (greetings, explanations, opinions, non-code topics), just answer directly \u2014 no tool needed.\n\nTool results come back in TOON (Token-Oriented Object Notation) instead of JSON to save context. TOON uses indentation for nesting and a CSV-like header `[N,]{field1,field2,\u2026}:` followed by one comma-separated row per item for uniform arrays. For example, `results[3,]{id,name,type,path,line_start}:` is followed by 3 lines of CSV data, and each row maps positionally to those fields.\n\nAlways respond in clean Markdown. Use ##, ###, bullets, **bold**, `inline code`, and fenced code blocks. Prefer short paragraphs.\n\nTool selection cheat-sheet (prefer the right-hand tool to save rounds):\n- Multiple nodes?            \u2192 batch_get_nodes (NOT sequential get_node)\n- Multiple file ranges?      \u2192 batch_file_sections (NOT sequential get_file_section)\n- Folder shape?              \u2192 get_directory_tree (NOT project_search)\n- 'How is X connected to Y?' \u2192 get_paths_between\n- 'What would break?'        \u2192 get_transitive_imports / get_inheritance_tree\n- 'Who changed this?'        \u2192 get_git_context\n- 'Where does this start?'   \u2192 detect_entry_points\n- 'Most complex code?'       \u2192 get_code_metrics\n- 'Tests for X?'             \u2192 find_test_correspondents\n- 'Same signature as X?'     \u2192 search_graph_by_signature\n- 'Notes mentioning X?'      \u2192 search_notes_fulltext\n\nWorkflow when the user asks a multi-file/multi-symbol question:\n1. Use `search_graph_multi` with synonyms when the topic is fuzzy (e.g. [\"couchbase\",\"cblite\",\"lite\"]).\n2. Use `get_neighbors` (not multiple `get_node` calls) when exploring a cluster of related nodes.\n3. **You are limited to a maximum of 3 tool-call rounds total per user message.** Prefer ONE `search_graph_multi` over many sequential `search_graph` calls. Do not re-issue near-duplicate queries \u2014 if you've already searched for \"work\" as a function, do NOT also search for \"work function\" / \"work method\" / \"work class\" one-by-one; pass them all to `search_graph_multi` in a single call.\n4. **As soon as you can answer the user's actual question with reasonable confidence, call `return_result`.** It is far better to ship a `confidence=med` answer than to keep digging and time out. Exhausting the round budget yields a worse user experience than a partial answer with a clear \"could not verify X\" caveat.\n5. `return_result(summary, files, node_refs)` \u2014 do NOT just emit prose. When you reference a code entity, wrap its node ID in double brackets like [[func::path/file.py::name]] so the UI can highlight it.\n   - The `summary` field MUST itself be well-formatted Markdown (headings, bullets, code blocks).\n   - Pass file paths in `files` and node IDs in `node_refs` \u2014 the UI renders them as clickable chips, so do NOT also list them inline in the summary.\n   - Set `confidence` to \"high\", \"med\", or \"low\" so the UI can show a status dot.\n\nWorkflow when the user asks about THEIR notes, bookmarks, highlights, or \"what did I save / annotate\":\n1. For keyword queries, prefer `search_notes_fulltext` over `list_notes`.\n2. Otherwise call `list_notes` (optionally with `type=\"note\"` or `type=\"bookmark\"`). This returns the user's own annotations with their `target` (file path or graph node ID), `content`, `tags`, and `created_at`. After calling `list_notes`, you may follow up with `notes_by_target` or `get_node` in the same round if needed.\n3. For each annotation pointing at a graph node, you may call `get_node` or `get_neighbors` to bring in relationship context (callers, callees, imports, defining file). For file targets, use `get_file_section`.\n4. Cite annotation IDs (e.g. `an::a1b2c3...`) and the target node IDs in your final `return_result` so the UI can chip them.\n\nWorkflow when debugging a specific file or unfamiliar source:\n1. On first contact with an unknown repo, prefer `detect_entry_points` \u2192 `get_directory_tree` \u2192 `get_wordcloud(strong)` over scattershot project_search calls.\n2. Call `file_stats(path)` first for any file question \u2014 it is extremely cheap and tells you size, line count, md5, function/class counts, and top-level imports.\n3. If the user is unsure which file is involved, use `project_search(pattern)` to grep across the indexed project. Default context is 5 lines before/after each match.\n4. Drill in with `get_function_source(path, name)` or `get_file_section(path, start, end)` to read targeted slices INSTEAD of asking the user to paste the file. When you need multiple ranges, use `batch_file_sections`. These tools are read-only \u2014 you can never modify files; just describe what should change and where.\n5. Always cite line numbers as `path:line_no` so the user can jump to them.\n\nBe concise but thorough."
+      "content": "You have no write access. Never attempt to modify files or run code.\n\n**FILE-NAMED QUESTIONS — read this first.** When the user names a specific file (e.g. “in file en/index.html, what …”, “which function in foo.js …”, “where is X in bar.py”), your FIRST tool call MUST be `outline_file(path)` — NOT `file_search`, NOT `project_search`, NOT a fat regex. After `outline_file` you may also call `list_declarations` or `find_symbol_usages` IN THE SAME ROUND if the outline doesn't directly answer the question. `file_search` is FORBIDDEN as the first call for any question that names a single file. Issuing a kitchen-sink regex like `cache|Cache|store|memo|memory` is a bug — do not do it.\n\nYou have tools to query the user's indexed graph. Use them when the question is about their files, code, functions, classes, imports, or project structure. For general questions (greetings, explanations, opinions, non-code topics), just answer directly — no tool needed.\n\nTool results come back in TOON (Token-Oriented Object Notation) instead of JSON to save context. TOON uses indentation for nesting and a CSV-like header `[N,]{field1,field2,…}:` followed by one comma-separated row per item for uniform arrays. For example, `results[3,]{id,name,type,path,line_start}:` is followed by 3 lines of CSV data, and each row maps positionally to those fields.\n\nAlways respond in clean Markdown. Use ##, ###, bullets, **bold**, `inline code`, and fenced code blocks. Prefer short paragraphs.\n\nTool selection cheat-sheet (prefer the right-hand tool to save rounds):\n- Multiple nodes?            → batch_get_nodes (NOT sequential get_node)\n- Multiple file ranges?      → batch_file_sections (NOT sequential get_file_section)\n- Folder shape?              → get_directory_tree (NOT project_search)\n- 'How is X connected to Y?' → get_paths_between\n- 'What would break?'        → get_transitive_imports / get_inheritance_tree\n- 'Who changed this?'        → get_git_context\n- 'Where does this start?'   → detect_entry_points\n- 'Most complex code?'       → get_code_metrics\n- 'Tests for X?'             → find_test_correspondents\n- 'Same signature as X?'     → search_graph_by_signature\n- 'Notes mentioning X?'      → search_notes_fulltext\n- 'What’s in file X?'         → outline_file (NOT file_search)\n- 'Where is Y declared in file X?' → list_declarations (NOT file_search)\n- 'Where is Y used inside file X?' → find_symbol_usages (NOT file_search)\n- 'Where are Y, Z, W used inside file X?' → find_symbol_usages with `symbols=[Y,Z,W]` in ONE call (NOT N sequential calls)\n- file_search is LAST RESORT only — only when no symbol name is known AND the file isn’t outlineable. Default context to 2 lines, never 10.\n\nAnti-patterns — DO NOT do these (each one wastes a round):\n- ❌ Calling `list_declarations(path)` AFTER `outline_file(path)` returned a non-empty outline. The outline already contains every declaration with line ranges; calling list_declarations again is duplicate work.\n- ❌ Calling `get_directory_tree(root: \"<the project root>\")`. The tool is for SUB-directories. If you don’t know the project layout, call `get_directory_tree` with no `root` argument or use `detect_entry_points` first.\n- ❌ Calling `find_symbol_usages` with generic English words like `cache`, `Map`, `WeakMap`, `localStorage` AFTER `outline_file` already gave you the specific symbol names defined in the file (e.g. `parseTimeCache`, `operatorsCache`). Pass the SPECIFIC names from the outline as a single batch.\n- ❌ Calling `batch_file_sections` and `get_file_section` for OVERLAPPING line ranges in the same round (e.g. 3220-3270 in batch AND 3220-3270 standalone). Pick one tool — `batch_file_sections` if you need ≥2 ranges, `get_file_section` for exactly one. Never both for overlapping spans.\n- ❌ Re-issuing `search_graph` after `search_graph_multi` already covered the same query space. If `search_graph_multi([\"cache\", \"cached\", …])` returned results, do not follow up with `search_graph(\"cache processed data\")` — pass that as another query in the multi call instead.\n\nWorkflow when the user asks a multi-file/multi-symbol question:\n1. Use `search_graph_multi` with synonyms when the topic is fuzzy (e.g. [\"couchbase\",\"cblite\",\"lite\"]).\n2. Use `get_neighbors` (not multiple `get_node` calls) when exploring a cluster of related nodes.\n3. **You are limited to a maximum of 3 tool-call rounds total per user message.** Prefer ONE `search_graph_multi` over many sequential `search_graph` calls. Do not re-issue near-duplicate queries — if you've already searched for \"work\" as a function, do NOT also search for \"work function\" / \"work method\" / \"work class\" one-by-one; pass them all to `search_graph_multi` in a single call.\n4. **As soon as you can answer the user's actual question with reasonable confidence, call `return_result`.** It is far better to ship a `confidence=med` answer than to keep digging and time out. Exhausting the round budget yields a worse user experience than a partial answer with a clear \"could not verify X\" caveat.\n5. `return_result(summary, files, node_refs)` — do NOT just emit prose. When you reference a code entity, wrap its node ID in double brackets like [[func::path/file.py::name]] so the UI can highlight it.\n   - The `summary` field MUST itself be well-formatted Markdown (headings, bullets, code blocks).\n   - Pass file paths in `files` and node IDs in `node_refs` — the UI renders them as clickable chips, so do NOT also list them inline in the summary.\n   - Set `confidence` to \"high\", \"med\", or \"low\" so the UI can show a status dot.\n\nWorkflow when the user asks about THEIR notes, bookmarks, highlights, or \"what did I save / annotate\":\n1. For keyword queries, prefer `search_notes_fulltext` over `list_notes`.\n2. Otherwise call `list_notes` (optionally with `type=\"note\"` or `type=\"bookmark\"`). This returns the user's own annotations with their `target` (file path or graph node ID), `content`, `tags`, and `created_at`. After calling `list_notes`, you may follow up with `notes_by_target` or `get_node` in the same round if needed.\n3. For each annotation pointing at a graph node, you may call `get_node` or `get_neighbors` to bring in relationship context (callers, callees, imports, defining file). For file targets, use `get_file_section`.\n4. Cite annotation IDs (e.g. `an::a1b2c3...`) and the target node IDs in your final `return_result` so the UI can chip them.\n\nWorkflow when debugging a specific file or unfamiliar source:\n1. On first contact with an unknown repo, prefer `detect_entry_points` → `get_directory_tree` → `get_wordcloud(strong)` over scattershot project_search calls.\n2. Call `file_stats(path)` first for any file question — it is extremely cheap and tells you size, line count, md5, function/class counts, and top-level imports.\n3. If the user is unsure which file is involved, use `project_search(pattern)` to grep across the indexed project. Default context is 5 lines before/after each match.\n4. Drill in with `get_function_source(path, name)` or `get_file_section(path, start, end)` to read targeted slices INSTEAD of asking the user to paste the file. When you need multiple ranges, use `batch_file_sections`. These tools are read-only — you can never modify files; just describe what should change and where.\n5. Always cite line numbers as `path:line_no` so the user can jump to them.\n\nBe concise but thorough."
     }
   ],
   "tools": [
     {
       "type": "function",
       "function": {
+        "name": "outline_file",
+        "description": "Sub-second outline of a file. Source files: top-level declaration tree (kinds + line ranges). Markdown: heading tree. HTML: tag tree (head/body/script). Use this on first contact with any unfamiliar file BEFORE reaching for file_search or get_file_section.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "depth": {
+              "type": "integer",
+              "default": 2,
+              "maximum": 6
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_declarations",
+        "description": "List every top-level declaration in a file: functions, classes, methods, and module/file-level identifiers (const/let/var/def, including new Map() / WeakMap() / Set() / WeakSet() bindings). Returns name, kind, line range, export status, and parent. Use this INSTEAD of file_search with a regex like `function|class|def` — it is exact, AST-aware, and ~100× smaller.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "kinds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "function",
+                  "class",
+                  "method",
+                  "const",
+                  "let",
+                  "var",
+                  "def",
+                  "map_decl",
+                  "weakmap_decl",
+                  "set_decl",
+                  "weakset_decl"
+                ]
+              },
+              "description": "Optional filter on declaration kinds."
+            },
+            "limit": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 500
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find_symbol_usages",
+        "description": "Find every line in a file that references one or more symbols, classified as declaration / read / write / call / comment / string. Returns line numbers + a single trimmed line per hit, no surrounding context. Use this INSTEAD of file_search when you already know the symbol name(s) — it returns ~10× less data and tells you what each line is doing. **When checking 2+ symbols in the same file, ALWAYS pass `symbols: [..]` in ONE call instead of issuing N separate calls — the file is read once and the response is bounded.** Pass exactly one of `symbol` (single) or `symbols` (batch).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": "string",
+              "description": "Single symbol name. Use this OR `symbols`, not both. For 2+ symbols in the same file, prefer `symbols`."
+            },
+            "symbols": {
+              "type": "array",
+              "items": { "type": "string" },
+              "maxItems": 20,
+              "description": "Batch mode: up to 20 symbol names looked up in a single file read. Returns `results: [{symbol, usages, count}, …]`. Strongly preferred over multiple sequential calls."
+            },
+            "kinds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "declaration",
+                  "read",
+                  "write",
+                  "call",
+                  "comment",
+                  "string"
+                ]
+              },
+              "description": "Optional filter on usage kinds; applied to every symbol in batch mode."
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
         "name": "search_graph",
-        "description": "Search the knowledge graph by keyword or semantic similarity. Returns matching nodes (functions, classes, files, etc.) with their type, path, and line number.",
+        "description": "Search across files for symbols by name or semantic similarity. For 'where is X used in file Y', use `find_symbol_usages` instead. For 'what is in file Y', use `outline_file`. Returns matching nodes (functions, classes, files, etc.) with their type, path, and line number.",
         "parameters": {
           "type": "object",
           "properties": {
             "query": {
               "type": "string",
-              "description": "Search query \u2014 a function name, class name, keyword, or natural-language description."
+              "description": "Search query — a function name, class name, keyword, or natural-language description."
             },
             "top": {
               "type": "integer",
@@ -69,7 +178,7 @@
       "type": "function",
       "function": {
         "name": "get_wordcloud",
-        "description": "Get the most strongly-connected entity names in the graph, weighted by graph strength (sum of in+out degree across nodes sharing a name). Use this to understand which symbols are 'hubs' in the codebase \u2014 high-strength names are likely to be impacted by, or to impact, changes elsewhere. Returns up to `limit` items, each with `name`, `strength` (sum of degrees), and `count` (number of nodes sharing that name). Use `mode='all'` only when you need the long tail (weakly-connected helpers and singletons).",
+        "description": "Get the most strongly-connected entity names in the graph, weighted by graph strength (sum of in+out degree across nodes sharing a name). Use this to understand which symbols are 'hubs' in the codebase — high-strength names are likely to be impacted by, or to impact, changes elsewhere. Returns up to `limit` items, each with `name`, `strength` (sum of degrees), and `count` (number of nodes sharing that name). Use `mode='all'` only when you need the long tail (weakly-connected helpers and singletons).",
         "parameters": {
           "type": "object",
           "properties": {
@@ -94,7 +203,7 @@
       "type": "function",
       "function": {
         "name": "search_graph_multi",
-        "description": "Run multiple graph searches in parallel and return a single deduped, score-merged result list. Preferred over multiple `search_graph` calls \u2014 use this whenever you have 2+ related terms (e.g. ['couchbase','cblite','lite']) instead of issuing N sequential search_graph calls.",
+        "description": "Run multiple graph searches in parallel and return a single deduped, score-merged result list. Preferred over multiple `search_graph` calls — use this whenever you have 2+ related terms (e.g. ['couchbase','cblite','lite']) instead of issuing N sequential search_graph calls.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -125,7 +234,7 @@
       "type": "function",
       "function": {
         "name": "get_neighbors",
-        "description": "BFS-walk the knowledge graph from a node. Strongly preferred when exploring clusters \u2014 use this (instead of multiple get_node calls) to fetch callers/callees/importers in one round-trip.",
+        "description": "BFS-walk the knowledge graph from a node. Strongly preferred when exploring clusters — use this (instead of multiple get_node calls) to fetch callers/callees/importers in one round-trip.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -161,7 +270,7 @@
       "type": "function",
       "function": {
         "name": "file_stats",
-        "description": "Cheap structural summary of a file (size, line count, md5, language, function/class counts, top-level imports). Read-only. Call this first for any file question \u2014 it is extremely cheap.",
+        "description": "Cheap structural summary of a file (size, line count, md5, language, function/class counts, top-level imports). Read-only. Call this first for any file question — it is extremely cheap.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -235,7 +344,7 @@
       "type": "function",
       "function": {
         "name": "file_search",
-        "description": "Grep within a single file. Returns matches with N lines of context before/after. Read-only. Cap 200 matches.",
+        "description": "DO NOT call this as your first tool when the user names a single file — call `outline_file(path)` first. Regex grep within a single file. LAST-RESORT tool — use only when you DON'T know a symbol name AND `outline_file`/`list_declarations` returned nothing useful. If you have a symbol, use `find_symbol_usages` instead. Returns matches with N lines of context before/after. Read-only. Cap 200 matches. Default `context` to 2 lines, never 10. Kitchen-sink regexes like `cache|Cache|store|memo|memory` are forbidden.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -270,7 +379,7 @@
       "type": "function",
       "function": {
         "name": "project_search",
-        "description": "Grep across the indexed project. Returns matches with file/line/context. Read-only. Cap 500 matches or 200KB total. Use this when the user is unsure which file contains the issue.",
+        "description": "Regex grep across the project. Last-resort tool — try `search_graph_multi`, `find_symbol_usages`, or `list_declarations` first when you have a symbol name or know the target file. Returns matches with file/line/context. Read-only. Cap 500 matches or 200KB total. Use this only when the user is unsure which file contains the issue AND no symbol name is available.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -334,7 +443,7 @@
       "type": "function",
       "function": {
         "name": "notes_by_target",
-        "description": "Find every annotation attached to a single file or graph node. Useful for joining the user's notes/bookmarks to graph context \u2014 e.g. fetch every note attached to a node returned by `search_graph`. Provide exactly one of `file` or `node`.",
+        "description": "Find every annotation attached to a single file or graph node. Useful for joining the user's notes/bookmarks to graph context — e.g. fetch every note attached to a node returned by `search_graph`. Provide exactly one of `file` or `node`.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -378,7 +487,9 @@
           "properties": {
             "node_ids": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "maxItems": 20,
               "description": "List of node IDs (max 20)."
             },
@@ -393,7 +504,9 @@
               "description": "Include each node's edges_in/edges_out (default true)."
             }
           },
-          "required": ["node_ids"]
+          "required": [
+            "node_ids"
+          ]
         }
       }
     },
@@ -411,15 +524,27 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "path":  { "type": "string" },
-                  "start": { "type": "integer" },
-                  "end":   { "type": "integer" }
+                  "path": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer"
+                  },
+                  "end": {
+                    "type": "integer"
+                  }
                 },
-                "required": ["path", "start", "end"]
+                "required": [
+                  "path",
+                  "start",
+                  "end"
+                ]
               }
             }
           },
-          "required": ["ranges"]
+          "required": [
+            "ranges"
+          ]
         }
       }
     },
@@ -427,14 +552,28 @@
       "type": "function",
       "function": {
         "name": "get_directory_tree",
-        "description": "Recursive directory listing under the indexed project. Returns a flat array of {path, kind, depth, size_bytes, lang, node_count}. Honours the same plugin ignore lists used by the indexer. Use this to learn the SHAPE of an unfamiliar repo \u2014 project_search is grep, not 'ls -R'.",
+        "description": "Recursive directory listing under the indexed project. Returns a flat array of {path, kind, depth, size_bytes, lang, node_count}. Honours the same plugin ignore lists used by the indexer. Use this to learn the SHAPE of an unfamiliar repo — project_search is grep, not 'ls -R'.",
         "parameters": {
           "type": "object",
           "properties": {
-            "root":        { "type": "string", "default": ".", "description": "Sub-directory under the indexed root (default '.')." },
-            "depth":       { "type": "integer", "default": 3, "maximum": 6 },
-            "glob":        { "type": "string", "description": "Optional fnmatch pattern, e.g. '*.py' \u2014 filters file entries." },
-            "include_dirs":{ "type": "boolean", "default": true }
+            "root": {
+              "type": "string",
+              "default": ".",
+              "description": "Sub-directory under the indexed root (default '.')."
+            },
+            "depth": {
+              "type": "integer",
+              "default": 3,
+              "maximum": 6
+            },
+            "glob": {
+              "type": "string",
+              "description": "Optional fnmatch pattern, e.g. '*.py' — filters file entries."
+            },
+            "include_dirs": {
+              "type": "boolean",
+              "default": true
+            }
           }
         }
       }
@@ -447,8 +586,20 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "top_n": { "type": "integer", "default": 20, "maximum": 50 },
-            "group": { "type": "string", "enum": ["dir", "lang", "ext"], "default": "dir" }
+            "top_n": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 50
+            },
+            "group": {
+              "type": "string",
+              "enum": [
+                "dir",
+                "lang",
+                "ext"
+              ],
+              "default": "dir"
+            }
           }
         }
       }
@@ -461,14 +612,37 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "start_node_id": { "type": "string" },
-            "end_node_id":   { "type": "string" },
-            "max_length":    { "type": "integer", "default": 5, "maximum": 8 },
-            "max_paths":     { "type": "integer", "default": 5, "maximum": 20 },
-            "edge_types":    { "type": "array", "items": { "type": "string" } },
-            "shortest_only": { "type": "boolean", "default": false }
+            "start_node_id": {
+              "type": "string"
+            },
+            "end_node_id": {
+              "type": "string"
+            },
+            "max_length": {
+              "type": "integer",
+              "default": 5,
+              "maximum": 8
+            },
+            "max_paths": {
+              "type": "integer",
+              "default": 5,
+              "maximum": 20
+            },
+            "edge_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "shortest_only": {
+              "type": "boolean",
+              "default": false
+            }
           },
-          "required": ["start_node_id", "end_node_id"]
+          "required": [
+            "start_node_id",
+            "end_node_id"
+          ]
         }
       }
     },
@@ -480,12 +654,33 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "seed_node_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 },
-            "depth":         { "type": "integer", "default": 1, "maximum": 3 },
-            "edge_types":    { "type": "array", "items": { "type": "string" } },
-            "max_nodes":     { "type": "integer", "default": 200, "maximum": 500 }
+            "seed_node_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10
+            },
+            "depth": {
+              "type": "integer",
+              "default": 1,
+              "maximum": 3
+            },
+            "edge_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "max_nodes": {
+              "type": "integer",
+              "default": 200,
+              "maximum": 500
+            }
           },
-          "required": ["seed_node_ids"]
+          "required": [
+            "seed_node_ids"
+          ]
         }
       }
     },
@@ -493,14 +688,21 @@
       "type": "function",
       "function": {
         "name": "get_inheritance_tree",
-        "description": "For a class node, returns its full ancestor chain and all descendants reachable via `inherits` edges. Optionally pull each class's defines\u2192method edges so you can answer 'where is this method overridden?' in one round.",
+        "description": "For a class node, returns its full ancestor chain and all descendants reachable via `inherits` edges. Optionally pull each class's defines→method edges so you can answer 'where is this method overridden?' in one round.",
         "parameters": {
           "type": "object",
           "properties": {
-            "class_node_id":    { "type": "string" },
-            "include_methods":  { "type": "boolean", "default": false }
+            "class_node_id": {
+              "type": "string"
+            },
+            "include_methods": {
+              "type": "boolean",
+              "default": false
+            }
           },
-          "required": ["class_node_id"]
+          "required": [
+            "class_node_id"
+          ]
         }
       }
     },
@@ -512,11 +714,26 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "file_node_id": { "type": "string" },
-            "direction":    { "type": "string", "enum": ["in", "out", "both"], "default": "in" },
-            "max_depth":    { "type": "integer", "default": 5 }
+            "file_node_id": {
+              "type": "string"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "in",
+                "out",
+                "both"
+              ],
+              "default": "in"
+            },
+            "max_depth": {
+              "type": "integer",
+              "default": 5
+            }
           },
-          "required": ["file_node_id"]
+          "required": [
+            "file_node_id"
+          ]
         }
       }
     },
@@ -528,9 +745,27 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "node_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 50 },
-            "top_n":    { "type": "integer", "default": 20, "maximum": 100 },
-            "sort_by":  { "type": "string", "enum": ["complexity", "loc", "param_count"], "default": "complexity" }
+            "node_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 50
+            },
+            "top_n": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100
+            },
+            "sort_by": {
+              "type": "string",
+              "enum": [
+                "complexity",
+                "loc",
+                "param_count"
+              ],
+              "default": "complexity"
+            }
           }
         }
       }
@@ -539,15 +774,35 @@
       "type": "function",
       "function": {
         "name": "search_graph_by_signature",
-        "description": "Find functions/methods whose parameter list matches a pattern. Either pass `param_names` (ordered list of names) or `signature_hash` (exact match). Use this for 'what else has this signature?' questions \u2014 grep cannot answer this correctly.",
+        "description": "Find functions/methods whose parameter list matches a pattern. Either pass `param_names` (ordered list of names) or `signature_hash` (exact match). Use this for 'what else has this signature?' questions — grep cannot answer this correctly.",
         "parameters": {
           "type": "object",
           "properties": {
-            "param_names":       { "type": "array", "items": { "type": "string" } },
-            "param_annotations": { "type": "array", "items": { "type": "string" } },
-            "signature_hash":    { "type": "string" },
-            "fuzzy":             { "type": "boolean", "default": false, "description": "If true, match when the function's params START with the given list." },
-            "top":               { "type": "integer", "default": 20, "maximum": 50 }
+            "param_names": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "param_annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "signature_hash": {
+              "type": "string"
+            },
+            "fuzzy": {
+              "type": "boolean",
+              "default": false,
+              "description": "If true, match when the function's params START with the given list."
+            },
+            "top": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 50
+            }
           }
         }
       }
@@ -560,10 +815,17 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "node_id":           { "type": "string" },
-            "include_heuristic": { "type": "boolean", "default": true }
+            "node_id": {
+              "type": "string"
+            },
+            "include_heuristic": {
+              "type": "boolean",
+              "default": true
+            }
           },
-          "required": ["node_id"]
+          "required": [
+            "node_id"
+          ]
         }
       }
     },
@@ -577,7 +839,9 @@
           "properties": {
             "kinds": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "Optional filter, e.g. ['cli','http_route','main']"
             }
           }
@@ -592,13 +856,28 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "path":       { "type": "string" },
-            "name":       { "type": "string", "description": "Optional function/class name; resolves to its line range via the graph." },
-            "line_start": { "type": "integer" },
-            "line_end":   { "type": "integer" },
-            "limit":      { "type": "integer", "default": 10, "maximum": 30 }
+            "path": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional function/class name; resolves to its line range via the graph."
+            },
+            "line_start": {
+              "type": "integer"
+            },
+            "line_end": {
+              "type": "integer"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 10,
+              "maximum": 30
+            }
           },
-          "required": ["path"]
+          "required": [
+            "path"
+          ]
         }
       }
     },
@@ -610,11 +889,26 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "query": { "type": "string" },
-            "type":  { "type": "string", "enum": ["note", "bookmark", "highlight"] },
-            "top":   { "type": "integer", "default": 10, "maximum": 50 }
+            "query": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "note",
+                "bookmark",
+                "highlight"
+              ]
+            },
+            "top": {
+              "type": "integer",
+              "default": 10,
+              "maximum": 50
+            }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     },
@@ -622,7 +916,7 @@
       "type": "function",
       "function": {
         "name": "return_result",
-        "description": "FINAL ANSWER. Call this exactly once when you have enough information to answer the user. Bounds the tool-call loop and supplies structured citations the UI renders as clickable chips. **Never emit normal text after calling `return_result` \u2014 this ends the turn.**",
+        "description": "FINAL ANSWER. Call this exactly once when you have enough information to answer the user. Bounds the tool-call loop and supplies structured citations the UI renders as clickable chips. **Never emit normal text after calling `return_result` — this ends the turn.**",
         "parameters": {
           "type": "object",
           "properties": {

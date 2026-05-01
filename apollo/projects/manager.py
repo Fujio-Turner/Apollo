@@ -66,6 +66,62 @@ class ProjectManager:
                     pass  # Store close may fail; log but continue
             self._store = None
 
+    @staticmethod
+    def _ensure_gitignore_excludes_apollo(project_root: Path) -> bool:
+        """Append ``_apollo*`` ignore rules to the project's ``.gitignore``
+        if one exists and doesn't already exclude Apollo's per-project
+        state directories.
+
+        Apollo writes per-project data into ``_apollo/`` (manifest, graph,
+        cblite database, embeddings) and ``_apollo_web/`` (Phase 14 web
+        capture folder). The cblite database in particular routinely runs
+        into the multi-MB range — accidentally committing it bloats the
+        repo and pollutes diffs, so we proactively keep it out of git.
+
+        Idempotent: if any line in ``.gitignore`` already matches
+        ``_apollo``, ``_apollo/``, or ``_apollo*``, we leave the file
+        alone. Returns ``True`` if a write occurred.
+        """
+        gitignore = Path(project_root) / ".gitignore"
+        if not gitignore.exists():
+            # Don't create a .gitignore for projects that don't already
+            # have one — they may not be git-tracked at all.
+            return False
+
+        try:
+            existing_text = gitignore.read_text(encoding="utf-8")
+        except Exception:
+            return False
+
+        # Cheap idempotency check: any non-comment line that mentions
+        # "_apollo" is good enough — covers _apollo, _apollo/, _apollo*,
+        # /_apollo/, **/_apollo, etc.
+        for raw_line in existing_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "_apollo" in line:
+                return False  # Already handled.
+
+        block = (
+            "\n"
+            "# Apollo per-project state (graph, cblite database, embeddings,\n"
+            "# annotations, web captures). These directories can grow to many MB\n"
+            "# (the cblite database in particular) and are recreated locally on\n"
+            "# demand — keep them out of the repo.\n"
+            "_apollo/\n"
+            "_apollo_web/\n"
+        )
+        # Make sure we don't double-up newlines if the file already ends
+        # in one (or doesn't end in one at all).
+        prefix = "" if existing_text.endswith("\n") or existing_text == "" else "\n"
+        try:
+            with gitignore.open("a", encoding="utf-8") as f:
+                f.write(prefix + block)
+        except Exception:
+            return False
+        return True
+
     def open(self, path: Union[str, Path]) -> ProjectInfo:
         """Open an existing or new project.
         
@@ -106,6 +162,14 @@ class ProjectManager:
         self._manifest = manifest
         self._root_dir = path
         
+        # Best-effort: keep _apollo*/ out of the user's git repo so the
+        # multi-MB cblite database (and friends) don't get committed by
+        # accident. Only touches an existing .gitignore.
+        try:
+            self._ensure_gitignore_excludes_apollo(path)
+        except Exception:
+            pass
+
         return ProjectInfo.from_manifest(manifest)
 
     def init(
@@ -138,7 +202,13 @@ class ProjectManager:
         manifest.save()
         self._manifest = manifest
         self._root_dir = path
-        
+
+        # Mirror the gitignore safeguard from open() — same rationale.
+        try:
+            self._ensure_gitignore_excludes_apollo(path)
+        except Exception:
+            pass
+
         return ProjectInfo.from_manifest(manifest)
 
     def update_filters(self, filters: dict) -> ProjectInfo:

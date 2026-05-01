@@ -38,13 +38,43 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_INDEX_PATH = "data/index.json"
 DEFAULT_CBLITE_PATH = "data/graph.cblite2"
+# Legacy global hashes file. New code resolves the per-project location
+# via ``_hashes_path_for(target_dir)`` (see ``cmd_index``); this constant
+# is kept only so old callers / docs still see a defined name and so the
+# legacy-fallback read in ``cmd_index --incremental`` has somewhere to
+# look on first run after the per-project migration.
 HASHES_PATH = "data/file_hashes.json"
+
+
+def _hashes_path_for(target_dir: str) -> str:
+    """Resolve the per-project incremental-hashes file for ``target_dir``.
+
+    Apollo writes the file Phase D's incremental indexer uses to skip
+    unchanged files into ``<target_dir>/_apollo/file_hashes.json`` so
+    each project carries its own memory of what's been parsed. Without
+    that scoping, indexing project A then project B would read A's
+    stale table and silently skip files that genuinely differ between
+    the two trees (the same per-project-state argument that drove the
+    move of ``graph.json`` and the cblite bundle into ``_apollo/``).
+    """
+    return os.path.join(target_dir, "_apollo", "file_hashes.json")
 
 
 def _default_index_path(backend: str) -> str:
     if backend == "cblite":
         return DEFAULT_CBLITE_PATH
-    return DEFAULT_INDEX_PATH
+    # Prefer the gzipped variant when it already exists; otherwise fall back
+    # to the legacy plain-JSON path so existing installs keep loading their
+    # current ``data/index.json`` without the user having to pass ``--index``.
+    # New installs (neither file present) get the gzipped default — typically
+    # 5–10× smaller on disk for the kind of repeated-string content the
+    # graph serializes (see ``storage/json_store.py``).
+    gz_path = DEFAULT_INDEX_PATH + ".gz"
+    if os.path.exists(gz_path):
+        return gz_path
+    if os.path.exists(DEFAULT_INDEX_PATH):
+        return DEFAULT_INDEX_PATH
+    return gz_path
 
 
 def _open_store(args):
@@ -56,22 +86,46 @@ def _open_store(args):
 def _build_parsers(parser_name: str) -> list:
     """Build the parser list based on the --parser flag.
 
-    MarkdownParser handles .md/.markdown with rich AST-based extraction.
-    TextFileParser is always appended so non-code files (JSON, YAML, CSV,
-    plain text) are indexed regardless of the code-parser choice.
+    Order matters — :meth:`GraphBuilder._find_parser` returns the *first*
+    parser whose ``can_parse()`` returns True for a given file:
+
+    1. Discovered plugins from ``plugins/`` (e.g. html5, json1, dockerfile1).
+       Each plugin honours its own ``config.json`` ``enabled`` flag and
+       merged user overrides from ``data/settings.json``. This list mirrors
+       what :func:`web.server._build_active_parsers` uses, so a CLI index
+       and a web-UI index produce the same graph.
+    2. The legacy code parsers (TreeSitter / Python / Markdown).
+    3. ``TextFileParser`` as the universal fallback so plain-text / data
+       files (JSON, YAML, CSV, plain text, ``.html`` ≤ 1 MB) are still
+       indexed when no plugin claims them.
+
+    Until the plugin list was added here, CLI indexing silently dropped
+    every ``.html`` file larger than 1 MB because TextFileParser's size
+    cap is 1 MB and the html5 plugin never ran. See DESIGN.md
+    §"File-skipping invariants".
     """
+    from apollo.plugins import discover_plugins
+
+    plugins = list(discover_plugins())
     md_parser = MarkdownParser()
     text_parser = TextFileParser()
+
     if parser_name == "tree-sitter":
         ts = TreeSitterParser()
         # Fallback to AST parser for Python if tree-sitter-python isn't installed
-        return [ts, PythonParser(), md_parser, text_parser]
+        legacy = [ts, PythonParser(), md_parser]
     elif parser_name == "ast":
-        return [PythonParser(), md_parser, text_parser]
+        legacy = [PythonParser(), md_parser]
     else:
         # auto: prefer tree-sitter if available, fallback to ast
         ts = TreeSitterParser()
-        return [ts, PythonParser(), md_parser, text_parser]
+        legacy = [ts, PythonParser(), md_parser]
+
+    parsers = list(plugins) + legacy
+    # ``TextFileParser`` last — it's a fallback, never the preferred match.
+    if not any(isinstance(p, TextFileParser) for p in parsers):
+        parsers.append(text_parser)
+    return parsers
 
 
 def cmd_index(args):
@@ -87,13 +141,20 @@ def cmd_index(args):
     builder = GraphBuilder(parsers=parsers)
 
     if args.incremental:
+        # Resolve the per-project hashes file. Read the project-scoped
+        # location first; fall back to the legacy global path so users
+        # upgrading from an earlier Apollo don't pay a full rebuild on
+        # the first incremental run after the migration.
+        project_hashes_path = _hashes_path_for(target_dir)
         prev_hashes = {}
-        if os.path.exists(HASHES_PATH):
-            with open(HASHES_PATH) as f:
-                prev_hashes = json.load(f)
+        for candidate in (project_hashes_path, HASHES_PATH):
+            if os.path.exists(candidate):
+                with open(candidate) as f:
+                    prev_hashes = json.load(f)
+                break
         graph, new_hashes = builder.build_incremental(target_dir, prev_hashes)
-        os.makedirs(os.path.dirname(HASHES_PATH), exist_ok=True)
-        with open(HASHES_PATH, "w") as f:
+        os.makedirs(os.path.dirname(project_hashes_path), exist_ok=True)
+        with open(project_hashes_path, "w") as f:
             json.dump(new_hashes, f, separators=(",", ":"))
         changed = sum(1 for k in new_hashes if new_hashes[k] != prev_hashes.get(k))
         print(f"  Incremental: {changed} file(s) changed, {len(new_hashes)} total")

@@ -866,3 +866,647 @@ def search_notes_fulltext(annotation_manager, query: str,
     scored.sort(key=lambda kv: kv[0], reverse=True)
     return {"results": [r for _, r in scored[:top]],
             "count": len(scored), "query": query}
+
+
+# ─────────────────────────── Phase 8 (§8.3) ───────────────────────────
+#
+# File-shaped tools whose names + first-sentence descriptions exactly
+# match the noun phrases users put in their questions ("what's in this
+# file", "where is X declared / used in file Y"). These shift the model's
+# rational tool pick away from `file_search` (regex grep) and toward a
+# resolved-fact answer in round 0.
+
+# Map graph node `type` → declaration `kind` reported by list_declarations
+# and outline_file. We deliberately keep the surface narrow — the schema
+# enum in ai/chat_request.json is the source of truth for valid values.
+_DECL_KIND_FROM_NODE_TYPE = {
+    "function": "function",
+    "class": "class",
+    "method": "method",
+    "variable": "var",
+    "section": "section",   # markdown headings
+    "code_block": "code_block",
+    "table": "table",
+    "link": "link",
+    "task_item": "task_item",
+}
+
+# Patterns used when the file came in via `text_parser` fallback (no AST).
+# Match on a full source line; the first match wins.
+_FALLBACK_DECL_PATTERNS = [
+    ("function", re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(")),
+    ("function", re.compile(r"^\s*(?:export\s+(?:default\s+)?)?function\s*\*?\s*(\w+)\s*\(")),
+    ("class",    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?class\s+(\w+)\b")),
+    ("weakmap_decl", re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*new\s+WeakMap\s*\(")),
+    ("map_decl",     re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*new\s+Map\s*\(")),
+    ("weakset_decl", re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*new\s+WeakSet\s*\(")),
+    ("set_decl",     re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*new\s+Set\s*\(")),
+    ("const",        re.compile(r"^\s*(?:export\s+)?const\s+(\w+)\s*=")),
+    ("let",          re.compile(r"^\s*(?:export\s+)?let\s+(\w+)\s*=")),
+    ("var",          re.compile(r"^\s*(?:export\s+)?var\s+(\w+)\s*=")),
+]
+
+# All schema-permitted kinds (mirrors chat_request.json enum exactly).
+_DECL_KIND_ENUM = {
+    "function", "class", "method", "const", "let", "var", "def",
+    "map_decl", "weakmap_decl", "set_decl", "weakset_decl",
+    # Markdown / outline-only kinds (returned by outline_file but valid
+    # in list_declarations too):
+    "section", "code_block", "table", "link", "task_item",
+}
+
+
+def _resolve_file_node(graph: nx.DiGraph, path: str) -> tuple[str | None, dict]:
+    """Map a path → (file_node_id, node_data). Tolerates absolute or relative
+    paths and graphs that store either form on the node. Returns (None, {})
+    when no file node matches."""
+    if not path:
+        return None, {}
+    candidates = {
+        path,
+        path.lstrip("./"),
+        os.path.basename(path),
+    }
+    # Direct ID hits first.
+    for cand in (f"file::{path}", f"file::{path.lstrip('./')}"):
+        if cand in graph:
+            return cand, graph.nodes[cand]
+    for nid, data in graph.nodes(data=True):
+        if data.get("type") != "file":
+            continue
+        p = data.get("path") or ""
+        if not p:
+            continue
+        if p in candidates or path in (p, os.path.abspath(p)):
+            return nid, data
+        # Match by suffix (handles "en/index.html" against any deeper path).
+        if p.endswith("/" + path) or path.endswith("/" + p):
+            return nid, data
+    return None, {}
+
+
+def _is_exported_decl(node_data: dict, source_line: str | None) -> bool:
+    """Best-effort 'is this top-level / exported?' classification.
+
+    Source files vary wildly. Python defines exports by absence of a leading
+    underscore; JS/TS uses an explicit `export` keyword we can sniff on the
+    declaration line. Anything ambiguous returns False.
+    """
+    name = node_data.get("name") or ""
+    if name and name.startswith("_") and not name.startswith("__"):
+        return False
+    if source_line and re.match(r"^\s*export\b", source_line):
+        return True
+    # Python convention: any non-underscore top-level def is "exported".
+    if name and not name.startswith("_"):
+        return True
+    return False
+
+
+def _read_file_lines(graph: nx.DiGraph, root_dir: str | None,
+                     path: str) -> tuple[Path, list[str]]:
+    """Resolve and read a file under the indexed sandbox.
+
+    Wraps file_inspect.safe_path so we keep one place that decides what
+    "inside the project" means.
+    """
+    from apollo import file_inspect
+    p = file_inspect.safe_path(path, graph, root_dir)
+    if not p.is_file():
+        raise file_inspect.FileAccessError(f"Not a file: {p}", status_code=404)
+    with open(p, encoding="utf-8", errors="replace") as f:
+        lines = [ln.rstrip("\n") for ln in f]
+    return p, lines
+
+
+def list_declarations(graph: nx.DiGraph, root_dir: str | None,
+                      path: str,
+                      kinds: list[str] | None = None,
+                      limit: int = 200) -> dict:
+    """List every top-level declaration in `path`. Plan §8.3.1.
+
+    Reads the parser-built `defines` edges off the file node. Falls back
+    to a single regex pass when the file was indexed by `text_parser`
+    (no AST nodes attached); in that case `accuracy` is `"regex"`.
+    """
+    limit = max(1, min(int(limit), 500))
+    requested = set(kinds or []) if kinds else None
+    if requested:
+        requested = {k for k in requested if k in _DECL_KIND_ENUM}
+
+    file_id, file_data = _resolve_file_node(graph, path)
+    rows: list[dict] = []
+    accuracy = "ast"
+
+    # Read file source ONCE — needed for both the "is_exported" sniff
+    # (for graph-derived declarations) and the regex fallback.
+    p_path: Path | None = None
+    file_lines: list[str] = []
+    try:
+        p_path, file_lines = _read_file_lines(graph, root_dir, path)
+    except Exception:
+        # Sandbox or read failure — return whatever the graph already knows.
+        accuracy = "graph_only"
+
+    graph_rows_added = 0
+    if file_id is not None:
+        for _src, succ, edata in graph.out_edges(file_id, data=True):
+            if edata.get("type") != "defines":
+                continue
+            ndata = graph.nodes.get(succ, {})
+            ntype = ndata.get("type")
+            kind = _DECL_KIND_FROM_NODE_TYPE.get(ntype)
+            if kind is None:
+                continue
+            if requested and kind not in requested:
+                continue
+            ls = ndata.get("line_start") or ndata.get("line") or 0
+            le = ndata.get("line_end") or ls
+            src_line = ""
+            if file_lines and 1 <= ls <= len(file_lines):
+                src_line = file_lines[ls - 1]
+            rows.append({
+                "name": ndata.get("name", ""),
+                "kind": kind,
+                "line_start": int(ls or 0),
+                "line_end": int(le or 0),
+                "is_exported": _is_exported_decl(ndata, src_line),
+                "parent": ndata.get("parent_class") or "",
+            })
+            graph_rows_added += 1
+            # Methods are pulled in via the class node; iterate explicitly
+            # so we surface them in `list_declarations` even though the
+            # `defines` edge from the FILE node only points at the class.
+            if ntype == "class":
+                for _c, m_succ, m_edata in graph.out_edges(succ, data=True):
+                    if m_edata.get("type") != "defines":
+                        continue
+                    mdata = graph.nodes.get(m_succ, {})
+                    if mdata.get("type") != "method":
+                        continue
+                    if requested and "method" not in requested:
+                        continue
+                    mls = mdata.get("line_start") or 0
+                    mle = mdata.get("line_end") or mls
+                    rows.append({
+                        "name": mdata.get("name", ""),
+                        "kind": "method",
+                        "line_start": int(mls or 0),
+                        "line_end": int(mle or 0),
+                        "is_exported": _is_exported_decl(mdata, ""),
+                        "parent": mdata.get("parent_class") or ndata.get("name", ""),
+                    })
+                    graph_rows_added += 1
+
+    # When the graph either had no entry for this file OR had a file
+    # node but zero defines edges, fall back to a full regex pass so the
+    # tool still returns something useful (this is the common case for
+    # files indexed by `text_parser` and for fixtures with stub graphs).
+    if graph_rows_added == 0 and accuracy != "graph_only":
+        accuracy = "regex"
+
+    # Regex fallback: catch new Map() / WeakMap() / Set() / WeakSet()
+    # bindings and any def/class/function/const/let/var the parser missed
+    # (text_parser fallback, or unknown extensions).
+    seen_keys = {(r["name"], r["line_start"], r["kind"]) for r in rows}
+    if file_lines:
+        # If we already have AST rows for this file we still scan for
+        # map/weakmap bindings because the standard variable parser does
+        # NOT distinguish those kinds.
+        scan_full = (file_id is None) or accuracy == "regex"
+        for i, line in enumerate(file_lines, 1):
+            for kind, rx in _FALLBACK_DECL_PATTERNS:
+                if not scan_full and not kind.endswith("_decl"):
+                    continue
+                if requested and kind not in requested:
+                    continue
+                m = rx.match(line)
+                if not m:
+                    continue
+                name = m.group(1)
+                key = (name, i, kind)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                rows.append({
+                    "name": name,
+                    "kind": kind,
+                    "line_start": i,
+                    "line_end": i,
+                    "is_exported": bool(re.match(r"^\s*export\b", line)),
+                    "parent": "",
+                })
+                break  # first matching pattern wins for this line
+
+    rows.sort(key=lambda r: (r["line_start"], r["name"]))
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "path": str(p_path) if p_path else path,
+        "declarations": rows,
+        "count": len(rows),
+        "truncated": truncated,
+        "accuracy": accuracy,
+    }
+
+
+# Cap on how many symbols can be looked up in a single batch call.
+# Keeps the response payload bounded and avoids accidental DoS-via-fanout
+# (each symbol still triggers a per-line classifier pass).
+_USAGES_BATCH_MAX_SYMBOLS = 20
+
+
+def find_symbol_usages(graph: nx.DiGraph, root_dir: str | None,
+                       path: str,
+                       symbol: str | None = None,
+                       symbols: list[str] | None = None,
+                       kinds: list[str] | None = None) -> dict:
+    """Every line in `path` that mentions a symbol (or symbols), classified.
+
+    Plan §8.3.2 + Phase 8 §8.13 batch follow-up.
+
+    Two input shapes:
+
+    * ``symbol="foo"`` — single-symbol mode (legacy). Response keeps the
+      flat ``{symbol, usages[], count}`` shape so existing HTTP consumers
+      and the Phase 8 unit tests don't change.
+    * ``symbols=["foo", "bar"]`` — batch mode. Reads the file ONCE,
+      classifies every line against every requested symbol, and returns
+      ``{results: [{symbol, usages[], count}, …], total}``. Cuts a
+      fan-out of N sequential ``find_symbol_usages`` calls (which the
+      benchmark trace showed the model issuing 8× in round 1) down to
+      a single tool call — and a single file read for HTML/JS files
+      that are megabytes in size.
+
+    Uses the shared text classifier (``file_inspect._classify_hit``) so
+    ``file_search`` and the Phase 1 round-reduction work agree on what
+    counts as a declaration / read / write / call. Returns the trimmed
+    line itself — no surrounding context — to keep payloads ~10× smaller
+    than file_search.
+    """
+    from apollo import file_inspect
+
+    # Normalise input into a non-empty `wanted` list. The flag below
+    # decides which response shape to emit so single-symbol callers
+    # keep the legacy contract.
+    batch_mode = symbols is not None
+    if batch_mode:
+        wanted = [s for s in (symbols or []) if s]
+    elif symbol:
+        wanted = [symbol]
+    else:
+        wanted = []
+
+    if not wanted:
+        if batch_mode:
+            return {"path": path, "results": [], "total": 0,
+                    "error": "`symbols` must be a non-empty list"}
+        return {"path": path, "symbol": symbol, "usages": [], "count": 0,
+                "error": "`symbol` is required"}
+
+    # De-dupe while preserving order and enforce the per-call cap.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in wanted:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    deduped = deduped[:_USAGES_BATCH_MAX_SYMBOLS]
+
+    requested = {k for k in (kinds or [])
+                 if k in {"declaration", "read", "write", "call",
+                          "comment", "string"}}
+
+    # Single file read covers every requested symbol — this is the
+    # whole point of the batch path. For a 1.4 MB HTML file with 8
+    # symbols (the §8.13 trace) we go from 8 file reads to 1.
+    p_path, lines = _read_file_lines(graph, root_dir, path)
+
+    # One combined regex acts as a cheap pre-filter so we only run the
+    # per-symbol classifier on lines that contain at least one of the
+    # requested symbols. Then per-symbol regexes resolve which symbols
+    # actually appear on the line (and which kind they are).
+    combined = re.compile(
+        r"\b(?:" + "|".join(re.escape(s) for s in deduped) + r")\b"
+    )
+    per_symbol_needles = {s: re.compile(r"\b" + re.escape(s) + r"\b")
+                          for s in deduped}
+    per_symbol_out: dict[str, list[dict]] = {s: [] for s in deduped}
+
+    for i, line in enumerate(lines, 1):
+        if not combined.search(line):
+            continue
+        for s in deduped:
+            if not per_symbol_needles[s].search(line):
+                continue
+            kind = file_inspect._classify_hit(line, s)
+            if requested and kind not in requested:
+                continue
+            per_symbol_out[s].append({
+                "line_no": i,
+                "kind": kind,
+                "text": line.strip()[:240],
+            })
+
+    md5 = file_inspect.file_md5(p_path)
+    accuracy = "text"  # heuristic; AST-resolved variant could land later.
+
+    if not batch_mode:
+        # Preserve the single-symbol response shape for backward compat.
+        s = deduped[0]
+        return {
+            "path": str(p_path),
+            "symbol": s,
+            "md5": md5,
+            "usages": per_symbol_out[s],
+            "count": len(per_symbol_out[s]),
+            "accuracy": accuracy,
+        }
+
+    results = [
+        {
+            "symbol": s,
+            "usages": per_symbol_out[s],
+            "count": len(per_symbol_out[s]),
+        }
+        for s in deduped
+    ]
+    return {
+        "path": str(p_path),
+        "md5": md5,
+        "results": results,
+        "total": sum(r["count"] for r in results),
+        "accuracy": accuracy,
+    }
+
+
+# ── HTML outline regex helpers (Phase 8 §8.3.3 — round-2 follow-up) ───
+#
+# The benchmark trace in PLAN_MORE_LOCAL_AI_FUNCTIONS.md §8.13 showed
+# `outline_file` returning `accuracy: "none"` for `en/index.html`
+# because the file was indexed by `text_parser` (no `defines` edges),
+# even though §8.3.3 of the plan promised a "tag tree (head/body/script)"
+# fallback for HTML. That gap forced the model into round 2 with three
+# wasted `get_function_source` calls (Python AST against HTML →
+# `invalid syntax`) before it found the right ranges via
+# `batch_file_sections`. This regex fallback closes the gap.
+
+# Top-level structural / landmark tags whose opening line we surface.
+# Order matters only for the regex compile cache.
+_HTML_LANDMARK_TAGS = (
+    "html", "head", "body", "header", "nav", "main", "section", "article",
+    "aside", "footer", "script", "style", "template",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+)
+# Open-tag detector: `<tag …>` with optional attrs, captured greedily so
+# we can pull `id="…"` / `name="…"` for naming the row. Self-closing
+# tags (e.g. <meta/>) are intentionally excluded — we only care about
+# block-level landmarks.
+_HTML_OPEN_RE = re.compile(
+    r"<(" + "|".join(_HTML_LANDMARK_TAGS) + r")(\s[^>]*)?>",
+    re.IGNORECASE,
+)
+# Close-tag detector for the same set. Used to compute line ranges.
+_HTML_CLOSE_RE = re.compile(
+    r"</(" + "|".join(_HTML_LANDMARK_TAGS) + r")\s*>",
+    re.IGNORECASE,
+)
+# Pull `id="foo"` (or single-quoted) out of an attribute blob.
+_HTML_ID_RE = re.compile(r"""\bid\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+# JS top-level decls inside <script> blocks. Matches:
+#
+#   function NAME(...)
+#   class NAME ...
+#   const|let|var NAME = ...   (any RHS — `new Map()`, arrow fn, literal, …)
+#
+# Any `const NAME =` is intentionally surfaced (not just function/arrow
+# RHS) because the §8.13 use case was the model asking "what caches are
+# defined in this HTML file?" — `const operatorsCache = new Map()` and
+# friends must appear in the outline.
+_JS_DECL_IN_SCRIPT_RE = re.compile(
+    r"^\s*(?:export\s+)?"
+    r"(?:async\s+)?"
+    r"(?:"
+    r"function\s+([A-Za-z_$][\w$]*)"
+    r"|class\s+([A-Za-z_$][\w$]*)"
+    r"|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="
+    r")",
+    re.MULTILINE,
+)
+
+
+def _html_outline_from_text(lines: list[str], depth: int) -> list[dict]:
+    """Build an HTML outline by scanning open/close tags + script bodies.
+
+    Strategy:
+
+    1. Walk every line once. When a landmark open-tag fires, push onto a
+       stack with its starting line. When the matching close-tag fires,
+       pop and emit a row with `line_start`/`line_end`. Mismatched /
+       missing closers fall back to "the next sibling open tag's line"
+       so we still emit a usable range for the model.
+    2. For each emitted `<script>` row, scan its body for JS function /
+       class / arrow-function-const declarations and emit them as nested
+       `depth=2` rows.
+    3. Headings (`<h1>`-`<h6>`) are surfaced as single-line rows because
+       the closer is almost always on the same line.
+
+    All rows use the same uniform shape as the AST path so the LLM gets
+    a TOON-friendly response either way.
+    """
+    rows: list[dict] = []
+    # Stack entries: (tag_lower, attrs_blob, line_start_1based)
+    stack: list[tuple[str, str, int]] = []
+
+    def _row_name(tag: str, attrs: str) -> str:
+        m = _HTML_ID_RE.search(attrs or "")
+        if m:
+            return f"<{tag} #{m.group(1)}>"
+        return f"<{tag}>"
+
+    for i, line in enumerate(lines, 1):
+        # Find every open and close on this line — a single line can
+        # contain both for short tags like <h2>Title</h2>.
+        for m in _HTML_OPEN_RE.finditer(line):
+            tag = m.group(1).lower()
+            attrs = m.group(2) or ""
+            # Heading shortcut: emit immediately, no nesting needed.
+            if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                rows.append({
+                    "kind": "heading",
+                    "name": _row_name(tag, attrs),
+                    "line_start": i,
+                    "line_end": i,
+                    "depth": 1,
+                })
+                continue
+            stack.append((tag, attrs, i))
+        for m in _HTML_CLOSE_RE.finditer(line):
+            tag = m.group(1).lower()
+            # Pop the most recent matching open tag.
+            for j in range(len(stack) - 1, -1, -1):
+                if stack[j][0] == tag:
+                    open_tag, attrs, ls = stack.pop(j)
+                    # Outermost stack depth dictates row depth (1-based).
+                    row_depth = max(1, len(stack) + 1)
+                    if row_depth > depth:
+                        # User asked for shallower output — skip.
+                        break
+                    kind = "script" if open_tag == "script" else "tag"
+                    rows.append({
+                        "kind": kind,
+                        "name": _row_name(open_tag, attrs),
+                        "line_start": ls,
+                        "line_end": i,
+                        "depth": row_depth,
+                    })
+                    break
+
+    # Anything left on the stack never closed — emit with line_end = EOF
+    # so the model still sees the section.
+    eof = len(lines)
+    while stack:
+        tag, attrs, ls = stack.pop(0)
+        row_depth = max(1, len(stack) + 1)
+        if row_depth > depth:
+            continue
+        kind = "script" if tag == "script" else "tag"
+        rows.append({
+            "kind": kind,
+            "name": _row_name(tag, attrs),
+            "line_start": ls,
+            "line_end": eof,
+            "depth": row_depth,
+        })
+
+    # For each <script> row, surface its inner JS top-level decls.
+    # Always emit when depth >= 2: the `depth` parameter caps HTML tag
+    # nesting, but JS decls inside a <script> are *content* of that
+    # script row, not extra HTML nesting — and surfacing them is the
+    # whole point of the HTML outline (§8.13 fixed the case where the
+    # model otherwise reached for `get_function_source`, which can't
+    # parse HTML, and burned a round). Capped at 50 per script block.
+    if depth >= 2:
+        nested: list[dict] = []
+        for r in rows:
+            if r["kind"] != "script":
+                continue
+            ls, le = r["line_start"], r["line_end"]
+            if le <= ls:
+                continue
+            body = "\n".join(lines[ls:le - 1])  # body is between tags
+            count = 0
+            for m in _JS_DECL_IN_SCRIPT_RE.finditer(body):
+                if count >= 50:
+                    break
+                name = m.group(1) or m.group(2) or m.group(3) or ""
+                if not name:
+                    continue
+                # Translate body offset → file line.
+                rel_line = body.count("\n", 0, m.start()) + 1
+                file_line = ls + rel_line  # body starts on ls + 1
+                kind = "function" if m.group(1) else (
+                    "class" if m.group(2) else "const")
+                nested.append({
+                    "kind": kind,
+                    "name": name[:120],
+                    "line_start": file_line,
+                    "line_end": file_line,
+                    "depth": r["depth"] + 1,
+                })
+                count += 1
+        rows.extend(nested)
+
+    rows.sort(key=lambda r: (r["line_start"], r["depth"], r["name"]))
+    return rows
+
+
+def outline_file(graph: nx.DiGraph, root_dir: str | None,
+                 path: str, depth: int = 2) -> dict:
+    """Sub-second outline of a file — uniform `outline[]` shape. Plan §8.3.3.
+
+    Reads off the parser-produced graph payload first. For HTML files
+    (and any file outside the graph) falls back to a regex-based scan
+    that emits a tag tree of landmark elements (`head`, `body`, `script`,
+    `style`, `<h1..h6>`, `<section>`, …) plus the JS function / class /
+    arrow-const declarations found inside each `<script>` block. For
+    every other file type that has no graph entry, returns
+    `outline: []` and `accuracy: "none"` rather than guessing.
+
+    `accuracy` enum:
+
+    * ``ast``    — rows came from the parser graph.
+    * ``regex``  — HTML / no-graph fallback.
+    * ``none``   — file is not HTML and has no graph entry; nothing to show.
+    """
+    depth = max(0, min(int(depth), 6))
+    file_id, _file_data = _resolve_file_node(graph, path)
+    rows: list[dict] = []
+
+    # Graph path — preferred, exact line ranges from the parser.
+    if file_id is not None:
+        for _src, succ, edata in graph.out_edges(file_id, data=True):
+            if edata.get("type") != "defines":
+                continue
+            ndata = graph.nodes.get(succ, {})
+            ntype = ndata.get("type")
+            kind = _DECL_KIND_FROM_NODE_TYPE.get(ntype)
+            if kind is None:
+                continue
+            ls = ndata.get("line_start") or ndata.get("line") or 0
+            le = ndata.get("line_end") or ls
+            rows.append({
+                "kind": kind,
+                "name": ndata.get("name", "")[:120],
+                "line_start": int(ls or 0),
+                "line_end": int(le or 0),
+                "depth": 1,
+            })
+            if ntype == "class" and depth >= 2:
+                for _c, m_succ, m_edata in graph.out_edges(succ, data=True):
+                    if m_edata.get("type") != "defines":
+                        continue
+                    mdata = graph.nodes.get(m_succ, {})
+                    if mdata.get("type") != "method":
+                        continue
+                    mls = mdata.get("line_start") or 0
+                    mle = mdata.get("line_end") or mls
+                    rows.append({
+                        "kind": "method",
+                        "name": mdata.get("name", "")[:120],
+                        "line_start": int(mls or 0),
+                        "line_end": int(mle or 0),
+                        "depth": 2,
+                    })
+
+    if rows:
+        rows.sort(key=lambda r: (r["line_start"], r["depth"], r["name"]))
+        return {
+            "path": path,
+            "outline": rows,
+            "count": len(rows),
+            "depth": depth,
+            "accuracy": "ast",
+        }
+
+    # Fallback path — only fires for HTML (and HTM). Other no-graph
+    # files keep the documented `accuracy: "none"` contract so the LLM
+    # can tell the difference between "nothing here" and "scan limited".
+    ext = (Path(path).suffix or "").lower()
+    if ext in {".html", ".htm"}:
+        try:
+            _p, lines = _read_file_lines(graph, root_dir, path)
+        except Exception:
+            return {"path": path, "outline": [], "count": 0,
+                    "depth": depth, "accuracy": "none"}
+        html_rows = _html_outline_from_text(lines, depth)
+        return {
+            "path": path,
+            "outline": html_rows,
+            "count": len(html_rows),
+            "depth": depth,
+            "accuracy": "regex",
+        }
+
+    return {"path": path, "outline": [], "count": 0, "depth": depth,
+            "accuracy": "none"}

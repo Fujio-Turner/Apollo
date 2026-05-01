@@ -23,9 +23,25 @@ from graph.incremental import (
 
 logger = logging.getLogger(__name__)
 
-# Path to store reindex history
-REINDEX_HISTORY_PATH = Path(".apollo/reindex_history.json")
+# Filenames for reindex state. The actual paths are resolved per-project
+# under ``<root_dir>/_apollo/`` (see ``ReindexService._state_dir``); we
+# keep just the basenames here so a single Apollo install can switch
+# between projects without one project's hashes leaking into another's
+# next sweep (which would silently skip files that look "unchanged" but
+# weren't actually scanned for that project).
+REINDEX_HISTORY_FILENAME = "reindex_history.json"
+FILE_HASHES_FILENAME = "file_hashes.json"
 MAX_HISTORY_ENTRIES = 100
+
+# Legacy/global locations we still read from on first load so users
+# upgrading from an earlier Apollo don't lose their history when the
+# service migrates to per-project state. The data is *not* written
+# back to these locations — the next save lands under ``_apollo/``.
+_LEGACY_HISTORY_PATHS = [Path(".apollo/reindex_history.json")]
+_LEGACY_HASHES_PATHS = [
+    Path(".apollo/file_hashes.json"),
+    Path("data/file_hashes.json"),
+]
 
 
 @dataclass
@@ -60,24 +76,48 @@ class ReindexService:
         # Load history from disk
         self._load_history()
     
+    def _state_dir(self) -> Path:
+        """Return the per-project ``_apollo/`` directory the reindex
+        service writes its hashes/history to. Always rooted at
+        ``self.root_dir`` so opening a different project doesn't read
+        the previous project's hash table (which would silently skip
+        files that genuinely differ between the two trees)."""
+        return Path(self.root_dir) / "_apollo"
+
+    def _history_path(self) -> Path:
+        return self._state_dir() / REINDEX_HISTORY_FILENAME
+
+    def _hashes_path(self) -> Path:
+        return self._state_dir() / FILE_HASHES_FILENAME
+
     def _load_history(self) -> None:
-        """Load reindex history from disk."""
-        if REINDEX_HISTORY_PATH.exists():
-            try:
-                data = json.loads(REINDEX_HISTORY_PATH.read_text())
-                self.reindex_history = [
-                    ReindexStats.from_dict(entry) for entry in data
-                ][-MAX_HISTORY_ENTRIES:]  # Keep only last N
-            except (json.JSONDecodeError, OSError, AttributeError):
-                self.reindex_history = []
-        else:
-            self.reindex_history = []
-    
+        """Load reindex history from disk.
+
+        Reads the per-project file under ``<root>/_apollo/`` first; if
+        that doesn't exist yet, falls back to legacy global locations
+        so first-run after upgrade still surfaces prior telemetry. The
+        legacy file is *not* deleted — the next ``_save_history()`` just
+        writes the per-project copy and lets the legacy file age out.
+        """
+        candidates = [self._history_path()] + _LEGACY_HISTORY_PATHS
+        for path in candidates:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text())
+                    self.reindex_history = [
+                        ReindexStats.from_dict(entry) for entry in data
+                    ][-MAX_HISTORY_ENTRIES:]  # Keep only last N
+                    return
+                except (json.JSONDecodeError, OSError, AttributeError):
+                    continue
+        self.reindex_history = []
+
     def _save_history(self) -> None:
-        """Save reindex history to disk."""
-        REINDEX_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        """Save reindex history to disk under ``<root>/_apollo/``."""
+        path = self._history_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         data = [asdict(stats) for stats in self.reindex_history[-MAX_HISTORY_ENTRIES:]]
-        REINDEX_HISTORY_PATH.write_text(json.dumps(data, indent=2, default=str))
+        path.write_text(json.dumps(data, indent=2, default=str))
     
     def get_last_stats(self) -> Optional[ReindexStats]:
         """Get the most recent reindex statistics."""
@@ -169,17 +209,24 @@ class ReindexService:
             self._is_reindexing = False
     
     def _load_prev_hashes(self) -> dict[str, dict]:
-        """Load file hashes from previous run."""
-        hashes_path = Path(".apollo/file_hashes.json")
-        if hashes_path.exists():
-            try:
-                return json.loads(hashes_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                return {}
+        """Load file hashes from previous run.
+
+        Reads ``<root>/_apollo/file_hashes.json`` first; falls back to
+        the legacy global locations so users upgrading from an earlier
+        Apollo don't pay a full rebuild on the first sweep after the
+        per-project migration.
+        """
+        candidates = [self._hashes_path()] + _LEGACY_HASHES_PATHS
+        for path in candidates:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
         return {}
-    
+
     def _save_prev_hashes(self, hashes: dict[str, dict]) -> None:
-        """Save file hashes for next run."""
-        hashes_path = Path(".apollo/file_hashes.json")
-        hashes_path.parent.mkdir(parents=True, exist_ok=True)
-        hashes_path.write_text(json.dumps(hashes, indent=2, default=str))
+        """Save file hashes for next run under ``<root>/_apollo/``."""
+        path = self._hashes_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(hashes, indent=2, default=str))

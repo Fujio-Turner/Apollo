@@ -259,19 +259,171 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     # Initialize ProjectManager for project lifecycle management
     project_manager = ProjectManager(version=version)
 
+    # ── Per-project store resolution ────────────────────────────────
+    # The store passed into create_app is the *startup* store (typically
+    # the legacy global ``data/graph.json`` or ``data/graph.cblite2``).
+    # When the user opens a different project via /api/projects/open or
+    # the auto-restore path below, we swap to that project's per-project
+    # store living under ``<root>/_apollo/`` so each folder gets its own
+    # graph + database (the design users see in the dev-mode "delete
+    # database" tool). Without this swap the chat/search would keep
+    # answering against whichever store happened to be opened at startup
+    # regardless of the active project.
+    from pathlib import Path as _Path
+
+    def _resolve_project_store_location(project_path, project_backend: str) -> str:
+        """Return the per-project store path for the given project root."""
+        apollo_dir = _Path(project_path) / "_apollo"
+        if project_backend == "cblite":
+            # Reuse ProjectManager's hashing convention so the path matches
+            # what the manifest expects (and what reprocess()/leave() act on).
+            db_hash = project_manager._compute_db_hash(project_path)
+            return str(apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2")
+        return str(apollo_dir / "graph.json")
+
+    @app.get("/api/active-store")
+    def get_active_store():
+        """Diagnostic: report the currently-active store location/backend."""
+        loc = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
+        return {"backend": backend, "location": loc, "root_dir": root_dir}
+
+    def _swap_to_project_store(project_path) -> None:
+        """Close the active store and reopen the per-project store for
+        ``project_path``. Reloads the graph, rebuilds search, and refreshes
+        the chat service so subsequent chat/search/graph queries see the
+        new project. Called from ``/api/projects/open`` and the startup
+        auto-open path so opening an already-indexed project no longer
+        leaves the chat answering against the previous project's data.
+        """
+        nonlocal store, graph, q, search, chat_service, root_dir, backend, reindex_service
+
+        from apollo.storage import open_store as _open_store
+        from apollo.graph.query import GraphQuery as _GraphQuery
+        import networkx as _nx
+
+        project_path_str = str(_Path(project_path).resolve())
+
+        # Prefer the manifest's recorded backend (each project picks its
+        # own backend at init time); fall back to the startup backend.
+        target_backend = backend
+        try:
+            if (
+                project_manager.manifest
+                and project_manager.manifest.storage
+                and project_manager.manifest.storage.backend
+            ):
+                target_backend = project_manager.manifest.storage.backend
+        except Exception:
+            pass
+
+        new_location = _resolve_project_store_location(project_path_str, target_backend)
+        current_location = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
+        if (
+            current_location
+            and _Path(current_location).resolve() == _Path(new_location).resolve()
+            and target_backend == backend
+            and root_dir
+            and _Path(root_dir).resolve() == _Path(project_path_str).resolve()
+        ):
+            return  # Already pointing at this project's store.
+
+        # Close the previously-active store before swapping.
+        try:
+            if hasattr(store, "close"):
+                store.close()
+        except Exception:
+            logger.exception("failed to close previous store at %s", current_location)
+
+        _Path(new_location).parent.mkdir(parents=True, exist_ok=True)
+        new_store = _open_store(target_backend, new_location)
+        store = new_store
+        backend = target_backend
+        root_dir = project_path_str
+
+        # Load the graph from the new store. A brand-new project (no graph
+        # yet) should yield an empty graph instead of an exception.
+        include_embeddings = backend != "cblite"
+        try:
+            graph = new_store.load(include_embeddings=include_embeddings)
+        except FileNotFoundError:
+            graph = _nx.DiGraph()
+        except Exception:
+            logger.exception("failed to load graph from %s; starting empty", new_location)
+            graph = _nx.DiGraph()
+        q = _GraphQuery(graph)
+
+        # Rebuild the search index against the new store/graph.
+        try:
+            if backend == "cblite":
+                from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
+                from apollo.embeddings.embedder import Embedder as _Emb
+                search = CouchbaseLiteSemanticSearch(new_store, _Emb())
+            else:
+                from apollo.search.semantic import SemanticSearch
+                from apollo.embeddings.embedder import Embedder as _Emb
+                search = SemanticSearch(graph, _Emb())
+        except Exception:
+            logger.warning("search index unavailable for %s", project_path_str)
+            search = None
+
+        # Refresh chat_service references in place so any captured handle
+        # keeps working (mirrors the pattern in /api/index).
+        if chat_service is not None:
+            try:
+                chat_service.graph = graph
+                chat_service.search = search
+                chat_service.root_dir = root_dir
+                chat_service._query = None
+            except Exception:
+                logger.exception("failed to refresh chat_service after project swap")
+
+        # Re-bind the background reindex service to the new project so its
+        # sweeps target the right tree + store.
+        try:
+            if reindex_service is not None:
+                reindex_service = ReindexService(root_dir, new_store, reindex_service.config)
+            else:
+                reindex_service = ReindexService(
+                    root_dir,
+                    new_store,
+                    ReindexConfig(
+                        strategy="auto",
+                        sweep_interval_minutes=30,
+                        sweep_on_session_start=True,
+                        local_max_hops=1,
+                        force_full_after_runs=50,
+                    ),
+                )
+        except Exception:
+            logger.exception("failed to rebind reindex service after project swap")
+
+        logger.info(
+            "swapped active store: backend=%s location=%s nodes=%d",
+            backend, new_location, graph.number_of_nodes(),
+        )
+
     # Auto-open the project on startup so project-scoped features
     # (annotations, etc.) work without forcing the user to re-open the
     # folder via the UI after every restart. We try, in order:
     #   1) the directory the server was launched against (--watch-dir)
-    #   2) the path recorded in settings.json by the previous session
+    #   2) the path recorded in settings.json by the previous session,
+    #      but ONLY when the caller didn't explicitly pass a root_dir
+    #      (otherwise an explicit watch-dir without a manifest would get
+    #      silently overridden by the previous session's project, which
+    #      breaks tests/callers that pass a one-off root_dir).
     # Either path needs an `_apollo/apollo.json` manifest to count.
-    from pathlib import Path as _Path
-    _candidates = [p for p in (root_dir, _get_last_project()) if p]
+    if root_dir:
+        _candidates = [root_dir]
+    else:
+        _last = _get_last_project()
+        _candidates = [_last] if _last else []
+    _startup_project_opened = False
     for _candidate in _candidates:
         try:
             if (_Path(_candidate) / "_apollo" / "apollo.json").exists():
                 project_manager.open(_candidate)
                 _record_last_project(_candidate)
+                _startup_project_opened = _candidate
                 break
         except Exception:
             logger.exception("failed to auto-open project at startup for %s", _candidate)
@@ -463,8 +615,27 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 import logging
                 logging.warning(f"Failed to start reindex service: {e}")
 
+    # If a project was successfully auto-opened on startup, swap to its
+    # per-project store now (after graph/q/search/chat_service/reindex
+    # have all been initialized so the nonlocals in _swap_to_project_store
+    # have valid bindings to mutate).
+    if _startup_project_opened:
+        try:
+            _swap_to_project_store(_startup_project_opened)
+        except Exception:
+            logger.exception(
+                "failed to swap to per-project store at startup for %s",
+                _startup_project_opened,
+            )
+
     # ── Register project management routes ────────────────────────
-    register_project_routes(app, project_manager, store, backend, on_project_open=_record_last_project)
+    def _on_project_open(path):
+        # Persist last-opened path for next server start, then swap the
+        # active store/graph/search/chat to this project's _apollo/ data.
+        _record_last_project(path)
+        _swap_to_project_store(path)
+
+    register_project_routes(app, project_manager, store, backend, on_project_open=_on_project_open)
 
     # ------------------------------------------------------------------ API --
 
@@ -674,6 +845,28 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logger.info("search index ready in %.2fs", time.time() - t3)
             except Exception:
                 logger.warning("search index unavailable after %.2fs", time.time() - t3)
+
+            # Refresh ChatService's references so its tools see the new
+            # project. ChatService is constructed once during create_app()
+            # with the *initial* graph / root_dir; without this mutation
+            # the chat would keep answering against the previous project's
+            # graph after the user opened or re-indexed a different folder
+            # (root cause of the stale "no such file" / wrong-stats bug).
+            # We mutate the existing instance instead of reassigning so
+            # any in-flight WebSocket / HTTP handler that already captured
+            # `chat_service` keeps working.
+            if chat_service is not None:
+                try:
+                    chat_service.graph = graph
+                    chat_service.search = search
+                    chat_service.root_dir = target
+                    chat_service._query = None  # force lazy GraphQuery rebuild
+                    logger.info(
+                        "chat service refreshed: root=%s nodes=%d",
+                        target, graph.number_of_nodes(),
+                    )
+                except Exception:
+                    logger.exception("failed to refresh chat_service after indexing")
 
             total = time.time() - t0
             logger.info(
@@ -1286,6 +1479,75 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             context=int(body.get("context", 5) or 5),
             file_glob=body.get("file_glob", "*.py") or "*.py",
             regex=bool(body.get("regex", True)),
+        )
+
+    # ── Phase 8: file-shaped tools (declarations / usages / outline) ──
+
+    @app.get("/api/files/declarations")
+    def api_files_declarations(
+        path: str = Query(...),
+        kinds: Optional[str] = Query(
+            None,
+            description="Comma-separated list of declaration kinds to include.",
+        ),
+        limit: int = Query(200, ge=1, le=500),
+    ):
+        from apollo.chat import local_tools
+        kinds_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        return _file_inspect_call(
+            local_tools.list_declarations,
+            graph, root_dir, path,
+            kinds=kinds_list, limit=limit,
+        )
+
+    @app.get("/api/files/usages")
+    def api_files_usages(
+        path: str = Query(...),
+        symbol: Optional[str] = Query(
+            None,
+            description="Single symbol name. Use this OR `symbols`.",
+        ),
+        symbols: Optional[str] = Query(
+            None,
+            description="Comma-separated list of symbol names (batch mode, "
+                        "max 20). Reads the file once and returns "
+                        "`results: [{symbol, usages, count}, …]`.",
+        ),
+        kinds: Optional[str] = Query(
+            None,
+            description="Comma-separated list of usage kinds to include "
+                        "(declaration, read, write, call, comment, string).",
+        ),
+    ):
+        from apollo.chat import local_tools
+        if not symbol and not symbols:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either `symbol` or `symbols`.",
+            )
+        kinds_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        symbols_list = (
+            [s.strip() for s in symbols.split(",") if s.strip()]
+            if symbols else None
+        )
+        return _file_inspect_call(
+            local_tools.find_symbol_usages,
+            graph, root_dir, path,
+            symbol=symbol,
+            symbols=symbols_list,
+            kinds=kinds_list,
+        )
+
+    @app.get("/api/files/outline")
+    def api_files_outline(
+        path: str = Query(...),
+        depth: int = Query(2, ge=0, le=6),
+    ):
+        from apollo.chat import local_tools
+        return _file_inspect_call(
+            local_tools.outline_file,
+            graph, root_dir, path, depth=depth,
         )
 
     @app.get("/api/wordcloud")

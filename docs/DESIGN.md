@@ -173,6 +173,148 @@ Cross-file resolution is the hardest part. Strategy:
 - Build a global symbol table: `{qualified_name: node_id}`.
 - When a call like `mailer.emails()` is found, look up `mailer` in imports → resolve to `src/utils/mailer.py` → find `emails` in that file's symbols.
 
+#### 4.2.1 File-skipping invariants
+
+The chat tools, file-explorer tree, semantic search, and `safe_path()`
+sandbox all derive what files exist from the indexed graph (a `file::…`
+node is the source of truth). When a file the user can clearly see on
+disk is *missing* from the graph, every downstream tool surface lies to
+the user — chat answers "no such file", search returns no hits, and the
+file tree hides it.
+
+Two historical regressions caused exactly that, and the rules below
+codify the fixes:
+
+1. **No silent drops on parser failure.** When `_find_parser()` matches
+   a parser by extension but the parser returns `None` (size cap hit,
+   parse exception, blank file, …), `graph/builder.py::_parse_one`
+   *must* still return a minimal stub dict so the file gets a `file::`
+   node — the symbols are lost, the file is not. Any future change that
+   makes `_parse_one` return `None` to the parallel pool is a bug.
+2. **CLI and web-UI parser lists must match.** Both
+   `web.server._build_active_parsers` and `main._build_parsers` start
+   with `discover_plugins()` and *append* `TextFileParser` last. Wiring
+   plugin discovery into one but not the other (which used to be the
+   case for the CLI) means an `.html > 1 MB` file gets routed to
+   `TextFileParser`, fails its 1 MB cap, and disappears from the index.
+3. **Size caps are per-plugin and intentional.** Each plugin owns its
+   own `max_file_size_bytes` (e.g. 5 MB for html5, 1 MB for the generic
+   text parser). Don't widen the text parser's cap to "fix" a missing
+   plugin — fix the plugin discovery instead, otherwise huge data files
+   bloat embeddings without adding signal.
+4. **The fallback chain is single-attempt by extension.** `_find_parser`
+   returns the *first* parser whose `can_parse()` returns True. There is
+   no second-try with a different parser — invariant #1 makes that
+   unnecessary because the file always lands as a `file::` stub at
+   minimum.
+
+When debugging "Apollo can't see this file", check, in order: is the
+file in `_apollo/graph.json`? Does the active parser list include the
+plugin you expect? Is the file under a `_CORE_SKIP_DIRS` entry or a
+plugin's `ignore_dirs`? Almost every "indexing bug" report turns out to
+be one of those three.
+
+#### 4.2.2 Project-switch invariants
+
+The web server is long-lived: a single process serves multiple projects
+as the user clicks "Open Folder". `ChatService`, on the other hand, is
+constructed *once* in `web.server.create_app()` with whatever `graph` /
+`root_dir` / `search` were live at startup. If those references aren't
+kept in sync with the active project, the chat answers questions about
+the *previous* project — typical symptoms: "no such file" for files the
+explorer clearly shows, `get_stats` returning the old node count,
+`project_search` erroring `"No root configured"`.
+
+Three rules keep that from happening:
+
+1. **Re-indexing must refresh `chat_service`.** After
+   `web.server` finishes a `/api/index` run (new graph, new search), it
+   must mutate `chat_service.graph`, `chat_service.search`, and
+   `chat_service.root_dir` in place — and reset `chat_service._query`
+   so the lazy `GraphQuery` is rebuilt on the new graph. Mutating the
+   existing instance (rather than reassigning) keeps in-flight WebSocket
+   handlers alive.
+2. **`root_dir` lookups go through `ChatService._current_root_dir()`.**
+   That helper prefers `ProjectManager.root_dir` (the live value the
+   user is looking at) over `self.root_dir` (a snapshot from
+   construction). All `file_inspect` tool dispatch must use it.
+   Reading `self.root_dir` directly is a regression — a project opened
+   via the UI without re-indexing would still need its file paths
+   resolved against the right folder.
+3. **`/api/projects/open` must swap the active store.** The store handed
+   to `create_app()` is the *startup* store (the legacy global
+   `data/graph.cblite2` / `data/graph.json`). When the user opens a
+   different project, `web.server._swap_to_project_store(path)` closes
+   that handle, opens the project's own store under `<root>/_apollo/`
+   (cblite: `_apollo/cblite/apollo_<md5>.cblite2`; json:
+   `_apollo/graph.json`), reloads the graph, rebuilds `search`, and
+   refreshes the `chat_service` references the same way `/api/index`
+   does. Without the swap, an already-indexed project picked from the
+   UI would silently keep answering against whichever store happened to
+   load at boot — the same class of bug as rule #1, just one level up.
+   The swap is wired through `register_project_routes`'
+   `on_project_open` callback so `/api/projects/open` and the startup
+   auto-restore both go through the same path.
+
+#### 4.2.3 Per-project state and the `.gitignore` safeguard
+
+Every project Apollo opens accumulates state under two top-level
+sibling directories of the project root:
+
+| Directory      | Owner            | Contents                                                                 |
+|----------------|------------------|--------------------------------------------------------------------------|
+| `_apollo/`     | core indexer     | `apollo.json` manifest, `graph.json` (json backend) or `cblite/apollo_<md5>.cblite2` bundle, `embeddings.npy`, `file_hashes.json` (incremental indexer memory), `reindex_history.json` (background sweep telemetry), `annotations.json`, `chat/` history |
+| `_apollo_web/` | web capture flow | Captured HTML/PDF → Markdown (see §14.3)                                  |
+
+`file_hashes.json` and `reindex_history.json` are the two files that
+*used to* live in global locations (`data/file_hashes.json` for the CLI
+incremental indexer, `.apollo/file_hashes.json` /
+`.apollo/reindex_history.json` for the background sweep service). Both
+have been moved under `<root>/_apollo/` because they're per-project
+state — indexing project A then project B with a shared hash table
+silently skips files that genuinely differ between the two trees. The
+old global paths are still *read* on first run (legacy fallback) so
+upgrades don't pay a full rebuild, but new writes always land under the
+project's own `_apollo/`. See `apollo/reindex_service.py` (`_state_dir`,
+`_load_prev_hashes`, `_save_history`) and `main.py._hashes_path_for()`.
+
+These directories are deliberately *not* dot-prefixed so users can see
+them in their file browser and so Apollo's own indexer can hard-skip
+them by name (`graph.builder._SKIP_DIRS`). The downside is that they're
+visible to git too — and the cblite database in particular regularly
+grows into the multi-MB range. Committing it bloats the repo, churns
+diffs on every reindex, and exposes embeddings the user may not want
+to share.
+
+To prevent that, `ProjectManager.open()` and `ProjectManager.init()`
+both call `_ensure_gitignore_excludes_apollo(root)`, which:
+
+1. Returns immediately if `<root>/.gitignore` does not exist (we never
+   create one for projects that aren't already git-tracked).
+2. Scans the file for any non-comment line containing the substring
+   `_apollo` and bails if found — the rule covers `_apollo`,
+   `_apollo/`, `_apollo*`, `/_apollo/`, `**/_apollo`, etc., so users
+   who hand-rolled their own pattern aren't second-guessed.
+3. Otherwise appends a small block:
+
+   ```
+   # Apollo per-project state (graph, cblite database, embeddings,
+   # annotations, web captures). These directories can grow to many MB
+   # (the cblite database in particular) and are recreated locally on
+   # demand — keep them out of the repo.
+   _apollo/
+   _apollo_web/
+   ```
+
+The whole call is wrapped in `try/except` so a read-only filesystem
+or permission error can never break project open. The block is
+idempotent across repeated `open()` calls — the substring guard makes
+it safe to run on every session start.
+
+If a future feature adds a third state directory (e.g. `_apollo_cache/`),
+extend the block here so users get the new entry the next time they
+open the project.
+
 ### 4.3 Storage Backend
 
 #### 4.3.1 Graph Store
@@ -184,6 +326,61 @@ Stores nodes, edges, and node payloads (source text, file path, line range, meta
 | **NetworkX**         | Pure Python, rich traversal API, easy to start | In-memory only, no persistence (needs pickling or JSON export) |
 | **SQLite**           | Built-in, persistent, fast, SQL queries        | Graph traversal requires recursive CTEs     |
 | **Couchbase Lite**   | Persistent, JSON document model, SQL++ queries, built-in vector index | C binding complexity, less Python ecosystem support |
+
+##### 4.3.1.1 JSON store on-disk format
+
+The default backend (`storage/json_store.py`) persists the NetworkX `DiGraph`
+as a single JSON document. The original v1 format used flat arrays
+(`{"nodes": [...], "edges": [...]}`) which forced an O(N) scan to look up any
+node and rewrote the entire file on every save. For a real project the index
+grew to ~25 MB and reads paid the cost of decoding every node before answering
+any question.
+
+Two changes shipped together to take that down:
+
+1. **v2 dict-keyed shape** — adjacency-style maps so any node or edge is
+   reachable in O(1) without first walking a list:
+
+   ```json
+   {
+     "version": 2,
+     "nodes": {"<node-id>": {<attrs>}, ...},
+     "edges": {"<src-id>": {"<dst-id>": {<attrs>}, ...}, ...}
+   }
+   ```
+
+   The loader still accepts the v1 array shape transparently
+   (`isinstance(raw["nodes"], dict)` switch), so existing `data/index.json`
+   files keep loading after upgrade and migrate to v2 on the next save.
+
+2. **Optional gzip + orjson encoder** — when the configured path ends in
+   `.gz` the payload is gzipped on write; reads sniff the gzip magic bytes
+   (`0x1f 0x8b`) so the gzip-or-not decision is invisible to callers. The
+   serializer prefers `orjson` (pulled in via `requirements.txt`) and falls
+   back to stdlib `json` so the store still works in minimal environments.
+
+   On a real-world ~25 MB index this collapses to ~8.6 MB on disk
+   (≈3× smaller — the bulk of the file is repeated keys like `"id"`, `"type"`,
+   `"abs_path"`, `"source"`, `"target"`, which gzip dedupes trivially) and
+   `load()` actually got *faster* (~252 ms → ~182 ms) because orjson's parse
+   speedup more than offsets the gzip decompression cost. `save()` is slower
+   (~450 ms → ~1.25 s) but Apollo is read-dominated — sweeps fire every 30
+   minutes, not 30 times per second — so the trade is fine.
+
+`main.py`'s `_default_index_path()` prefers `data/index.json.gz` when it
+exists, falls back to the legacy `data/index.json` when only that one is
+present, and points new installs at the gzipped path. `JsonStore.delete()`
+removes both the configured path and its compression twin so neither variant
+survives a deliberate purge.
+
+Why this and not Fleece / a binary store today: Couchbase Fleece is faster and
+smaller still (~20× JSON parse speed, random access via mmap'd offset
+tables), but it's a C++ format with no first-class Python binding. The
+existing Couchbase Lite backend already uses Fleece internally, so when
+per-document writes (rather than a single-blob rewrite) become the bottleneck
+the right move is finishing the CBL backend rather than wrapping raw Fleece —
+CBL gives us Fleece *plus* per-document upserts, transactions, and indexes.
+Until then the v2/gzip/orjson trio is the high-value, low-risk middle ground.
 
 #### 4.3.2 Vector Index
 
@@ -918,6 +1115,9 @@ in **one round** instead of N grep-and-disambiguate rounds.
 | `detect_entry_points` | `GET /api/entry-points` | `detectEntryPoints` | 3 |
 | `get_git_context` | `GET /api/git/blame` | `getGitContext` | 4 |
 | `search_notes_fulltext` | (no HTTP) — pairs with existing `/api/annotations*` | — | 4 |
+| `list_declarations` | `GET /api/files/declarations` | `listDeclarations` | 8 |
+| `find_symbol_usages` | `GET /api/files/usages` | `findSymbolUsages` | 8 |
+| `outline_file` | `GET /api/files/outline` | `outlineFile` | 8 |
 
 **One-line semantics (full reference: `chat/local_tools.py`, `docs/openapi.yaml`):**
 
@@ -940,6 +1140,20 @@ in **one round** instead of N grep-and-disambiguate rounds.
   `git blame -L`; returns `{git_available: false}` cleanly on non-git
   roots / missing binary), `search_notes_fulltext` (substring + token-OR
   scoring over all annotations).
+- **Phase 8 — file-shaped tools (catalog-shape fix):** `outline_file`
+  (sub-second outline read off `defines` edges), `list_declarations`
+  (functions / classes / methods / `const|let|var|def` bindings,
+  including `new Map() / WeakMap() / Set() / WeakSet()` regex fallback),
+  `find_symbol_usages` (every line in a file referencing a symbol,
+  classified `declaration | read | write | call | comment | string` via
+  the shared `file_inspect._classify_hit` text classifier — same
+  classifier used by Phase 1 of [`PLAN_LLM_ROUND_REDUCTION.md`](work/PLAN_LLM_ROUND_REDUCTION.md)).
+  Names + first-sentence descriptions are deliberately shaped to match
+  the noun phrases users put in their questions ("what's in file X?",
+  "where is Y declared in file X?"), so the model picks them over
+  `file_search` without needing prompt discipline. See
+  [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8](work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+  for the full design rationale.
 
 **Cross-cutting contracts:**
 
@@ -967,6 +1181,13 @@ in **one round** instead of N grep-and-disambiguate rounds.
    constructed logger names. The dispatcher in `chat/service.py` already
    logs every tool call at `tool.call` / `tool.return` so individual helpers
    stay silent on the happy path.
+6. **Shared text classifier.** `find_symbol_usages` and the Phase 1
+   work in [`PLAN_LLM_ROUND_REDUCTION.md`](work/PLAN_LLM_ROUND_REDUCTION.md)
+   both call `file_inspect._classify_hit(line, symbol)` to label a hit as
+   `declaration | read | write | call | comment | string`. Keeping a
+   single classifier means the round-reduction work and the file-shaped
+   tools can never disagree about what counts as, say, a "write" — a
+   change to the heuristics ripples to both consumers in one PR.
 
 ---
 

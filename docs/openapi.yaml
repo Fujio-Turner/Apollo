@@ -825,8 +825,35 @@ paths:
     post:
       operationId: fileSearch
       tags: [Files]
-      summary: Grep within a single file
-      description: Returns matches with N lines of context before and after. Cap 200 matches.
+      deprecated: true
+      summary: "(DEPRECATED) Grep within a single file"
+      description: >
+        **Deprecated for AI/LLM-driven file-named queries.** Use one of the
+        Phase 8 replacements instead:
+
+        - `GET /api/files/outline` — sub-second declaration tree of a file.
+          Use this on first contact with any file.
+        - `GET /api/files/declarations` — exact list of every top-level
+          declaration (functions / classes / methods / consts / etc.) with
+          line ranges and export status. Replaces a regex like
+          `function|class|def`.
+        - `GET /api/files/usages` — every line in a file that references
+          a given symbol, classified as declaration / read / write / call /
+          comment / string. Replaces a name-only grep.
+
+        The `chat` service automatically removes `file_search` and
+        `project_search` from the LLM tool catalog whenever the user's
+        message names a specific file (path or `name.ext`), so the model
+        is forced toward the three replacements above. See
+        `PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13 for the rationale and
+        the benchmark trace that motivated the change.
+
+        This HTTP route is still served unchanged for non-LLM callers
+        (UI search, scripts, manual `curl`). It will continue to return
+        matches with N lines of context before and after, capped at 200
+        matches. There is no scheduled removal date — the deprecation
+        flag exists to redirect new integrations to the Phase 8
+        endpoints, which are smaller, structured, and round-cheap.
       requestBody:
         required: true
         content:
@@ -867,11 +894,37 @@ paths:
     post:
       operationId: projectSearch
       tags: [Files]
-      summary: Grep across the indexed project
+      deprecated: true
+      summary: "(DEPRECATED) Grep across the indexed project"
       description: >
-        Returns matches with file/line/context. Caps at 500 matches or 200 KB
-        of snippet bytes (whichever first). Use this when the user is unsure
-        which file contains the issue.
+        **Deprecated for AI/LLM-driven file-named queries.** Prefer the
+        Phase 8 replacements when the user already knows the target file
+        or symbol:
+
+        - `GET /api/files/outline` for "what's in file X".
+        - `GET /api/files/declarations` for "list everything declared in
+          file X" (replaces project-wide regexes like
+          `function|class|def`).
+        - `GET /api/files/usages` for "where is symbol Y used in file X".
+
+        For project-wide structural questions ("how is X connected to Y?",
+        "what would break if I change X?", "where does this start?"),
+        prefer the graph endpoints `GET /api/paths`, `GET /api/imports/{file_id}`,
+        `GET /api/inheritance/{class_id}`, and `GET /api/entry-points`
+        instead of a fat regex.
+
+        The `chat` service automatically removes `project_search` and
+        `file_search` from the LLM tool catalog whenever the user's
+        message names a specific file. See
+        `PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13 for the trace that
+        motivated the change (model was issuing kitchen-sink regexes
+        like `cache|Cache|store|memo|memory` as its first call instead
+        of using `outline_file`).
+
+        This HTTP route is still served unchanged for non-LLM callers
+        and will continue to return matches with file/line/context
+        capped at 500 matches or 200 KB of snippet bytes (whichever
+        comes first). There is no scheduled removal date.
       requestBody:
         required: true
         content:
@@ -902,6 +955,169 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ProjectSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/files/declarations:
+    get:
+      operationId: listDeclarations
+      tags: [Files]
+      summary: List every top-level declaration in a file
+      description: >
+        Returns functions, classes, methods, and module/file-level
+        identifiers (const/let/var/def, including new Map() / WeakMap()
+        / Set() / WeakSet() bindings) with their line ranges, export
+        status, and parent. Reads from the parser's `defines` edges,
+        falling back to a single regex pass for files indexed by
+        `text_parser`. Use INSTEAD of `file_search` with a regex like
+        `function|class|def` — exact, AST-aware, ~100× smaller.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+          description: Project-relative or absolute file path.
+        - name: kinds
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Comma-separated kind filter. One or more of
+            `function,class,method,const,let,var,def,map_decl,
+            weakmap_decl,set_decl,weakset_decl`.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+            maximum: 500
+      responses:
+        "200":
+          description: Declarations found in the file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListDeclarationsResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/files/usages:
+    get:
+      operationId: findSymbolUsages
+      tags: [Files]
+      summary: Every line in a file that references one or more symbols, classified
+      description: >
+        Hits are classified as declaration / read / write / call /
+        comment / string and returned with line number plus a single
+        trimmed line — no surrounding context. Use INSTEAD of
+        `file_search` when you already know the symbol name(s); ~10× less
+        data than a context-bearing grep, and tells you what each line
+        is doing.
+
+        **Two input modes (pass exactly one):**
+
+        - `symbol=foo` — single-symbol mode. Response shape:
+          `{path, symbol, usages, count, accuracy}` (legacy).
+        - `symbols=foo,bar,baz` — batch mode (max 20 symbols).
+          Reads the file ONCE and classifies every line against every
+          requested symbol. Response shape:
+          `{path, results: [{symbol, usages, count}, …], total, accuracy}`.
+
+        Strongly prefer batch mode whenever you have ≥2 symbols in the
+        same file — it folds N round-trips into 1 and only reads the
+        file once. See `PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13 for the
+        benchmark trace that motivated the addition.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: symbol
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Single symbol name. Provide this OR `symbols` (not both).
+            Returns the legacy flat-shape response.
+        - name: symbols
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Comma-separated list of symbol names (max 20). Triggers
+            batch mode and returns the `results[]` shape. Strongly
+            preferred over multiple sequential calls.
+        - name: kinds
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Comma-separated kind filter, applied to every symbol in
+            batch mode. One or more of
+            `declaration,read,write,call,comment,string`.
+      responses:
+        "200":
+          description: Classified symbol usages (single-symbol or batch shape)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/FindSymbolUsagesResult"
+                  - $ref: "#/components/schemas/FindSymbolUsagesBatchResult"
+        "400":
+          description: Neither `symbol` nor `symbols` was provided.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Path outside sandbox
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/files/outline:
+    get:
+      operationId: outlineFile
+      tags: [Files]
+      summary: Sub-second outline of a file
+      description: >
+        Source files: top-level declaration tree (kinds + line ranges).
+        Markdown: heading tree. HTML: tag tree (head/body/script). Pure
+        read off the parser-produced graph payload — for files indexed
+        by `text_parser` (no nodes attached), returns `outline: []` and
+        `accuracy: "none"` rather than guessing. Use on first contact
+        with any unfamiliar file BEFORE reaching for `file_search` or
+        `get_file_section`.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: depth
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 2
+            maximum: 6
+      responses:
+        "200":
+          description: Uniform outline rows
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutlineFileResult"
         "400":
           $ref: "#/components/responses/BadRequest"
         "403":
@@ -3423,6 +3639,179 @@ components:
                 type: string
               summary:
                 type: string
+
+    ListDeclarationsResult:
+      type: object
+      required: [path, declarations, count, truncated, accuracy]
+      properties:
+        path:
+          type: string
+        accuracy:
+          type: string
+          enum: [ast, regex, graph_only]
+          description: >
+            `ast` = parser produced the rows; `regex` = regex fallback used
+            (file not in graph or had zero defines); `graph_only` = file
+            could not be read from disk (sandbox/IO failure) and only the
+            graph rows are returned.
+        count:
+          type: integer
+        truncated:
+          type: boolean
+        declarations:
+          type: array
+          description: Uniform-shape array — TOON-friendly.
+          items:
+            type: object
+            required: [name, kind, line_start, line_end, is_exported, parent]
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+                enum:
+                  - function
+                  - class
+                  - method
+                  - const
+                  - let
+                  - var
+                  - def
+                  - map_decl
+                  - weakmap_decl
+                  - set_decl
+                  - weakset_decl
+                  - section
+                  - code_block
+                  - table
+                  - link
+                  - task_item
+              line_start:
+                type: integer
+              line_end:
+                type: integer
+              is_exported:
+                type: boolean
+              parent:
+                type: string
+                description: Enclosing class for methods; empty otherwise.
+
+    FindSymbolUsagesResult:
+      type: object
+      required: [path, symbol, usages, count, accuracy]
+      properties:
+        path:
+          type: string
+        symbol:
+          type: string
+        md5:
+          type: string
+        accuracy:
+          type: string
+          enum: [ast, text]
+          description: >
+            `text` = heuristic single-line classifier (current
+            implementation); `ast` reserved for a future identifier-
+            resolved variant.
+        count:
+          type: integer
+        usages:
+          type: array
+          description: Uniform-shape array — TOON-friendly.
+          items:
+            type: object
+            required: [line_no, kind, text]
+            properties:
+              line_no:
+                type: integer
+              kind:
+                type: string
+                enum: [declaration, read, write, call, comment, string]
+              text:
+                type: string
+                description: The trimmed source line, capped at 240 chars.
+
+    FindSymbolUsagesBatchResult:
+      type: object
+      required: [path, results, total, accuracy]
+      description: >
+        Response shape for batch mode (`symbols=foo,bar,…`). Reads the
+        file once and returns a per-symbol breakdown. See
+        FindSymbolUsagesResult for the single-symbol shape.
+      properties:
+        path:
+          type: string
+        md5:
+          type: string
+        accuracy:
+          type: string
+          enum: [ast, text]
+        total:
+          type: integer
+          description: Sum of `count` across every per-symbol entry.
+        results:
+          type: array
+          description: Uniform-shape array — TOON-friendly. One entry per de-duped symbol.
+          items:
+            type: object
+            required: [symbol, usages, count]
+            properties:
+              symbol:
+                type: string
+              count:
+                type: integer
+              usages:
+                type: array
+                items:
+                  type: object
+                  required: [line_no, kind, text]
+                  properties:
+                    line_no:
+                      type: integer
+                    kind:
+                      type: string
+                      enum: [declaration, read, write, call, comment, string]
+                    text:
+                      type: string
+                      description: The trimmed source line, capped at 240 chars.
+
+    OutlineFileResult:
+      type: object
+      required: [path, outline, count, depth, accuracy]
+      properties:
+        path:
+          type: string
+        accuracy:
+          type: string
+          enum: [ast, regex, none]
+          description: >
+            `ast` = the parser produced the rows; `regex` = HTML
+            tag-tree fallback (used when an `.html`/`.htm` file is not
+            in the parser graph — emits `head`/`body`/`script`/`style`/
+            `<h1..h6>`/`<section>`/… plus the JS function/class/const
+            declarations found inside each `<script>` block); `none` =
+            file is not HTML and has no graph entry, nothing to show.
+        count:
+          type: integer
+        depth:
+          type: integer
+        outline:
+          type: array
+          description: Uniform-shape array — TOON-friendly.
+          items:
+            type: object
+            required: [kind, name, line_start, line_end, depth]
+            properties:
+              kind:
+                type: string
+              name:
+                type: string
+              line_start:
+                type: integer
+              line_end:
+                type: integer
+              depth:
+                type: integer
 
   responses:
     BadRequest:

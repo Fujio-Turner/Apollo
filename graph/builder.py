@@ -143,11 +143,21 @@ def _is_venv_dir(dirpath: str, markers: tuple[str, ...] = _VENV_MARKERS) -> bool
 def _parse_one(item: tuple) -> dict | None:
     """Parse a single file — top-level function for ProcessPoolExecutor.
 
-    If `parser` is None the file has no language parser; return a minimal
-    parsed dict so the file is still added as a plain `file` node.
+    Resolution order:
+
+    1. If ``parser`` is None the file has no language parser; return a
+       minimal parsed dict so the file is still added as a plain ``file``
+       node (so it shows up in the tree and can be inspected).
+    2. If ``parser`` returned ``None`` (e.g. plugin's size cap hit, parse
+       exception, blank file) we fall back to the same minimal dict
+       *instead of dropping the file entirely* — otherwise the file would
+       silently disappear from the index, which historically caused chat
+       tools to report "no such file" for things the user could clearly
+       see in the explorer (see DESIGN.md §"File-skipping invariants").
     """
     parser, src_file, rel_path, source_text = item
-    if parser is None:
+
+    def _minimal() -> dict:
         return {
             "rel_path": rel_path,
             "functions": [],
@@ -158,12 +168,19 @@ def _parse_one(item: tuple) -> dict | None:
             "module_docstring": None,
             "patterns": [],
         }
+
+    if parser is None:
+        return _minimal()
     if source_text is not None:
         parsed = parser.parse_source(source_text, str(src_file))
     else:
         parsed = parser.parse_file(str(src_file))
-    if parsed is not None:
-        parsed["rel_path"] = rel_path
+    if parsed is None:
+        # Plugin claimed the extension but bailed (size cap, exception,
+        # empty body, …). Keep a stub so the file still gets a `file::`
+        # node — losing the symbols is acceptable, losing the file is not.
+        return _minimal()
+    parsed["rel_path"] = rel_path
     return parsed
 
 
