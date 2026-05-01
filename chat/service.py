@@ -68,14 +68,30 @@ def _to_toon_for_llm(json_str: str) -> tuple[str, bool]:
 
 
 # Boilerplate request payload (system prompt + tool catalog) is loaded from
-# `ai/chat_request.json` so it can be tuned without touching Python code.
+# `ai/chat_request_v2.json` so it can be tuned without touching Python code.
 # The file holds the *static* parts of every chat completion request — the
 # model, conversation history, and user message are layered on at call time.
-_REQUEST_TEMPLATE_PATH = os.path.join(
+#
+# Versioning convention:
+#   chat_request_v1.json — legacy rollback (pre Phase-1)
+#   chat_request.json    — previous active payload (kept for parity)
+#   chat_request_v2.json — ACTIVE payload integrating all 14 new internal
+#                          functions (batch_get_nodes, batch_file_sections,
+#                          get_directory_tree, project_stats_detailed,
+#                          get_paths_between, get_subgraph,
+#                          get_inheritance_tree, get_transitive_imports,
+#                          get_code_metrics, search_graph_by_signature,
+#                          find_test_correspondents, detect_entry_points,
+#                          get_git_context, search_notes_fulltext)
+_AI_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "ai",
-    "chat_request.json",
 )
+_REQUEST_TEMPLATE_PATH = os.path.join(_AI_DIR, "chat_request_v2.json")
+# Fallback to the previous active payload if the v2 file is missing — keeps
+# tests / fresh checkouts working until the v2 file is committed.
+if not os.path.exists(_REQUEST_TEMPLATE_PATH):
+    _REQUEST_TEMPLATE_PATH = os.path.join(_AI_DIR, "chat_request.json")
 
 
 def _load_request_template() -> dict:
@@ -456,6 +472,137 @@ class ChatService:
             except Exception as e:
                 return json.dumps({"error": f"annotation lookup failed: {e}"})
 
+        elif name == "batch_get_nodes":
+            from apollo.chat import local_tools
+            ids = args.get("node_ids") or []
+            include_source = bool(args.get("include_source", True))
+            include_edges = bool(args.get("include_edges", True))
+            return json.dumps(local_tools.batch_get_nodes(
+                self.graph, ids,
+                include_source=include_source,
+                include_edges=include_edges,
+            ), default=str)
+
+        elif name == "batch_file_sections":
+            from apollo.chat import local_tools
+            ranges = args.get("ranges") or []
+            return json.dumps(local_tools.batch_file_sections(
+                self.graph, self.root_dir, ranges,
+            ), default=str)
+
+        elif name == "get_directory_tree":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_directory_tree(
+                self.graph,
+                root=args.get("root", ".") or ".",
+                depth=int(args.get("depth", 3) or 3),
+                glob=args.get("glob") or None,
+                include_dirs=bool(args.get("include_dirs", True)),
+            ), default=str)
+
+        elif name == "project_stats_detailed":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.project_stats_detailed(
+                self.graph,
+                top_n=int(args.get("top_n", 20) or 20),
+                group=args.get("group", "dir") or "dir",
+            ), default=str)
+
+        elif name == "get_paths_between":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_paths_between(
+                self.graph,
+                start_node_id=args.get("start_node_id", ""),
+                end_node_id=args.get("end_node_id", ""),
+                max_length=int(args.get("max_length", 5) or 5),
+                max_paths=int(args.get("max_paths", 5) or 5),
+                edge_types=args.get("edge_types"),
+                shortest_only=bool(args.get("shortest_only", False)),
+            ), default=str)
+
+        elif name == "get_subgraph":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_subgraph(
+                self.graph,
+                seed_node_ids=args.get("seed_node_ids") or [],
+                depth=int(args.get("depth", 1) or 1),
+                edge_types=args.get("edge_types"),
+                max_nodes=int(args.get("max_nodes", 200) or 200),
+            ), default=str)
+
+        elif name == "get_inheritance_tree":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_inheritance_tree(
+                self.graph,
+                class_node_id=args.get("class_node_id", ""),
+                include_methods=bool(args.get("include_methods", False)),
+            ), default=str)
+
+        elif name == "get_transitive_imports":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_transitive_imports(
+                self.graph,
+                file_node_id=args.get("file_node_id", ""),
+                direction=args.get("direction", "in") or "in",
+                max_depth=int(args.get("max_depth", 5) or 5),
+            ), default=str)
+
+        elif name == "get_code_metrics":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_code_metrics(
+                self.graph,
+                node_ids=args.get("node_ids"),
+                top_n=int(args.get("top_n", 20) or 20),
+                sort_by=args.get("sort_by", "complexity") or "complexity",
+            ), default=str)
+
+        elif name == "search_graph_by_signature":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.search_graph_by_signature(
+                self.graph,
+                param_names=args.get("param_names"),
+                param_annotations=args.get("param_annotations"),
+                signature_hash=args.get("signature_hash"),
+                fuzzy=bool(args.get("fuzzy", False)),
+                top=int(args.get("top", 20) or 20),
+            ), default=str)
+
+        elif name == "find_test_correspondents":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.find_test_correspondents(
+                self.graph,
+                node_id=args.get("node_id", ""),
+                include_heuristic=bool(args.get("include_heuristic", True)),
+            ), default=str)
+
+        elif name == "detect_entry_points":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.detect_entry_points(
+                self.graph,
+                kinds=args.get("kinds"),
+            ), default=str)
+
+        elif name == "get_git_context":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_git_context(
+                self.graph, self.root_dir,
+                path=args.get("path", ""),
+                name=args.get("name"),
+                line_start=args.get("line_start"),
+                line_end=args.get("line_end"),
+                limit=int(args.get("limit", 10) or 10),
+            ), default=str)
+
+        elif name == "search_notes_fulltext":
+            from apollo.chat import local_tools
+            mgr = self._get_annotation_manager()
+            return json.dumps(local_tools.search_notes_fulltext(
+                mgr,
+                query=args.get("query", ""),
+                type_filter=args.get("type"),
+                top=int(args.get("top", 10) or 10),
+            ), default=str)
+
         elif name == "get_wordcloud":
             from collections import defaultdict
             exclude = {"directory", "file", "import"}
@@ -695,6 +842,31 @@ class ChatService:
                     "chat.error id=%s round=%d phase=tools total_dt=%.2fs",
                     rid, round_idx, time.time() - t_start,
                 )
+                # Classify so the UI can show a useful daisyUI toast instead
+                # of dumping the raw provider stack-trace text on the user.
+                err_cls = type(e).__name__
+                provider_label = self.active_provider
+                if err_cls in ("APIConnectionError", "APITimeoutError",
+                               "ConnectError", "ConnectTimeout", "ReadTimeout"):
+                    error_kind = "connection_error"
+                    user_message = (
+                        f"Cannot reach {provider_label} provider — "
+                        "check your internet connection and try again."
+                    )
+                elif err_cls in ("AuthenticationError", "PermissionDeniedError"):
+                    error_kind = "auth_error"
+                    user_message = (
+                        f"{provider_label} rejected the API key — "
+                        "verify the credentials in your environment."
+                    )
+                elif err_cls == "RateLimitError":
+                    error_kind = "rate_limit"
+                    user_message = (
+                        f"{provider_label} rate-limit hit — wait a moment and retry."
+                    )
+                else:
+                    error_kind = "error"
+                    user_message = f"Chat failed ({err_cls}): {e}"
                 yield {
                     "type": "step",
                     "phase": "error",
@@ -702,8 +874,11 @@ class ChatService:
                     "where": "tools",
                     "round": round_idx,
                     "message": str(e),
+                    "error_kind": error_kind,
+                    "user_message": user_message,
                 }
-                raise
+                # Raise a clean message so the SSE `[ERROR]` frame stays readable.
+                raise RuntimeError(user_message) from e
             choice = response.choices[0]
             last_round_finish = choice.finish_reason
             tool_call_count = len(choice.message.tool_calls or []) if choice.message else 0

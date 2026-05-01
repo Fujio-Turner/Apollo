@@ -18,7 +18,13 @@ tailwind.config = {
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts-wordcloud@2/dist/echarts-wordcloud.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-dark.min.css">
+<!-- highlight.js theme. Default to GitHub LIGHT to match the default
+     `data-theme="light"` on <html>. Using `github-dark` here makes the
+     initial render unreadable: dark-theme strings (#a5d6ff cyan) on a
+     light bubble = washed out. The stylesheet is hot-swapped to
+     `github-dark.min.css` by `toggleTheme()` in app.js when the user
+     switches to dark mode. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css">
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
 <link href="https://cdn.jsdelivr.net/npm/@yaireo/tagify/dist/tagify.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@yaireo/tagify"></script>

@@ -1399,6 +1399,138 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     def stats():
         return q.stats()
 
+    # ── PLAN_MORE_LOCAL_AI_FUNCTIONS endpoints ─────────────────────────
+    # Mirror the new chat-agent tools as HTTP endpoints so the human-facing
+    # UI has parity with the AI's view (per plan §0 rule 5).
+
+    @app.post("/api/nodes/batch")
+    async def api_nodes_batch(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        ids = body.get("ids") or body.get("node_ids") or []
+        if not isinstance(ids, list):
+            raise HTTPException(status_code=400, detail="`ids` must be a list")
+        return local_tools.batch_get_nodes(
+            graph, ids,
+            include_source=bool(body.get("include_source", True)),
+            include_edges=bool(body.get("include_edges", True)),
+        )
+
+    @app.post("/api/files/sections")
+    async def api_files_sections(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        ranges = body.get("ranges") or []
+        if not isinstance(ranges, list):
+            raise HTTPException(status_code=400, detail="`ranges` must be a list")
+        return local_tools.batch_file_sections(graph, root_dir, ranges)
+
+    @app.get("/api/stats/detailed")
+    def api_stats_detailed(
+        top_n: int = Query(20, ge=1, le=50),
+        group: str = Query("dir", pattern="^(dir|lang|ext)$"),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.project_stats_detailed(graph, top_n=top_n, group=group)
+
+    @app.get("/api/paths")
+    def api_paths(
+        start: str = Query(...),
+        end: str = Query(...),
+        max_length: int = Query(5, ge=1, le=8),
+        max_paths: int = Query(5, ge=1, le=20),
+        edge_types: Optional[str] = Query(None, description="Comma-separated edge types"),
+        shortest_only: bool = Query(False),
+    ):
+        from apollo.chat import local_tools
+        et = [t.strip() for t in edge_types.split(",")] if edge_types else None
+        return local_tools.get_paths_between(
+            graph, start, end,
+            max_length=max_length, max_paths=max_paths,
+            edge_types=et, shortest_only=shortest_only,
+        )
+
+    @app.post("/api/subgraph")
+    async def api_subgraph(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        return local_tools.get_subgraph(
+            graph,
+            seed_node_ids=body.get("seed_node_ids") or [],
+            depth=int(body.get("depth", 1) or 1),
+            edge_types=body.get("edge_types"),
+            max_nodes=int(body.get("max_nodes", 200) or 200),
+        )
+
+    @app.get("/api/inheritance/{class_id:path}")
+    def api_inheritance(class_id: str, include_methods: bool = Query(False)):
+        from apollo.chat import local_tools
+        return local_tools.get_inheritance_tree(
+            graph, class_id, include_methods=include_methods,
+        )
+
+    @app.get("/api/imports/{file_id:path}")
+    def api_transitive_imports(
+        file_id: str,
+        direction: str = Query("in", pattern="^(in|out|both)$"),
+        max_depth: int = Query(5, ge=1, le=10),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_transitive_imports(
+            graph, file_id, direction=direction, max_depth=max_depth,
+        )
+
+    @app.get("/api/metrics")
+    def api_metrics(
+        top_n: int = Query(20, ge=1, le=100),
+        sort_by: str = Query("complexity", pattern="^(complexity|loc|param_count)$"),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_code_metrics(graph, top_n=top_n, sort_by=sort_by)
+
+    @app.post("/api/signature/search")
+    async def api_signature_search(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        return local_tools.search_graph_by_signature(
+            graph,
+            param_names=body.get("param_names"),
+            param_annotations=body.get("param_annotations"),
+            signature_hash=body.get("signature_hash"),
+            fuzzy=bool(body.get("fuzzy", False)),
+            top=int(body.get("top", 20) or 20),
+        )
+
+    @app.get("/api/tests/{node_id:path}")
+    def api_test_correspondents(
+        node_id: str,
+        include_heuristic: bool = Query(True),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.find_test_correspondents(
+            graph, node_id, include_heuristic=include_heuristic,
+        )
+
+    @app.get("/api/entry-points")
+    def api_entry_points(kinds: Optional[str] = Query(None)):
+        from apollo.chat import local_tools
+        kk = [k.strip() for k in kinds.split(",")] if kinds else None
+        return local_tools.detect_entry_points(graph, kinds=kk)
+
+    @app.get("/api/git/blame")
+    def api_git_blame(
+        path: str = Query(...),
+        name: Optional[str] = Query(None),
+        line_start: Optional[int] = Query(None),
+        line_end: Optional[int] = Query(None),
+        limit: int = Query(10, ge=1, le=30),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_git_context(
+            graph, root_dir, path,
+            name=name, line_start=line_start, line_end=line_end, limit=limit,
+        )
+
     # -------------------------------------------------------------- Logging --
 
     @app.get("/api/logging/info")

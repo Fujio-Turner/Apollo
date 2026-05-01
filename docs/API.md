@@ -818,6 +818,143 @@ Folder tree of the current project, used by the bootstrap wizard.
 
 ---
 
+## Local AI Tools
+
+These endpoints mirror the AI agent's extended tool catalog (see
+`PLAN_MORE_LOCAL_AI_FUNCTIONS`). Each one is a single-call replacement for
+a multi-grep dance the model would otherwise perform. All read-only.
+
+### `POST /api/nodes/batch`
+
+Get up to 20 node payloads in one call. Replaces sequential `GET /api/node/{id}`.
+
+**Request Body**
+
+| Field            | Type      | Required | Description                          |
+|------------------|-----------|----------|--------------------------------------|
+| `ids`            | string[]  | yes      | Up to 20 node IDs                    |
+| `include_source` | boolean   | no       | Default `true`                       |
+| `include_edges`  | boolean   | no       | Default `true`                       |
+
+Returns `{ nodes[], missing[], requested }`. Unknown IDs land in `missing[]`.
+
+### `POST /api/files/sections`
+
+Read up to 10 line ranges across files in one call. Per-range cap is 400
+lines. Errors on individual ranges are inlined without failing the batch.
+
+**Request Body**
+
+```json
+{ "ranges": [ { "path": "x.py", "start": 1, "end": 40 } ] }
+```
+
+### `GET /api/stats/detailed`
+
+Deeper aggregation over the existing graph — group counts, top-N largest
+files, top-N most-connected nodes.
+
+| Param   | Type   | Default | Description                                  |
+|---------|--------|---------|----------------------------------------------|
+| `top_n` | int    | 20      | 1..50                                        |
+| `group` | string | dir     | One of `dir`, `lang`, `ext`                  |
+
+### `GET /api/paths`
+
+Find paths between two nodes via `nx.all_simple_paths` (or
+`shortest_path` when `shortest_only=true`) over an undirected,
+edge-type-filtered view.
+
+| Param           | Type    | Default | Description                                  |
+|-----------------|---------|---------|----------------------------------------------|
+| `start`         | string  | —       | Start node ID                                |
+| `end`           | string  | —       | End node ID                                  |
+| `max_length`    | int     | 5       | 1..8                                         |
+| `max_paths`     | int     | 5       | 1..20                                        |
+| `edge_types`    | csv     | —       | e.g. `calls,imports`                         |
+| `shortest_only` | boolean | false   | Return only the shortest path                |
+
+### `POST /api/subgraph`
+
+Subgraph induced by N seeds plus depth-K neighbours.
+
+```json
+{ "seed_node_ids": ["func::main.py::main"], "depth": 1, "max_nodes": 200 }
+```
+
+### `GET /api/inheritance/{class_id}`
+
+Full ancestor chain + descendants for a class node.
+
+| Param              | Type    | Default | Description                              |
+|--------------------|---------|---------|------------------------------------------|
+| `include_methods`  | boolean | false   | Roll up `defines→method` edges per class |
+
+### `GET /api/imports/{file_id}`
+
+Transitive import set in either direction.
+
+| Param       | Type   | Default | Description                                      |
+|-------------|--------|---------|--------------------------------------------------|
+| `direction` | string | in      | `in`, `out`, or `both`                           |
+| `max_depth` | int    | 5       | 1..10                                            |
+
+### `GET /api/metrics`
+
+Top-N most complex / largest functions project-wide.
+
+| Param     | Type   | Default     | Description                              |
+|-----------|--------|-------------|------------------------------------------|
+| `top_n`   | int    | 20          | 1..100                                   |
+| `sort_by` | string | complexity  | `complexity`, `loc`, or `param_count`    |
+
+### `POST /api/signature/search`
+
+Find functions whose parameter list matches a pattern. Cannot be
+answered correctly by grep — the indexer's resolved param list is the
+only ground truth.
+
+```json
+{ "param_names": ["user_id", "amount"], "fuzzy": false, "top": 20 }
+```
+
+Either `param_names`, `param_annotations`, or `signature_hash` must be
+supplied.
+
+### `GET /api/tests/{node_id}`
+
+Probable tests covering a function/class node — explicit `tests` edges
+first, then heuristic matches (`test_<name>`, `Test<Name>`).
+
+| Param               | Type    | Default | Description                  |
+|---------------------|---------|---------|------------------------------|
+| `include_heuristic` | boolean | true    | Include name-pattern matches |
+
+### `GET /api/entry-points`
+
+Probable entry points: `__main__` markers, FastAPI/Flask/Django routes,
+Click/Typer CLI commands, well-known basenames.
+
+| Param   | Type | Description                                                |
+|---------|------|------------------------------------------------------------|
+| `kinds` | csv  | Optional filter (`cli`, `http_route`, `main`, …)           |
+
+### `GET /api/git/blame`
+
+`git log` + `git blame -L` for a file (or function/line range). Returns
+`{ git_available: false }` cleanly on non-git roots and on missing
+`git` binaries — never raises.
+
+| Param        | Type   | Default | Description                                           |
+|--------------|--------|---------|-------------------------------------------------------|
+| `path`       | string | —       | Project-relative file path                            |
+| `name`       | string | —       | Optional function/class name → resolved to a range    |
+| `line_start` | int    | —       | Start line for blame (inclusive)                      |
+| `line_end`   | int    | —       | End line for blame (inclusive)                        |
+| `limit`      | int    | 10      | 1..30 — max recent commits returned                   |
+
+---
+
 ## Realtime
 
 ### `WS /ws`

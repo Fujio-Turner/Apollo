@@ -36,6 +36,11 @@ tags:
   - name: Chat
   - name: Images
   - name: Watch
+  - name: Git
+    description: >
+      Read-only git introspection (blame + recent commits). Mirrors the
+      AI agent's `get_git_context` tool. Returns `{git_available: false}`
+      cleanly on non-git roots and on missing `git` binaries.
   - name: Realtime
     description: WebSocket channel for live graph updates from the file watcher.
 
@@ -1813,6 +1818,456 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # ── Local AI tools (PLAN_MORE_LOCAL_AI_FUNCTIONS) ─────────────────────
+  # Each endpoint below mirrors a tool in `chat/local_tools.py` so the
+  # human-facing UI has parity with the AI agent's view. All read-only.
+
+  /api/nodes/batch:
+    post:
+      operationId: batchGetNodes
+      tags: [Graph]
+      summary: Get up to 20 node payloads in one call
+      description: >
+        Replaces sequential `GET /api/node/{id}` calls. Unknown IDs are
+        returned in `missing[]` so callers don't have to retry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  maxItems: 20
+                  items:
+                    type: string
+                include_source:
+                  type: boolean
+                  default: true
+                include_edges:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Batched node payloads
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchNodesResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/files/sections:
+    post:
+      operationId: batchFileSections
+      tags: [Files]
+      summary: Read up to 10 line ranges across files in one call
+      description: >
+        Hard caps: 10 ranges per call, 400 lines per range. Each entry
+        returns its own (path, start, end, md5, lines, truncated). Errors
+        on individual ranges are inlined without failing the batch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ranges]
+              properties:
+                ranges:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: object
+                    required: [path, start, end]
+                    properties:
+                      path:
+                        type: string
+                      start:
+                        type: integer
+                      end:
+                        type: integer
+      responses:
+        "200":
+          description: Batched file section payloads
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchFileSectionsResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/stats/detailed:
+    get:
+      operationId: getStatsDetailed
+      tags: [Graph]
+      summary: Deeper aggregation over the existing graph
+      description: >
+        Group counts by directory / language / extension, plus top-N
+        largest files (by node_count) and most-connected nodes (by degree).
+      parameters:
+        - name: top_n
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 50
+        - name: group
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [dir, lang, ext]
+            default: dir
+      responses:
+        "200":
+          description: Detailed stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DetailedStats"
+
+  /api/paths:
+    get:
+      operationId: getPathsBetween
+      tags: [Graph]
+      summary: Find paths between two nodes
+      description: >
+        `nx.all_simple_paths` (or `shortest_path` when `shortest_only=true`)
+        over an edge-type-filtered, undirected view of the graph. Use to
+        answer "how is X connected to Y?" / refactoring blast-radius.
+      parameters:
+        - name: start
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: end
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: max_length
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+            minimum: 1
+            maximum: 8
+        - name: max_paths
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+            minimum: 1
+            maximum: 20
+        - name: edge_types
+          in: query
+          required: false
+          description: Comma-separated edge types
+          schema:
+            type: string
+        - name: shortest_only
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Paths between the two nodes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PathsResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/subgraph:
+    post:
+      operationId: getSubgraph
+      tags: [Graph]
+      summary: Subgraph induced by N seed nodes plus their depth-K neighbours
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seed_node_ids]
+              properties:
+                seed_node_ids:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: string
+                depth:
+                  type: integer
+                  default: 1
+                  minimum: 0
+                  maximum: 3
+                edge_types:
+                  type: array
+                  items:
+                    type: string
+                max_nodes:
+                  type: integer
+                  default: 200
+                  maximum: 500
+      responses:
+        "200":
+          description: Subgraph nodes + edges
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubgraphResult"
+
+  /api/inheritance/{class_id}:
+    get:
+      operationId: getInheritanceTree
+      tags: [Graph]
+      summary: Full ancestor chain + descendants for a class node
+      parameters:
+        - name: class_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include_methods
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Inheritance tree
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InheritanceTreeResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/imports/{file_id}:
+    get:
+      operationId: getTransitiveImports
+      tags: [Graph]
+      summary: Transitive import set for a file (in / out / both)
+      description: >
+        `direction=out` = what this file depends on; `direction=in` =
+        what depends on this file.
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [in, out, both]
+            default: in
+        - name: max_depth
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+            minimum: 1
+            maximum: 10
+      responses:
+        "200":
+          description: Transitive imports
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransitiveImportsResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/metrics:
+    get:
+      operationId: getCodeMetrics
+      tags: [Graph]
+      summary: Top-N most complex / largest functions project-wide
+      parameters:
+        - name: top_n
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: sort_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [complexity, loc, param_count]
+            default: complexity
+      responses:
+        "200":
+          description: Code metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeMetricsResult"
+
+  /api/signature/search:
+    post:
+      operationId: searchBySignature
+      tags: [Search]
+      summary: Find functions whose parameter list matches a pattern
+      description: >
+        Pass `param_names` (ordered) or `signature_hash` (exact). Cannot
+        be answered correctly by grep — the indexer's resolved param list
+        is the only ground truth.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                param_names:
+                  type: array
+                  items:
+                    type: string
+                param_annotations:
+                  type: array
+                  items:
+                    type: string
+                signature_hash:
+                  type: string
+                fuzzy:
+                  type: boolean
+                  default: false
+                top:
+                  type: integer
+                  default: 20
+                  maximum: 50
+      responses:
+        "200":
+          description: Matching functions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignatureSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/tests/{node_id}:
+    get:
+      operationId: findTestCorrespondents
+      tags: [Graph]
+      summary: Probable tests covering a function/class node
+      description: >
+        Explicit `tests` edges first, then heuristic matches
+        (`test_<name>`, `Test<Name>`).
+      parameters:
+        - name: node_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include_heuristic
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: Test correspondents
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestCorrespondentsResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/entry-points:
+    get:
+      operationId: detectEntryPoints
+      tags: [Graph]
+      summary: Probable entry points for the indexed project
+      description: >
+        Scans for `__main__` markers, FastAPI/Flask/Django routes,
+        Click/Typer CLI commands, well-known basenames (main.py /
+        cli.py / manage.py).
+      parameters:
+        - name: kinds
+          in: query
+          required: false
+          description: Comma-separated kind filter (cli,http_route,main,…)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Entry points
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntryPointsResult"
+
+  /api/git/blame:
+    get:
+      operationId: getGitContext
+      tags: [Git]
+      summary: git log + git blame for a file (or function range)
+      description: >
+        Returns recent commits touching `path` and (when a line range is
+        given via `line_start`/`line_end` or resolved from `name`) blame
+        rows. Returns `git_available=false` cleanly on non-git roots and
+        on missing `git` binaries — never raises into the response.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: name
+          in: query
+          required: false
+          description: Optional function/class name; resolves to its line range via the graph.
+          schema:
+            type: string
+        - name: line_start
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: line_end
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 30
+      responses:
+        "200":
+          description: Git context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GitContextResult"
+
 # ════════════════════════════════════════════════════════════════════════
 components:
   schemas:
@@ -2537,6 +2992,437 @@ components:
         created_at:
           type: string
           format: date-time
+
+    # ── Local AI tools (PLAN_MORE_LOCAL_AI_FUNCTIONS) ─────────────────
+    BatchNodesResult:
+      type: object
+      required: [nodes, missing, requested]
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            description: Same payload as `GET /api/node/{id}`.
+            additionalProperties: true
+        missing:
+          type: array
+          items:
+            type: string
+        requested:
+          type: integer
+
+    BatchFileSectionsResult:
+      type: object
+      required: [sections, requested, served]
+      properties:
+        requested:
+          type: integer
+        served:
+          type: integer
+        sections:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+              start:
+                type: integer
+              end:
+                type: integer
+              md5:
+                type: string
+              lines:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    n:
+                      type: integer
+                    text:
+                      type: string
+              truncated:
+                type: boolean
+              error:
+                type: string
+
+    DetailedStats:
+      type: object
+      required: [group, top_n, groups, top_files, top_connected]
+      properties:
+        group:
+          type: string
+          enum: [dir, lang, ext]
+        top_n:
+          type: integer
+        groups:
+          type: array
+          items:
+            type: object
+            required: [key, file_count]
+            properties:
+              key:
+                type: string
+              file_count:
+                type: integer
+        top_files:
+          type: array
+          items:
+            type: object
+            properties:
+              file:
+                type: string
+              node_id:
+                type: string
+              node_count:
+                type: integer
+        top_connected:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              type:
+                type: string
+              path:
+                type: string
+              degree:
+                type: integer
+
+    PathsResult:
+      type: object
+      required: [start, end, paths, count]
+      properties:
+        start:
+          type: string
+        end:
+          type: string
+        count:
+          type: integer
+        paths:
+          type: array
+          items:
+            type: object
+            required: [length, node_ids, edges]
+            properties:
+              length:
+                type: integer
+              node_ids:
+                type: array
+                items:
+                  type: string
+              edges:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    from:
+                      type: string
+                    to:
+                      type: string
+                    type:
+                      type: string
+                    direction:
+                      type: string
+                      enum: [in, out, ""]
+
+    SubgraphResult:
+      type: object
+      required: [seeds, depth, nodes, edges, node_count, edge_count]
+      properties:
+        seeds:
+          type: array
+          items:
+            type: string
+        depth:
+          type: integer
+        node_count:
+          type: integer
+        edge_count:
+          type: integer
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              type:
+                type: string
+              path:
+                type: string
+              depth:
+                type: integer
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              type:
+                type: string
+
+    InheritanceTreeResult:
+      type: object
+      required: [class_id, ancestors, descendants, methods]
+      properties:
+        class_id:
+          type: string
+        ancestors:
+          type: array
+          items:
+            $ref: "#/components/schemas/InheritanceTreeNode"
+        descendants:
+          type: array
+          items:
+            $ref: "#/components/schemas/InheritanceTreeNode"
+        methods:
+          type: array
+          items:
+            type: object
+            properties:
+              class_id:
+                type: string
+              id:
+                type: string
+              name:
+                type: string
+              path:
+                type: string
+              line_start:
+                type: integer
+
+    InheritanceTreeNode:
+      type: object
+      required: [id, name, path, depth]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        depth:
+          type: integer
+
+    TransitiveImportsResult:
+      type: object
+      required: [file_node_id, direction, max_depth, imports, count]
+      properties:
+        file_node_id:
+          type: string
+        direction:
+          type: string
+          enum: [in, out, both]
+        max_depth:
+          type: integer
+        count:
+          type: integer
+        imports:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              path:
+                type: string
+              type:
+                type: string
+              depth:
+                type: integer
+
+    CodeMetricsRow:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        loc:
+          type: integer
+        complexity:
+          type: integer
+        param_count:
+          type: integer
+        signature_hash:
+          type: string
+
+    CodeMetricsResult:
+      type: object
+      required: [metrics, scope]
+      properties:
+        scope:
+          type: string
+          enum: [explicit, top_n]
+        sort_by:
+          type: string
+        top_n:
+          type: integer
+        total_eligible:
+          type: integer
+        missing:
+          type: array
+          items:
+            type: string
+        metrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/CodeMetricsRow"
+
+    SignatureSearchResult:
+      type: object
+      required: [matches, count, fuzzy]
+      properties:
+        count:
+          type: integer
+        fuzzy:
+          type: boolean
+        matches:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              type:
+                type: string
+              path:
+                type: string
+              line_start:
+                type: integer
+              params:
+                type: array
+                items:
+                  type: string
+              signature_hash:
+                type: string
+
+    TestCorrespondentsResult:
+      type: object
+      required: [node_id, explicit, heuristic, count]
+      properties:
+        node_id:
+          type: string
+        count:
+          type: integer
+        explicit:
+          type: array
+          items:
+            $ref: "#/components/schemas/TestCorrespondent"
+        heuristic:
+          type: array
+          items:
+            $ref: "#/components/schemas/TestCorrespondent"
+
+    TestCorrespondent:
+      type: object
+      required: [id, name, path]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+
+    EntryPointsResult:
+      type: object
+      required: [entry_points, count]
+      properties:
+        count:
+          type: integer
+        entry_points:
+          type: array
+          items:
+            type: object
+            required: [kind, id, name, path, line]
+            properties:
+              kind:
+                type: string
+                description: e.g. main, main_func, cli, http_route, fastapi_app, script, pytest_fixture
+              id:
+                type: string
+              name:
+                type: string
+              path:
+                type: string
+              line:
+                type: integer
+              decorator:
+                type: string
+              method:
+                type: string
+              basename:
+                type: string
+
+    GitContextResult:
+      type: object
+      required: [git_available]
+      properties:
+        git_available:
+          type: boolean
+        reason:
+          type: string
+          description: Present when git_available=false. e.g. "not a git repo".
+        repo_root:
+          type: string
+        path:
+          type: string
+        line_start:
+          type:
+            - integer
+            - "null"
+        line_end:
+          type:
+            - integer
+            - "null"
+        commits:
+          type: array
+          items:
+            type: object
+            properties:
+              sha:
+                type: string
+              author:
+                type: string
+              date:
+                type: string
+              summary:
+                type: string
+        blame:
+          type: array
+          items:
+            type: object
+            properties:
+              sha:
+                type: string
+              author:
+                type: string
+              date:
+                type: string
+              summary:
+                type: string
 
   responses:
     BadRequest:

@@ -543,17 +543,31 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 #chat-messages .chat-bubble .md-content code {
    font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
    font-size: 0.9em; padding: 1px 5px; border-radius: 3px;
-   background: rgba(0,0,0,0.2);
+   /* Lowered from 0.2 → 0.06 so green `text-primary` node-refs
+      embedded in inline code stay legible against the bubble. */
+   background: rgba(0,0,0,0.06);
    color: inherit;
 }
 #chat-messages .chat-bubble .md-content pre {
    border-radius: 6px; padding: 8px 10px; margin: 6px 0;
    font-size: 11px;
-   background: rgba(0,0,0,0.25);
+   /* Lowered from 0.25 → 0.08 for the same legibility reason —
+      the grey was washing out node-ref chips and other coloured
+      tokens (HTML <span> output) in fenced blocks. */
+   background: rgba(0,0,0,0.08);
    color: inherit;
    word-wrap: break-word;
    overflow-wrap: break-word;
    white-space: pre-wrap;
+}
+/* Dark-theme override: black-on-black would disappear, so use a
+   translucent WHITE wash instead — keeps the same "slightly tinted"
+   feel on dark bubbles without crushing green text. */
+[data-theme="dark"] #chat-messages .chat-bubble .md-content code {
+   background: rgba(255,255,255,0.08);
+}
+[data-theme="dark"] #chat-messages .chat-bubble .md-content pre {
+   background: rgba(255,255,255,0.06);
 }
 #chat-messages .chat-bubble .md-content pre code {
   padding: 0; background: none;
@@ -571,7 +585,12 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 /* ── Top Search Bar ───────────────────────────────────────────── */
 /* ── Chat mode tags (Tagify) ──────────────────────────────────── */
 .tagify { --tag-pad: 0.25em 0.5em; flex: 1; min-height: 2rem; padding: 4px 6px; border-radius: 0.25rem; }
-.tagify__input { min-width: 80px; }
+/* Chat input specifically: override DaisyUI .input/.input-sm fixed height
+   so typed text + badges can wrap onto a second line and remain visible.
+   Without this the wrapper is locked to height:2rem and clips the caret. */
+.tagify.tagify--mix#chat-input,
+.tagify[class*="input-sm"] { height: auto !important; max-height: 8rem; overflow-y: auto; line-height: 1.4; align-items: flex-start; }
+.tagify__input { min-width: 80px; line-height: 1.4; }
 .tagify__tag { margin: 2px 4px 2px 0; }
 .tagify__tag > div { padding: 2px 8px; border-radius: 9999px; font-weight: 600; font-size: 11px; color: #fff; }
 .tagify__tag[data-mode="find"] > div { background: #16a34a; }   /* green */
@@ -842,6 +861,104 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 .ann-row-actions .ann-action:hover { background: oklch(var(--b2)); }
 .ann-row-actions .ann-action.danger:hover { background: rgba(239,68,68,0.15); border-color: #ef4444; color: #ef4444; }
 .ann-empty { text-align: center; padding: 60px 20px; opacity: 0.55; font-size: 12px; }
+
+/* ── My Hub: Welcome / Quick Start panel ───────────────────────── */
+.hub-welcome {
+  position: relative;
+  padding: 18px 20px 20px;
+  border-radius: 12px;
+  border: 1px solid oklch(var(--b3) / 0.6);
+  background:
+    radial-gradient(120% 80% at 0% 0%, oklch(var(--p) / 0.10) 0%, transparent 55%),
+    radial-gradient(120% 80% at 100% 100%, oklch(var(--in, var(--p)) / 0.08) 0%, transparent 60%),
+    oklch(var(--b1));
+  overflow: hidden;
+}
+.hub-welcome::before {
+  content: "";
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: linear-gradient(135deg, transparent 65%, oklch(var(--p) / 0.06) 100%);
+}
+
+.hub-hero { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; }
+.hub-hero-icon {
+  font-size: 28px; line-height: 1;
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  background: linear-gradient(135deg, oklch(var(--p) / 0.18), oklch(var(--p) / 0.06));
+  border: 1px solid oklch(var(--p) / 0.25);
+  flex-shrink: 0;
+  box-shadow: 0 4px 12px oklch(var(--p) / 0.12);
+}
+.hub-title {
+  font-size: 22px; font-weight: 700; line-height: 1.1;
+  margin: 0 0 4px 0;
+  background: linear-gradient(90deg, oklch(var(--bc)) 0%, oklch(var(--p)) 100%);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.hub-subtitle { font-size: 13px; line-height: 1.5; opacity: 0.85; margin: 0; }
+.hub-accent { color: oklch(var(--p)); font-weight: 600; }
+
+.hub-section-label {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  opacity: 0.7;
+  margin: 16px 0 10px;
+}
+.hub-section-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: oklch(var(--p));
+  box-shadow: 0 0 8px oklch(var(--p) / 0.7);
+}
+
+.hub-quickstart { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.hub-qs-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid oklch(var(--b3) / 0.5);
+  background: oklch(var(--b2) / 0.5);
+  transition: border-color 0.15s, transform 0.15s, background 0.15s;
+}
+.hub-qs-item:hover {
+  border-color: oklch(var(--p) / 0.5);
+  background: oklch(var(--b2) / 0.85);
+  transform: translateX(2px);
+}
+.hub-qs-text { font-size: 12.5px; line-height: 1.5; opacity: 0.92; padding-top: 1px; }
+
+.hub-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+  line-height: 1.4;
+}
+.hub-badge-files  { background: oklch(0.92 0.08 250 / 0.25); color: oklch(0.55 0.18 250); border-color: oklch(0.55 0.18 250 / 0.3); }
+.hub-badge-chat   { background: oklch(0.92 0.10 150 / 0.25); color: oklch(0.45 0.18 150); border-color: oklch(0.45 0.18 150 / 0.3); }
+.hub-badge-click  { background: oklch(0.92 0.10 290 / 0.25); color: oklch(0.55 0.20 290); border-color: oklch(0.55 0.20 290 / 0.3); }
+.hub-badge-reset  { background: oklch(0.92 0.08 30 / 0.25);  color: oklch(0.55 0.18 30);  border-color: oklch(0.55 0.18 30 / 0.3); }
+.hub-badge-depth  { background: oklch(0.92 0.10 80 / 0.30);  color: oklch(0.50 0.16 80);  border-color: oklch(0.50 0.16 80 / 0.35); }
+.hub-badge-note   { background: oklch(0.92 0.10 340 / 0.25); color: oklch(0.55 0.20 340); border-color: oklch(0.55 0.20 340 / 0.3); }
+
+.hub-code {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: oklch(var(--b3) / 0.7);
+  border: 1px solid oklch(var(--b3));
+  color: oklch(var(--p));
+}
+.hub-star { color: #f59e0b; font-weight: 700; }
 
 /* ── My Hub: Recent activity list ──────────────────────────────── */
 #hub-recent { display: flex; flex-direction: column; gap: 6px; }
