@@ -210,6 +210,42 @@ class CouchbaseLiteStore:
             if not created:
                 pass  # Community Edition — vector search via brute-force SQL++
 
+    # -- Async multi-get -----------------------------------------------
+
+    async def aget_node_docs(
+        self, node_ids: list[str]
+    ) -> dict[str, dict | None]:
+        """Fetch many node documents from CBL **in parallel**.
+
+        Wraps :meth:`CBL.aget_documents_json` (which uses
+        ``asyncio.to_thread`` + ``asyncio.gather``) and JSON-decodes
+        the results. Returns ``{ node_id: attrs|None }`` — missing
+        documents map to ``None``. Order of input IDs is preserved.
+
+        Use this instead of a serial ``for nid in ids:
+        cbl.get_document_json(nid)`` loop whenever a request handler
+        needs multiple node payloads — Couchbase Lite queries are
+        single-threaded, so off-loading each get to the thread pool
+        keeps the FastAPI event loop responsive.
+        """
+        cbl = self._open()
+        nodes_col = cbl.get_or_create_collection("nodes")
+        raw = await cbl.aget_documents_json(nodes_col, list(node_ids))
+        out: dict[str, dict | None] = {}
+        for nid, body in zip(node_ids, raw):
+            if body is None:
+                out[nid] = None
+                continue
+            try:
+                attrs = json.loads(body)
+                if isinstance(attrs, str):
+                    attrs = json.loads(attrs)
+                attrs.pop("_id", None)
+                out[nid] = attrs
+            except Exception:
+                out[nid] = None
+        return out
+
     # -- Expose CBL for search backends ---
 
     @property

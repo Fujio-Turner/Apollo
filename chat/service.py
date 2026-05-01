@@ -735,23 +735,16 @@ class ChatService:
             ), default=str)
 
         elif name == "get_wordcloud":
-            from collections import defaultdict
-            exclude = {"directory", "file", "import"}
+            # Strength + count are derived purely from the graph and do
+            # not depend on the chat call's arguments. We delegate to
+            # ``apollo.graph.indices.get_indices`` which caches the
+            # result by ``(num_nodes, num_edges)`` — repeated wordcloud
+            # invocations within a session reuse the same buckets.
+            exclude = frozenset({"directory", "file", "import"})
             mode = (args.get("mode") or "strong").lower()
-            strengths: dict[str, float] = defaultdict(float)
-            counts: dict[str, int] = defaultdict(int)
-            for nid, data in self.graph.nodes(data=True):
-                if data.get("type", "") in exclude:
-                    continue
-                n = data.get("name", "")
-                if not n:
-                    continue
-                try:
-                    deg = self.graph.degree(nid)
-                except Exception:
-                    deg = 0
-                strengths[n] += deg
-                counts[n] += 1
+            from apollo.graph.indices import get_indices
+            indices = get_indices(self.graph)
+            strengths, counts = indices.wordcloud(exclude)
             items = [
                 {"name": n, "strength": float(strengths[n]), "count": counts[n]}
                 for n in strengths

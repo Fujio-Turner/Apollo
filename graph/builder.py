@@ -17,6 +17,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -143,6 +144,11 @@ def _is_venv_dir(dirpath: str, markers: tuple[str, ...] = _VENV_MARKERS) -> bool
 def _parse_one(item: tuple) -> dict | None:
     """Parse a single file — top-level function for ProcessPoolExecutor.
 
+    The work-item tuple is ``(parser, src_file, rel_path, source_text,
+    file_md5_hex)``. ``file_md5_hex`` is set by ``build_incremental``
+    where we already had the bytes in memory; for the full-build path
+    it is ``None`` and ``_build_file_nodes`` falls back to a disk read.
+
     Resolution order:
 
     1. If ``parser`` is None the file has no language parser; return a
@@ -155,7 +161,7 @@ def _parse_one(item: tuple) -> dict | None:
        tools to report "no such file" for things the user could clearly
        see in the explorer (see DESIGN.md §"File-skipping invariants").
     """
-    parser, src_file, rel_path, source_text = item
+    parser, src_file, rel_path, source_text, file_md5_hex = item
 
     def _minimal() -> dict:
         return {
@@ -167,6 +173,7 @@ def _parse_one(item: tuple) -> dict | None:
             "variables": [],
             "module_docstring": None,
             "patterns": [],
+            "file_md5": file_md5_hex,
         }
 
     if parser is None:
@@ -181,6 +188,8 @@ def _parse_one(item: tuple) -> dict | None:
         # node — losing the symbols is acceptable, losing the file is not.
         return _minimal()
     parsed["rel_path"] = rel_path
+    if file_md5_hex is not None and not parsed.get("file_md5"):
+        parsed["file_md5"] = file_md5_hex
     return parsed
 
 
@@ -207,6 +216,17 @@ class GraphBuilder:
         self._skip_dirs, self._ignore_file_globs, self._venv_markers = (
             _compose_ignore_set(self._parsers)
         )
+        # Precompile the user-glob list into a single anchored regex so
+        # the per-filename match in ``_discover_files`` becomes one
+        # ``re.search`` instead of N ``fnmatch.fnmatch`` calls. ``None``
+        # means "no globs" — short-circuit cheaper than a regex hit.
+        if self._ignore_file_globs:
+            patterns = "|".join(
+                f"(?:{fnmatch.translate(p)})" for p in self._ignore_file_globs
+            )
+            self._ignore_file_re: re.Pattern | None = re.compile(patterns)
+        else:
+            self._ignore_file_re = None
 
     @staticmethod
     def _normalize_filters(filters: dict | None) -> dict | None:
@@ -336,8 +356,8 @@ class GraphBuilder:
         self._build_dir_nodes_lazy(root, dir_set)
 
         # Filter to changed files using stat-based prefilter
-        files_to_parse: list[tuple[BaseParser, Path, str, str | None]] = []
-        for parser, src_file, rel_path, _ in files_to_parse_all:
+        files_to_parse: list[tuple[BaseParser, Path, str, str | None, str | None]] = []
+        for parser, src_file, rel_path, _src_text, _md5 in files_to_parse_all:
             try:
                 st = src_file.stat()
             except OSError:
@@ -368,6 +388,12 @@ class GraphBuilder:
                 continue
             file_hash = hashlib.sha256(content).hexdigest()
             source_text = content.decode("utf-8", errors="replace")
+            # We already have the bytes in memory — compute the md5
+            # used by the file node here so ``_build_file_nodes`` does
+            # not re-read the same file from disk. The on-disk read
+            # was previously the dominant cost on a no-op incremental
+            # over a large project.
+            file_md5_hex = hashlib.md5(content).hexdigest()
 
             new_hashes[rel_path] = {
                 "sha256": file_hash,
@@ -379,7 +405,7 @@ class GraphBuilder:
                 continue  # Content unchanged despite metadata change
 
             # Pass source_text so parser doesn't re-read from disk
-            files_to_parse.append((parser, src_file, rel_path, source_text))
+            files_to_parse.append((parser, src_file, rel_path, source_text, file_md5_hex))
 
         # Parse changed files in parallel
         parsed_files = self._parse_files_parallel(files_to_parse)
@@ -396,56 +422,91 @@ class GraphBuilder:
 
     def _discover_files(
         self, root: Path
-    ) -> tuple[list[tuple[BaseParser, Path, str, None]], set[str]]:
-        """Single os.walk pass: discover parseable files and their directories."""
-        files: list[tuple[BaseParser, Path, str, None]] = []
+    ) -> tuple[list[tuple[BaseParser, Path, str, None, None]], set[str]]:
+        """Single os.walk pass: discover parseable files and their directories.
+
+        Performance notes
+        -----------------
+        * Skip-list / venv checks are ordered cheapest-first so the common
+          path (``d.startswith(".")`` or a member of ``_skip_dirs``)
+          short-circuits before we ever ``stat()`` for a venv marker.
+        * Per-dir ``rel_dir`` is computed by string-slicing
+          ``dirpath`` — ``os.path.relpath`` re-splits both arguments
+          which is order-of-magnitude slower for the deeply-nested calls
+          this loop makes.
+        * The plugin-contributed ignore globs were re-evaluated per
+          (file × pattern) pair via ``fnmatch.fnmatch``. They're now
+          combined into a single precompiled regex (``_ignore_file_re``)
+          built once in ``__init__``.
+        """
+        files: list[tuple[BaseParser, Path, str, None, None]] = []
         dir_set: set[str] = set()
         dir_set.add("")  # root directory
 
+        root_str = str(root)
+        root_prefix_len = len(root_str) + 1  # +1 for the path separator
+        skip_dirs = self._skip_dirs
+        venv_markers = self._venv_markers
+        has_venv_markers = bool(venv_markers)
+        ignore_file_re = self._ignore_file_re
+        has_filters = self._filters is not None
+
         for dirpath, dirnames, filenames in os.walk(root):
-            # Prune hidden dirs, plugin-contributed skip dirs, and
-            # virtualenv-style directories (sentinel files come from each
-            # enabled plugin's ``ignore_dir_markers``).
+            # Compute this directory's path relative to root once via a
+            # cheap slice. ``dirpath == root_str`` is the project root.
+            if dirpath == root_str:
+                rel_dir_here = ""
+            else:
+                rel_dir_here = dirpath[root_prefix_len:]
+
             kept = []
             for d in dirnames:
-                if (
-                    d.startswith(".")
-                    or d in self._skip_dirs
-                    or _is_venv_dir(os.path.join(dirpath, d), self._venv_markers)
+                # Cheapest checks first — string ops, then set membership,
+                # only fall through to ``stat()``-based venv detection
+                # for directories that survived both filters.
+                if d.startswith(".") or d in skip_dirs:
+                    continue
+                if has_venv_markers and _is_venv_dir(
+                    os.path.join(dirpath, d), venv_markers
                 ):
                     continue
-                # Compute the dir's path relative to root and consult user filters.
-                child_abs = os.path.join(dirpath, d)
-                rel_dir = os.path.relpath(child_abs, root)
-                if rel_dir == ".":
-                    rel_dir = ""
-                if not self._is_dir_included(rel_dir):
-                    continue
+                if has_filters:
+                    rel_dir = f"{rel_dir_here}/{d}" if rel_dir_here else d
+                    if not self._is_dir_included(rel_dir):
+                        continue
                 kept.append(d)
             dirnames[:] = kept
             dirnames.sort()
 
-            for fname in sorted(filenames):
+            for fname in filenames:
                 if fname.startswith("."):
                     continue
-                # Plugin-contributed file globs (e.g. python3 → ``*.pyc``).
-                if self._ignore_file_globs and any(
-                    fnmatch.fnmatch(fname, pat) for pat in self._ignore_file_globs
-                ):
+                # Plugin-contributed file globs (e.g. python3 → ``*.pyc``)
+                # collapsed into one precompiled regex.
+                if ignore_file_re is not None and ignore_file_re.match(fname):
+                    continue
+
+                # Build rel_path by slicing the joined absolute path —
+                # avoids ``Path.relative_to`` which re-walks both halves.
+                if rel_dir_here:
+                    rel_path = f"{rel_dir_here}/{fname}"
+                else:
+                    rel_path = fname
+
+                # User filters: extension whitelist + glob excludes.
+                if has_filters and not self._is_file_included(rel_path):
                     continue
 
                 src_file = Path(dirpath) / fname
-                rel_path = str(src_file.relative_to(root))
-
-                # User filters: extension whitelist + glob excludes.
-                if not self._is_file_included(rel_path):
-                    continue
 
                 # Every file becomes a node. A parser is optional — files
                 # without one are still indexed as plain `file` nodes so
                 # they appear in the tree / can be inspected.
+                # 5-tuple: (parser, src_file, rel_path, source_text,
+                # file_md5_hex). The full build doesn't pre-read bytes
+                # so source_text and file_md5_hex are both None.
                 parser = self._find_parser(str(src_file))
-                files.append((parser, src_file, rel_path, None))
+                files.append((parser, src_file, rel_path, None, None))
 
                 # Collect all ancestor directories
                 parent = os.path.dirname(rel_path)
@@ -474,7 +535,8 @@ class GraphBuilder:
             self.graph.add_edge(parent_id, dir_id, type="contains")
 
     def _parse_files_parallel(
-        self, files: list[tuple[BaseParser, Path, str, str | None]]
+        self,
+        files: list[tuple[BaseParser, Path, str, str | None, str | None]],
     ) -> list[dict]:
         """Parse files concurrently using a thread pool."""
         if not files:

@@ -123,46 +123,101 @@ DEFAULT_SETTINGS = {
 }
 
 
+# Cache for ``_load_settings`` — many request handlers call it on every
+# hit, and the previous implementation re-walked ``plugins/`` and rewrote
+# ``data/settings.json`` whenever the detected plugin map differed from
+# what was persisted. The cache holds the (mtime, payload) of the file so
+# we only re-read on disk change, and re-runs ``detect_installed_plugins``
+# at most once per ``_PLUGIN_REFRESH_INTERVAL`` seconds.
+_SETTINGS_CACHE: dict = {"mtime": -1.0, "payload": None, "plugin_check_at": 0.0}
+_SETTINGS_LOCK = threading.Lock()
+_PLUGIN_REFRESH_INTERVAL = 30.0  # seconds
+
+
 def _load_settings():
-    if SETTINGS_PATH.exists():
-        with open(SETTINGS_PATH) as f:
-            settings = json_mod.load(f)
-    else:
-        settings = dict(DEFAULT_SETTINGS)
-    # Refresh the plugins section from the live plugins/ directory so
-    # settings.json is always an accurate mirror of what's installed.
-    # IMPORTANT: the ``config`` slot inside each plugin entry is reserved
-    # for **user overrides** written by ``PATCH /api/settings/plugins/
-    # <name>/config`` (Phase 2B). We must therefore strip the on-disk
-    # ``config.json`` mirror that ``detect_installed_plugins()`` puts
-    # into that slot — otherwise the next call to ``_load_settings``
-    # would stomp anything the user just patched. The on-disk values
-    # are still available live via ``detect_installed_plugins()`` /
-    # ``load_plugin_config()``; we just don't *persist* them here.
-    try:
-        from apollo.projects.settings import detect_installed_plugins
-        detected = detect_installed_plugins()
-        existing = settings.get("plugins") or {}
-        new_plugins: dict = {}
-        for name, meta in detected.items():
-            entry = {k: v for k, v in meta.items() if k != "config"}
-            user_override = (existing.get(name) or {}).get("config")
-            if isinstance(user_override, dict) and user_override:
-                entry["config"] = user_override
-            new_plugins[name] = entry
-        if new_plugins != settings.get("plugins"):
-            settings["plugins"] = new_plugins
-            _save_settings(settings)
-    except Exception:
-        # Detection is best-effort; never block settings load on it.
-        pass
-    return settings
+    """Return the merged settings dict, with a small in-memory cache.
+
+    The caller treats this as cheap; the original implementation was a
+    full file read + JSON parse + plugin-directory walk + (sometimes)
+    file write on every call. We keep the same semantics but skip the
+    re-read when the file's ``mtime`` is unchanged, and skip the
+    plugin-detection refresh when the last refresh was recent.
+    """
+    import time as _time
+
+    with _SETTINGS_LOCK:
+        try:
+            mtime = SETTINGS_PATH.stat().st_mtime if SETTINGS_PATH.exists() else 0.0
+        except OSError:
+            mtime = 0.0
+
+        cache = _SETTINGS_CACHE
+        cached = cache["payload"]
+        if cached is not None and cache["mtime"] == mtime:
+            # Still need to occasionally refresh the plugins block, but
+            # rate-limit it so the common request path is just a dict copy.
+            now = _time.time()
+            if now - cache["plugin_check_at"] < _PLUGIN_REFRESH_INTERVAL:
+                # Hand back a shallow copy so callers that mutate don't
+                # corrupt the cache (matches old read-load-modify pattern).
+                return dict(cached)
+            cache["plugin_check_at"] = now
+            settings = dict(cached)
+        else:
+            if SETTINGS_PATH.exists():
+                with open(SETTINGS_PATH) as f:
+                    settings = json_mod.load(f)
+            else:
+                settings = dict(DEFAULT_SETTINGS)
+            cache["plugin_check_at"] = _time.time()
+
+        # Refresh the plugins section from the live plugins/ directory.
+        # The ``config`` slot inside each plugin entry is reserved for
+        # user overrides written by ``PATCH /api/settings/plugins/
+        # <name>/config``. We therefore strip the on-disk ``config.json``
+        # mirror that ``detect_installed_plugins`` puts there before
+        # comparing — otherwise this loader would stomp anything the
+        # user just patched.
+        try:
+            from apollo.projects.settings import detect_installed_plugins
+            detected = detect_installed_plugins()
+            existing = settings.get("plugins") or {}
+            new_plugins: dict = {}
+            for name, meta in detected.items():
+                entry = {k: v for k, v in meta.items() if k != "config"}
+                user_override = (existing.get(name) or {}).get("config")
+                if isinstance(user_override, dict) and user_override:
+                    entry["config"] = user_override
+                new_plugins[name] = entry
+            if new_plugins != settings.get("plugins"):
+                settings["plugins"] = new_plugins
+                _save_settings(settings)
+        except Exception:
+            # Detection is best-effort; never block settings load on it.
+            pass
+
+        # Update cache. We re-stat after a possible ``_save_settings``
+        # so the next call sees the new mtime and skips the read.
+        try:
+            cache["mtime"] = SETTINGS_PATH.stat().st_mtime if SETTINGS_PATH.exists() else 0.0
+        except OSError:
+            cache["mtime"] = 0.0
+        cache["payload"] = settings
+        return dict(settings)
 
 
 def _save_settings(settings):
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
         json_mod.dump(settings, f, indent=2)
+    # Invalidate the cache so the next ``_load_settings`` re-reads from
+    # disk. Without this an immediately-following load would keep
+    # serving the pre-write payload until the cached mtime expired.
+    try:
+        _SETTINGS_CACHE["payload"] = None
+        _SETTINGS_CACHE["mtime"] = -1.0
+    except Exception:
+        pass
 
 
 def _record_last_project(path):
@@ -352,16 +407,17 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             graph = _nx.DiGraph()
         q = _GraphQuery(graph)
 
-        # Rebuild the search index against the new store/graph.
+        # Rebuild the search index against the new store/graph. The
+        # embedder is a process-wide singleton so swapping projects costs
+        # only the search-index wrapper rebuild — not a fresh model load.
         try:
+            from apollo.embeddings.embedder import get_shared_embedder as _shared
             if backend == "cblite":
                 from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                from apollo.embeddings.embedder import Embedder as _Emb
-                search = CouchbaseLiteSemanticSearch(new_store, _Emb())
+                search = CouchbaseLiteSemanticSearch(new_store, _shared())
             else:
                 from apollo.search.semantic import SemanticSearch
-                from apollo.embeddings.embedder import Embedder as _Emb
-                search = SemanticSearch(graph, _Emb())
+                search = SemanticSearch(graph, _shared())
         except Exception:
             logger.warning("search index unavailable for %s", project_path_str)
             search = None
@@ -497,20 +553,23 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     search: Optional[object] = None
     embedder = None
 
-    # Set up search backend
+    # Set up search backend. ``get_shared_embedder`` returns a process-wide
+    # singleton so the SentenceTransformer weights are loaded once per
+    # process — important because ``_swap_to_project_store`` re-runs this
+    # block whenever the user opens a different project.
     if backend == "cblite":
         try:
-            from apollo.embeddings.embedder import Embedder
+            from apollo.embeddings.embedder import get_shared_embedder
             from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-            embedder = Embedder()
+            embedder = get_shared_embedder()
             search = CouchbaseLiteSemanticSearch(store, embedder)
         except Exception:
             search = None
     else:
         try:
-            from apollo.embeddings.embedder import Embedder
+            from apollo.embeddings.embedder import get_shared_embedder
             from apollo.search.semantic import SemanticSearch
-            embedder = Embedder()
+            embedder = get_shared_embedder()
             search = SemanticSearch(graph, embedder)
         except Exception:
             search = None
@@ -811,10 +870,30 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t1 = time.time()
             logger.info("indexing step 2/4: generating embeddings for %d nodes", n_nodes)
             try:
-                from apollo.embeddings import Embedder
-                emb = Embedder()
-                emb.embed_graph(graph)
-                logger.info("embeddings generated in %.2fs", time.time() - t1)
+                from apollo.embeddings.embedder import (
+                    extract_cache_from_graph,
+                    get_shared_embedder,
+                )
+                # Reuse the previously-active graph's vectors keyed by
+                # content hash. After ``builder.build()`` rebuilt ``graph``
+                # the local ``self.graph`` reference here is the *new*
+                # graph, but the previously loaded ``store`` still holds
+                # the old in-memory copy via the chat_service / search
+                # references. We pull from the most recently saved store
+                # to populate the cache so unchanged nodes don't pay the
+                # SentenceTransformer encode cost again.
+                prev_cache: dict = {}
+                try:
+                    prev_graph = store.load()
+                    prev_cache = extract_cache_from_graph(prev_graph)
+                except Exception:
+                    prev_cache = {}
+                emb = get_shared_embedder()
+                emb.embed_graph(graph, prev_cache=prev_cache)
+                logger.info(
+                    "embeddings generated in %.2fs (reused %d cached)",
+                    time.time() - t1, len(prev_cache),
+                )
             except Exception:
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
@@ -834,14 +913,13 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t3 = time.time()
             logger.info("indexing step 4/4: rebuilding search index (backend=%s)", backend)
             try:
+                from apollo.embeddings.embedder import get_shared_embedder as _shared
                 if backend == "cblite":
                     from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                    from apollo.embeddings.embedder import Embedder as Emb
-                    search = CouchbaseLiteSemanticSearch(store, Emb())
+                    search = CouchbaseLiteSemanticSearch(store, _shared())
                 else:
                     from apollo.search.semantic import SemanticSearch
-                    from apollo.embeddings.embedder import Embedder as Emb
-                    search = SemanticSearch(graph, Emb())
+                    search = SemanticSearch(graph, _shared())
                 logger.info("search index ready in %.2fs", time.time() - t3)
             except Exception:
                 logger.warning("search index unavailable after %.2fs", time.time() - t3)
@@ -1564,23 +1642,38 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
           - relevant : top 100, strength >= 2 (compact "Show More" view)
           - all      : everything, capped at 500 (full "show every relationship")
         """
-        strengths: dict[str, float] = defaultdict(float)
-        counts: dict[str, int] = defaultdict(int)
-        for nid, data in graph.nodes(data=True):
-            ntype = data.get("type", "")
-            if ntype in EXCLUDE_TYPES_WORDCLOUD:
-                continue
-            if path and not data.get("path", "").startswith(path):
-                continue
-            name = data.get("name", "")
-            if not name:
-                continue
-            try:
-                deg = graph.degree(nid)
-            except Exception:
-                deg = 0
-            strengths[name] += deg
-            counts[name] += 1
+        # Unfiltered ``path is None`` calls hit a cached aggregate built
+        # by ``apollo.graph.indices`` — repeated wordcloud requests
+        # against an unchanged graph reuse the same dict. The
+        # path-filtered case still walks because the filter changes the
+        # answer per-call.
+        if not path:
+            from apollo.graph.indices import get_indices
+            cached_strengths, cached_counts = get_indices(graph).wordcloud(
+                frozenset(EXCLUDE_TYPES_WORDCLOUD)
+            )
+            strengths = cached_strengths
+            counts = cached_counts
+        else:
+            strengths_d: dict[str, float] = defaultdict(float)
+            counts_d: dict[str, int] = defaultdict(int)
+            for nid, data in graph.nodes(data=True):
+                ntype = data.get("type", "")
+                if ntype in EXCLUDE_TYPES_WORDCLOUD:
+                    continue
+                if not data.get("path", "").startswith(path):
+                    continue
+                name = data.get("name", "")
+                if not name:
+                    continue
+                try:
+                    deg = graph.degree(nid)
+                except Exception:
+                    deg = 0
+                strengths_d[name] += deg
+                counts_d[name] += 1
+            strengths = dict(strengths_d)
+            counts = dict(counts_d)
 
         items = [
             {"name": n, "value": float(strengths[n]), "count": counts[n]}
@@ -1672,10 +1765,25 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         ids = body.get("ids") or body.get("node_ids") or []
         if not isinstance(ids, list):
             raise HTTPException(status_code=400, detail="`ids` must be a list")
+        include_source = bool(body.get("include_source", True))
+        include_edges = bool(body.get("include_edges", True))
+        # Opt-in: when the active backend is Couchbase Lite the caller
+        # can ask for parallel CBL document gets (asyncio.to_thread +
+        # gather) instead of the in-memory NetworkX path. CBL queries
+        # are single-threaded; using the async fan-out keeps the event
+        # loop free while the per-doc gets run on worker threads.
+        use_cbl = bool(body.get("use_cbl", False)) and backend == "cblite"
+        if use_cbl:
+            return await local_tools.abatch_get_nodes(
+                graph, ids,
+                include_source=include_source,
+                include_edges=include_edges,
+                cbl_store=store,
+            )
         return local_tools.batch_get_nodes(
             graph, ids,
-            include_source=bool(body.get("include_source", True)),
-            include_edges=bool(body.get("include_edges", True)),
+            include_source=include_source,
+            include_edges=include_edges,
         )
 
     @app.post("/api/files/sections")
@@ -2322,11 +2430,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if watch_dir is None:
             raise HTTPException(status_code=400, detail="No root directory configured")
 
-        # Set up embedder for live re-embedding
+        # Set up embedder for live re-embedding (singleton — model already
+        # loaded once at startup, so this is just a dict lookup).
         live_embedder = None
         try:
-            from apollo.embeddings.embedder import Embedder
-            live_embedder = Embedder()
+            from apollo.embeddings.embedder import get_shared_embedder
+            live_embedder = get_shared_embedder()
         except Exception:
             pass
 
@@ -2340,13 +2449,33 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
         watcher.start()
 
-        # Persist updated graph on each change
+        # Persist updated graph after watcher events. The previous
+        # implementation called ``store.save(graph)`` synchronously on
+        # *every* event batch, which means a full file rewrite of
+        # graph.json(.gz) per file save. Even on a 50k-node project this
+        # is hundreds of milliseconds of disk I/O for a one-character
+        # edit. We debounce instead so multiple events within the window
+        # collapse into one rewrite.
         original_on_update = watcher.on_update
-        def _on_update_and_save(update):
+        save_state = {"timer": None}
+        save_lock = threading.Lock()
+        SAVE_DEBOUNCE_SECONDS = 5.0
+
+        def _do_save():
             try:
                 store.save(graph)
             except Exception:
-                pass
+                logger.exception("debounced graph save failed")
+
+        def _on_update_and_save(update):
+            with save_lock:
+                t = save_state.get("timer")
+                if t is not None:
+                    t.cancel()
+                t = threading.Timer(SAVE_DEBOUNCE_SECONDS, _do_save)
+                t.daemon = True
+                save_state["timer"] = t
+                t.start()
             if original_on_update:
                 original_on_update(update)
         watcher.on_update = _on_update_and_save

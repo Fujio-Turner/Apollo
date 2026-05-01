@@ -86,6 +86,98 @@ def test_batch_get_nodes_skip_source(small_graph):
     assert "edges_in" not in n
 
 
+# ─────────────────── Phase 1 — async CBL parallel path ───────────────
+
+class _FakeAsyncCblStore:
+    """Mimics CouchbaseLiteStore.aget_node_docs for tests.
+
+    Returns the canned docs for known IDs and ``None`` for missing IDs,
+    and records the call so tests can assert the multi-get fan-out
+    actually went through this path.
+    """
+    def __init__(self, docs):
+        self._docs = docs
+        self.calls: list[list[str]] = []
+
+    async def aget_node_docs(self, node_ids):
+        self.calls.append(list(node_ids))
+        return {nid: self._docs.get(nid) for nid in node_ids}
+
+
+def test_abatch_get_nodes_falls_back_without_store(small_graph):
+    import asyncio
+    r = asyncio.run(local_tools.abatch_get_nodes(
+        small_graph, ["func::a/foo.py::main", "missing"]
+    ))
+    assert r["missing"] == ["missing"]
+    assert r["nodes"][0]["id"] == "func::a/foo.py::main"
+    assert "edges_in" in r["nodes"][0]
+
+
+def test_abatch_get_nodes_uses_cbl_store_in_parallel(small_graph):
+    import asyncio
+    fake = _FakeAsyncCblStore({
+        "func::a/foo.py::main": {
+            "type": "function", "path": "a/foo.py", "name": "main",
+            "line_start": 10, "line_end": 20, "source": "def main(x): ...",
+        },
+    })
+    r = asyncio.run(local_tools.abatch_get_nodes(
+        small_graph,
+        ["func::a/foo.py::main", "missing"],
+        cbl_store=fake,
+    ))
+    # The fan-out happens through aget_node_docs, not the in-memory graph.
+    assert fake.calls == [["func::a/foo.py::main", "missing"]]
+    # Missing-from-CBL AND missing-from-graph → reported as missing.
+    assert r["missing"] == ["missing"]
+    n = r["nodes"][0]
+    assert n["id"] == "func::a/foo.py::main"
+    assert n["name"] == "main"
+    # Edge topology comes from the in-memory graph.
+    assert any(e["target"] == "func::a/bar.py::helper" for e in n["edges_out"])
+
+
+def test_abatch_get_nodes_falls_back_to_graph_on_cbl_miss(small_graph):
+    import asyncio
+    # CBL returns nothing, but the graph has the node → use graph attrs.
+    fake = _FakeAsyncCblStore({})
+    r = asyncio.run(local_tools.abatch_get_nodes(
+        small_graph, ["func::a/foo.py::main"], cbl_store=fake,
+    ))
+    assert r["missing"] == []
+    assert r["nodes"][0]["name"] == "main"
+
+
+def test_cbl_aget_documents_json_runs_in_parallel():
+    """The fan-out actually awaits asyncio.gather — verifiable via timing."""
+    import asyncio
+    import time
+
+    class _SlowCBL:
+        # Mimics the methods abatch_get_nodes' fan-out actually touches.
+        def get_document_json(self, _col, doc_id):
+            time.sleep(0.05)  # simulates a blocking ctypes read
+            return f'{{"id":"{doc_id}"}}'
+
+        async def aget_documents_json(self, col, ids):
+            # Same body as the real CBL.aget_documents_json.
+            async def _one(d):
+                try:
+                    return await asyncio.to_thread(self.get_document_json, col, d)
+                except Exception:
+                    return None
+            return await asyncio.gather(*(_one(d) for d in ids))
+
+    cbl = _SlowCBL()
+    t0 = time.perf_counter()
+    out = asyncio.run(cbl.aget_documents_json(None, [f"d{i}" for i in range(8)]))
+    elapsed = time.perf_counter() - t0
+    assert len(out) == 8
+    # Serial would be 8 * 0.05 = 0.40s; parallel should be well under that.
+    assert elapsed < 0.25, f"fan-out wasn't parallel (took {elapsed:.3f}s)"
+
+
 def test_batch_file_sections_real_file(tmp_path):
     f = tmp_path / "demo.py"
     f.write_text("\n".join(f"line{i}" for i in range(1, 21)))

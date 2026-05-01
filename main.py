@@ -164,11 +164,27 @@ def cmd_index(args):
     # Generate embeddings if sentence-transformers is available
     if not args.no_embeddings:
         try:
-            from apollo.embeddings import Embedder
+            from apollo.embeddings.embedder import (
+                extract_cache_from_graph,
+                get_shared_embedder,
+            )
             print("Generating embeddings...")
-            embedder = Embedder()
-            embedder.embed_graph(graph)
-            print("  Embeddings generated.")
+            # Harvest the previous run's vectors (keyed by content hash)
+            # before encoding so unchanged nodes pay zero model cost. The
+            # cache load is best-effort — a missing/corrupt previous index
+            # just means the first reindex on a project warms the cache.
+            prev_cache: dict = {}
+            try:
+                prev_store, prev_path = _open_store(args)
+                if os.path.exists(prev_path):
+                    prev_graph = prev_store.load()
+                    prev_cache = extract_cache_from_graph(prev_graph)
+                prev_store.close()
+            except Exception:
+                prev_cache = {}
+            embedder = get_shared_embedder()
+            embedder.embed_graph(graph, prev_cache=prev_cache)
+            print(f"  Embeddings generated (reused {len(prev_cache)} cached).")
         except ImportError:
             print("  Skipping embeddings (sentence-transformers not installed).")
 
@@ -284,8 +300,8 @@ def cmd_search(args):
     if backend == "cblite":
         try:
             from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-            from apollo.embeddings import Embedder
-            embedder = Embedder()
+            from apollo.embeddings import get_shared_embedder
+            embedder = get_shared_embedder()
             cbl_search = CouchbaseLiteSemanticSearch(store, embedder)
             if cbl_search.has_embeddings():
                 results = cbl_search.search(args.text, top_k=args.top, node_type=args.type)
@@ -309,9 +325,9 @@ def cmd_search(args):
 
     if has_embeddings:
         try:
-            from apollo.embeddings import Embedder
+            from apollo.embeddings import get_shared_embedder
             from apollo.search import SemanticSearch
-            embedder = Embedder()
+            embedder = get_shared_embedder()
             search = SemanticSearch(graph, embedder)
             results = search.search(args.text, top_k=args.top, node_type=args.type)
             print(f"\nSemantic search: \"{args.text}\" (top {args.top})\n")
@@ -365,9 +381,9 @@ def cmd_serve(args):
 
         # Embeddings (best-effort)
         try:
-            from apollo.embeddings import Embedder
+            from apollo.embeddings import get_shared_embedder
             print("  Generating embeddings...")
-            Embedder().embed_graph(graph)
+            get_shared_embedder().embed_graph(graph)
         except ImportError:
             print("  Skipping embeddings (sentence-transformers not installed).")
 
@@ -423,8 +439,8 @@ def cmd_watch(args):
     embedder = None
     if not args.no_embeddings:
         try:
-            from apollo.embeddings import Embedder
-            embedder = Embedder()
+            from apollo.embeddings import get_shared_embedder
+            embedder = get_shared_embedder()
         except ImportError:
             pass
 

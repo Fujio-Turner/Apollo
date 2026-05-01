@@ -474,6 +474,43 @@ class CBL:
         finally:
             self._lib.CBL_Release(doc)
 
+    async def aget_document_json(self, collection: c_void_p, doc_id: str) -> str | None:
+        """Async wrapper around :meth:`get_document_json`.
+
+        Runs the blocking ctypes call in a worker thread so the asyncio
+        event loop stays responsive. Couchbase Lite serialises reads
+        internally, but issuing them off-loop keeps FastAPI handlers
+        from blocking other requests.
+        """
+        import asyncio
+        return await asyncio.to_thread(self.get_document_json, collection, doc_id)
+
+    async def aget_documents_json(
+        self, collection: c_void_p, doc_ids: list[str]
+    ) -> list[str | None]:
+        """Fan out :meth:`get_document_json` over many IDs in parallel.
+
+        Returns the JSON bodies in the same order as ``doc_ids``;
+        missing documents come back as ``None``. Uses
+        ``asyncio.to_thread`` + ``asyncio.gather`` so the event loop
+        stays free while the underlying ctypes reads run on threads.
+        Raised exceptions on individual gets are returned as ``None``
+        for that slot rather than failing the whole batch.
+        """
+        import asyncio
+        if not doc_ids:
+            return []
+
+        async def _one(doc_id: str) -> str | None:
+            try:
+                return await asyncio.to_thread(
+                    self.get_document_json, collection, doc_id
+                )
+            except Exception:
+                return None
+
+        return await asyncio.gather(*(_one(d) for d in doc_ids))
+
     def purge_document(self, collection: c_void_p, doc_id: str) -> None:
         """Purge a document by ID (no error if it doesn't exist)."""
         ka: list[bytes] = []

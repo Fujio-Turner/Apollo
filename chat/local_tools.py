@@ -69,7 +69,13 @@ def _node_payload(graph: nx.DiGraph, node_id: str,
 def batch_get_nodes(graph: nx.DiGraph, node_ids: list[str],
                     include_source: bool = True,
                     include_edges: bool = True) -> dict:
-    """Fetch up to 20 node payloads in one call. Plan §1.1."""
+    """Fetch up to 20 node payloads in one call. Plan §1.1.
+
+    Synchronous, in-memory NetworkX path. For an async parallel path
+    that reads each node document from Couchbase Lite via
+    ``asyncio.to_thread`` + ``asyncio.gather``, see
+    :func:`abatch_get_nodes`.
+    """
     ids = list(node_ids or [])[:20]
     nodes: list[dict] = []
     missing: list[str] = []
@@ -80,6 +86,65 @@ def batch_get_nodes(graph: nx.DiGraph, node_ids: list[str],
                                        include_edges=include_edges))
         else:
             missing.append(nid)
+    return {"nodes": nodes, "missing": missing, "requested": len(ids)}
+
+
+async def abatch_get_nodes(graph: nx.DiGraph, node_ids: list[str],
+                           include_source: bool = True,
+                           include_edges: bool = True,
+                           cbl_store=None) -> dict:
+    """Async variant of :func:`batch_get_nodes`.
+
+    When ``cbl_store`` is a :class:`CouchbaseLiteStore`, fetches each
+    node's document from CBL in parallel via
+    :meth:`CouchbaseLiteStore.aget_node_docs` (which uses
+    ``asyncio.to_thread`` + ``asyncio.gather``). Edge topology and any
+    fields not present on the CBL doc fall back to the in-memory
+    NetworkX graph.
+
+    Without a ``cbl_store`` this is just an awaitable wrapper around
+    the synchronous in-memory path so callers can keep one code path.
+    """
+    ids = list(node_ids or [])[:20]
+    if cbl_store is None or not hasattr(cbl_store, "aget_node_docs"):
+        return batch_get_nodes(graph, ids,
+                               include_source=include_source,
+                               include_edges=include_edges)
+
+    cbl_docs = await cbl_store.aget_node_docs(ids)
+
+    nodes: list[dict] = []
+    missing: list[str] = []
+    for nid in ids:
+        attrs = cbl_docs.get(nid)
+        if attrs is None and nid not in graph:
+            missing.append(nid)
+            continue
+        if attrs is not None:
+            data = {k: v for k, v in attrs.items() if k != "embedding"}
+            if not include_source and "source" in data:
+                data.pop("source", None)
+            elif include_source and isinstance(data.get("source"), str) \
+                    and len(data["source"]) > 2000:
+                data["source"] = data["source"][:2000] + "\n... (truncated)"
+            payload = {"id": nid, **data}
+            if include_edges and nid in graph:
+                edges_in = [
+                    {"source": p, "type": graph.edges[p, nid].get("type", "")}
+                    for p in graph.predecessors(nid)
+                ]
+                edges_out = [
+                    {"target": s, "type": graph.edges[nid, s].get("type", "")}
+                    for s in graph.successors(nid)
+                ]
+                payload["edges_in"] = edges_in
+                payload["edges_out"] = edges_out
+            nodes.append(payload)
+        else:
+            # CBL miss but graph has it → fall back to graph attrs.
+            nodes.append(_node_payload(graph, nid,
+                                       include_source=include_source,
+                                       include_edges=include_edges))
     return {"nodes": nodes, "missing": missing, "requested": len(ids)}
 
 
@@ -539,12 +604,16 @@ def get_code_metrics(graph: nx.DiGraph, node_ids: list[str] | None = None,
         missing = [nid for nid in ids if nid not in graph]
         return {"metrics": rows, "missing": missing, "scope": "explicit"}
 
-    # Project-wide: rank all functions/methods by sort_by.
+    # Project-wide: rank all functions/methods by sort_by. Use the
+    # cached type index so the chat tool doesn't pay an O(N) walk —
+    # for typical projects the function/method bucket is a small
+    # fraction of total nodes.
+    from apollo.graph.indices import get_indices
+    by_type = get_indices(graph).by_type()
     rows = []
-    for nid, data in graph.nodes(data=True):
-        if data.get("type") not in ("function", "method"):
-            continue
-        rows.append(_row(nid, data))
+    for ntype in ("function", "method"):
+        for nid in by_type.get(ntype, ()):
+            rows.append(_row(nid, graph.nodes[nid]))
     rows.sort(key=lambda r: r.get(sort_by) or 0, reverse=True)
     return {"metrics": rows[:top_n], "scope": "top_n", "sort_by": sort_by,
             "top_n": top_n, "total_eligible": len(rows)}
@@ -563,10 +632,18 @@ def search_graph_by_signature(graph: nx.DiGraph,
     target_names = list(param_names) if param_names else None
     target_anns = list(param_annotations) if param_annotations else None
 
+    # Restrict iteration to the function/method buckets via the cached
+    # type index — avoids walking variable / import / comment nodes
+    # entirely. The index is shared across chat-tool calls.
+    from apollo.graph.indices import get_indices
+    by_type = get_indices(graph).by_type()
+    candidates: list[str] = []
+    for ntype in ("function", "method"):
+        candidates.extend(by_type.get(ntype, ()))
+
     matches: list[dict] = []
-    for nid, data in graph.nodes(data=True):
-        if data.get("type") not in ("function", "method"):
-            continue
+    for nid in candidates:
+        data = graph.nodes[nid]
         if signature_hash and data.get("signature_hash") != signature_hash:
             continue
         params = data.get("params") or []
@@ -745,16 +822,22 @@ def get_git_context(graph: nx.DiGraph, root_dir: str | None, path: str,
                 "repo_root": str(repo_root)}
 
     # Resolve `name` to a line range via the graph if possible.
+    # Iterate only function/method/class buckets via the cached type
+    # index instead of scanning the whole graph for one symbol.
     if name and (line_start is None or line_end is None):
-        for nid, data in graph.nodes(data=True):
-            if data.get("type") not in ("function", "method", "class"):
-                continue
-            if data.get("name") != name:
-                continue
-            p = data.get("path") or ""
-            if p == path or p.endswith("/" + path) or path.endswith("/" + p):
-                line_start = data.get("line_start") or line_start
-                line_end = data.get("line_end") or line_end
+        from apollo.graph.indices import get_indices
+        by_type = get_indices(graph).by_type()
+        for ntype in ("function", "method", "class"):
+            for nid in by_type.get(ntype, ()):
+                data = graph.nodes[nid]
+                if data.get("name") != name:
+                    continue
+                p = data.get("path") or ""
+                if p == path or p.endswith("/" + path) or path.endswith("/" + p):
+                    line_start = data.get("line_start") or line_start
+                    line_end = data.get("line_end") or line_end
+                    break
+            if line_start is not None and line_end is not None:
                 break
 
     def _run(cmd: list[str]) -> tuple[bool, str]:
@@ -931,9 +1014,13 @@ def _resolve_file_node(graph: nx.DiGraph, path: str) -> tuple[str | None, dict]:
     for cand in (f"file::{path}", f"file::{path.lstrip('./')}"):
         if cand in graph:
             return cand, graph.nodes[cand]
-    for nid, data in graph.nodes(data=True):
-        if data.get("type") != "file":
-            continue
+    # Walk only ``file`` nodes via the cached type index so we don't
+    # pay an O(N) graph scan to resolve a single path. For projects
+    # of any real size most nodes are *not* file nodes.
+    from apollo.graph.indices import get_indices
+    by_type = get_indices(graph).by_type()
+    for nid in by_type.get("file", ()):
+        data = graph.nodes[nid]
         p = data.get("path") or ""
         if not p:
             continue

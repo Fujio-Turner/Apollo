@@ -382,6 +382,42 @@ the right move is finishing the CBL backend rather than wrapping raw Fleece —
 CBL gives us Fleece *plus* per-document upserts, transactions, and indexes.
 Until then the v2/gzip/orjson trio is the high-value, low-risk middle ground.
 
+##### 4.3.1.2 Async multi-document reads on the CBL store
+
+Couchbase Lite's query layer is **single-threaded** — concurrent SQL++
+calls inside one database serialise behind an internal lock. The same
+holds for `CBLCollection_GetDocument` reads at the C level. That is
+fine for the per-request 1-doc reads in `chat/history.py`, but it
+makes any "fetch N documents by ID" loop the worst case: each
+`get_document_json` blocks the FastAPI event loop for the duration of
+the underlying ctypes call, and other requests stall behind it.
+
+To keep the event loop responsive when a handler legitimately needs
+many documents in one request, the CBL wrapper exposes async
+fan-out helpers:
+
+- [`CBL.aget_document_json(collection, doc_id)`](../storage/cblite/ctypes_api.py)
+  — `asyncio.to_thread` wrapper around the blocking single-doc read.
+- `CBL.aget_documents_json(collection, doc_ids)` — fans the per-ID
+  reads out via `asyncio.gather(asyncio.to_thread(...) for d in ids)`,
+  returning the JSON bodies in input order. Per-doc exceptions degrade
+  to `None` for that slot rather than failing the whole batch.
+- [`CouchbaseLiteStore.aget_node_docs(node_ids)`](../storage/cblite/store.py)
+  — convenience over `aget_documents_json` that targets the `nodes`
+  collection and JSON-decodes the results into `{node_id: attrs|None}`.
+
+The "parallelism" here is bounded by CBL's internal serialisation —
+this is not a path to faster CBL reads. The win is purely **event-loop
+liveness**: the per-doc ctypes calls run on the default executor's
+worker threads instead of the asyncio main thread, so other requests
+keep getting served while a multi-doc batch drains.
+
+**Usage rule.** Any new request handler that needs more than one CBL
+document MUST use these async helpers — never a serial `for nid in
+ids: cbl.get_document_json(...)` loop in async route code. The pattern
+is opt-in today on `/api/nodes/batch` (see §8.9) and is the model for
+any future endpoint that fetches multiple documents from CBL by ID.
+
 #### 4.3.2 Vector Index
 
 Stores embeddings and supports approximate nearest-neighbor (ANN) search.
@@ -1125,6 +1161,19 @@ in **one round** instead of N grep-and-disambiguate rounds.
   `batch_file_sections` (≤10 ranges/call, 400 LOC each),
   `get_directory_tree` (flat `ls -R`, honours plugin ignore lists),
   `project_stats_detailed` (group counts + top-N files / hubs).
+
+  *`batch_get_nodes` async opt-in.* By default the helper iterates the
+  in-memory NetworkX graph (`graph.nodes[nid]`), so no Couchbase Lite
+  reads happen per request. When the active backend is `cblite` the
+  caller can set `use_cbl: true` in the POST body to dispatch to the
+  async sibling [`abatch_get_nodes`](../chat/local_tools.py), which
+  fans the per-ID document reads out via
+  [`CouchbaseLiteStore.aget_node_docs`](../storage/cblite/store.py)
+  (see §4.3.1.2). Edge topology and any node missing from CBL fall
+  back to the in-memory graph. The flag is opt-in to preserve the
+  zero-IO fast path; any future handler that fetches multiple
+  documents straight from CBL should follow the same async fan-out
+  pattern instead of serialising the per-doc gets on the event loop.
 - **Phase 2 — graph algorithms:** `get_paths_between`
   (`nx.all_simple_paths` over an edge-type-filtered, undirected view),
   `get_subgraph` (BFS from N seeds, degree-capped),
