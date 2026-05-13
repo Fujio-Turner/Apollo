@@ -1148,13 +1148,14 @@ function renderGraph(data) {
   const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
   const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
   const large = (data.nodes||[]).length > 500;
-  // Dev mode: seed every node with a deterministic (x,y) derived from a
-  // hash of its id, so the same node always starts in the same spot
-  // across renders/releases. Combined with force.layoutAnimation:false
-  // the force layout converges to a stable picture instead of reshuffling
-  // every time the graph reloads. Drag still works (draggable:true).
-  const stable = IS_DEV_MODE;
-  const seedR = stable ? Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length))) : 0;
+  // Seed every node with a deterministic (x,y) derived from a hash of its
+  // id, so the same node always starts in the same spot across renders /
+  // releases / reloads. Combined with force.layoutAnimation:false the
+  // force layout converges to a stable picture instead of reshuffling
+  // every time the graph re-renders (e.g. when the user clicks empty
+  // space and clearFocus() runs). Drag still works (draggable:true).
+  const stable = true;
+  const seedR = Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length)));
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8,Math.min(40,n.symbolSize||12));
@@ -1666,7 +1667,53 @@ function applyPersistentFocus(id) {
 function clearFocus() {
   if (!graphChart || !currentGraph) return;
   selectedNode = null;
-  renderGraph(currentGraph);
+  // Reset the highlight/dim styles in-place WITHOUT calling renderGraph().
+  // Re-rendering would rebuild the ECharts series from scratch, which in
+  // force-layout mode causes every node to settle at a new position — the
+  // graph would visibly reshuffle every time the user clicks empty space,
+  // making it impossible to keep track of where a given node lives.
+  const chart = currentGraphVariant === '2' ? graphChart2 : graphChart;
+  if (chart) {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const tc = isDark ? '#dcddde' : '#333';
+    const ec = isDark ? '#3a3a3a' : '#ccc';
+    const opt = chart.getOption();
+    if (opt && opt.series && opt.series[0]) {
+      const seriesNodes = opt.series[0].data || [];
+      const seriesEdges = opt.series[0].links || opt.series[0].edges || [];
+      const large = seriesNodes.length > 500;
+      seriesNodes.forEach(n => {
+        n.itemStyle = n.itemStyle || {};
+        n.itemStyle.opacity = 1;
+        n.label = n.label || {};
+        const sz = n.symbolSize || 12;
+        // Match the default label-show rule used in renderGraph / renderGraph2.
+        if (currentGraphVariant === '2') {
+          n.label.show = sz > 22;
+          n.label.position = 'right';
+        } else {
+          n.label.show = !large && sz > 18;
+        }
+        n.label.fontSize = 10;
+        n.label.fontWeight = 'normal';
+        n.label.color = tc;
+      });
+      seriesEdges.forEach(e => {
+        e.lineStyle = e.lineStyle || {};
+        if (currentGraphVariant === '2') {
+          e.lineStyle.opacity = 0.7;
+          e.lineStyle.width = 0.8;
+          e.lineStyle.color = 'source';
+        } else {
+          e.lineStyle.opacity = 0.5;
+          e.lineStyle.width = undefined;
+          e.lineStyle.color = ec;
+        }
+      });
+      chart.dispatchAction({ type: 'unselect', seriesIndex: 0 });
+      chart.setOption({ series: [{ data: seriesNodes, links: seriesEdges }] });
+    }
+  }
   showWelcomePanel();
 }
 
