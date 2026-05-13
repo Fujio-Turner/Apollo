@@ -355,6 +355,56 @@ def test_detect_entry_points_filter_kinds(small_graph):
     assert all(e["kind"] == "main" for e in r["entry_points"])
 
 
+def test_detect_entry_points_dogfood_built_index(tmp_path):
+    """Resolves the §7.3 follow-up: dogfood `detect_entry_points` against an
+    index built by the real `GraphBuilder`.
+
+    Lays down a tiny project on disk that exercises three of the four
+    detection paths (script-name → `script`, `if __name__ == "__main__"` →
+    `main`, file basename heuristics → `script`). Builds a real graph via
+    `GraphBuilder` + `PythonParser`, then asserts the tool surfaces them.
+    """
+    from apollo.graph import GraphBuilder
+    from apollo.parser import PythonParser
+
+    (tmp_path / "main.py").write_text(
+        'def main():\n'
+        '    print("hello")\n'
+        '\n'
+        'if __name__ == "__main__":\n'
+        '    main()\n'
+    )
+    (tmp_path / "cli.py").write_text(
+        'import argparse\n'
+        '\n'
+        'def run():\n'
+        '    pass\n'
+    )
+    (tmp_path / "helper.py").write_text(
+        'def add(a, b):\n'
+        '    return a + b\n'
+    )
+
+    builder = GraphBuilder(parsers=[PythonParser()])
+    g = builder.build(str(tmp_path))
+
+    r = local_tools.detect_entry_points(g)
+    rows = r["entry_points"]
+    assert r["count"] >= 1, f"expected entry points, got {rows!r}"
+    paths = {row["path"] for row in rows}
+    kinds = {row["kind"] for row in rows}
+
+    # `main.py` and `cli.py` should be flagged as scripts by basename.
+    assert any(p.endswith("main.py") for p in paths), \
+        f"main.py missing: {paths}"
+    assert any(p.endswith("cli.py") for p in paths), \
+        f"cli.py missing: {paths}"
+    # The `if __name__ == "__main__"` block should also surface.
+    assert "script" in kinds or "main" in kinds, kinds
+    # The pure-helper file must NOT be classified as an entry point.
+    assert not any(p.endswith("helper.py") for p in paths)
+
+
 # ─────────────────────────── Phase 4 ───────────────────────────
 
 def test_get_git_context_no_repo(small_graph):

@@ -1703,7 +1703,16 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         }
 
     @app.get("/api/tree")
-    def tree():
+    def tree(
+        depth: Optional[int] = Query(None, description="Maximum tree depth from root (0-indexed). When omitted the full tree is returned."),
+        glob: Optional[str] = Query(None, description="Optional fnmatch pattern (e.g. '*.py') applied to file paths; non-matching files are dropped, directories are kept."),
+    ):
+        # Resolves the §7.3 known follow-up from PLAN_MORE_LOCAL_AI_FUNCTIONS.md:
+        # honour `depth` and `glob` query params on the human-facing /api/tree
+        # endpoint so it stays in parity with the AI `get_directory_tree` tool.
+        # When both params are omitted, behaviour is unchanged.
+        import fnmatch as _fnmatch
+
         dir_nodes: dict[str, dict] = {}
         file_nodes: dict[str, dict] = {}
 
@@ -1745,6 +1754,42 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         for nid, node in all_nodes.items():
             if nid not in child_ids:
                 roots.append(node)
+
+        # Apply optional `depth` cap. depth=0 returns roots only with no children.
+        if depth is not None:
+            try:
+                max_depth = max(0, int(depth))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="`depth` must be an integer >= 0")
+
+            def _trim(node: dict, current: int) -> None:
+                if current >= max_depth:
+                    node["children"] = []
+                    return
+                for child in node["children"]:
+                    _trim(child, current + 1)
+
+            for r in roots:
+                _trim(r, 0)
+
+        # Apply optional `glob` filter on file paths. Empty directories are
+        # left in place — callers can collapse client-side if they want.
+        if glob:
+            pattern = glob
+
+            def _filter(node: dict) -> None:
+                kept: list[dict] = []
+                for child in node["children"]:
+                    if child.get("type") == "file":
+                        if _fnmatch.fnmatch(child.get("path") or "", pattern):
+                            kept.append(child)
+                    else:
+                        _filter(child)
+                        kept.append(child)
+                node["children"] = kept
+
+            for r in roots:
+                _filter(r)
 
         if len(roots) == 1:
             return roots[0]

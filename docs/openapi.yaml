@@ -138,6 +138,25 @@ paths:
       operationId: getTree
       tags: [Filesystem]
       summary: Recursive file tree of the indexed directory
+      description: >
+        Returns the directory/file tree built from `contains` edges in the
+        knowledge graph. Optional `depth` and `glob` query params keep the
+        endpoint in parity with the AI `get_directory_tree` tool — when both
+        are omitted the full tree is returned (legacy behaviour).
+      parameters:
+        - name: depth
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Maximum tree depth from root (0-indexed). When omitted the full tree is returned.
+        - name: glob
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional fnmatch pattern (e.g. `*.py`) applied to file paths; non-matching files are dropped, directories are kept.
       responses:
         "200":
           description: Recursive tree
@@ -145,6 +164,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TreeNode"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   # ── Indexing ────────────────────────────────────────────────────────
   /api/indexing-status:

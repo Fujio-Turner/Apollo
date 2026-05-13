@@ -61,6 +61,15 @@ Lists immediate subdirectories of a given path.
 
 Returns a recursive directory/file tree of the indexed project.
 
+**Query Params**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `depth` | integer | no | Maximum tree depth from root (0-indexed). When omitted the full tree is returned. |
+| `glob` | string | no | Optional fnmatch pattern (e.g. `*.py`) applied to file paths. Non-matching files are dropped; directories are kept. |
+
+When both params are omitted the legacy behaviour is preserved. With params,
+this endpoint is in parity with the AI `get_directory_tree` tool.
+
 ---
 
 ## Indexing
