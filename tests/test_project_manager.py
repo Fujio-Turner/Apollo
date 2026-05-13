@@ -519,3 +519,53 @@ class TestProjectManagerLeaveWithSettings:
             deleted_resolved = [str(Path(d).resolve()) for d in deleted]
             assert str(apollo_dir.resolve()) in deleted_resolved
             assert str(apollo_web_dir.resolve()) in deleted_resolved
+
+
+class TestGitignoreSafeguard:
+    """open()/init() should keep _apollo*/ out of an existing .gitignore."""
+
+    def test_open_appends_apollo_block_to_existing_gitignore(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gitignore = Path(tmpdir) / ".gitignore"
+            gitignore.write_text("# user rules\nnode_modules/\n")
+
+            manager = ProjectManager("0.7.2")
+            manager.open(tmpdir)
+
+            text = gitignore.read_text()
+            assert "node_modules/" in text  # original lines preserved
+            assert "_apollo/" in text
+            assert "_apollo_web/" in text
+            assert "Apollo per-project state" in text  # explanatory note
+
+    def test_open_idempotent_when_apollo_already_listed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gitignore = Path(tmpdir) / ".gitignore"
+            original = "# user rules\n_apollo/\n"
+            gitignore.write_text(original)
+
+            manager = ProjectManager("0.7.2")
+            manager.open(tmpdir)
+            manager.open(tmpdir)  # second call must not duplicate
+
+            assert gitignore.read_text() == original
+
+    def test_open_does_not_create_gitignore_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ProjectManager("0.7.2")
+            manager.open(tmpdir)
+
+            assert not (Path(tmpdir) / ".gitignore").exists()
+
+    def test_init_appends_apollo_block_to_existing_gitignore(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gitignore = Path(tmpdir) / ".gitignore"
+            gitignore.write_text("dist/\n")
+
+            manager = ProjectManager("0.7.2")
+            manager.init(tmpdir)
+
+            text = gitignore.read_text()
+            assert "dist/" in text
+            assert "_apollo/" in text
+            assert "_apollo_web/" in text

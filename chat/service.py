@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Iterator, Optional
@@ -71,11 +72,33 @@ def _to_toon_for_llm(json_str: str) -> tuple[str, bool]:
 # `ai/chat_request.json` so it can be tuned without touching Python code.
 # The file holds the *static* parts of every chat completion request — the
 # model, conversation history, and user message are layered on at call time.
-_REQUEST_TEMPLATE_PATH = os.path.join(
+#
+# Versioning convention (matches the `_comment` field inside the JSON
+# files themselves):
+#   chat_request.json    — ACTIVE payload (always edit this one)
+#   chat_request_v1.json — original snapshot, pre-tuning
+#   chat_request_v2.json — snapshot after PLAN_MORE_LOCAL_AI_FUNCTIONS
+#                           phases 1-4 (14 new internal functions)
+#   chat_request_v3.json — pre-Phase-8 snapshot
+#
+# Historical note: an earlier revision of this loader pointed at
+# `chat_request_v2.json` as the ACTIVE file, which silently froze the
+# catalog at the v2 snapshot and hid the three Phase-8 tools
+# (`outline_file`, `list_declarations`, `find_symbol_usages`) from the
+# LLM even after they were added. That's why the §8.13 benchmark trace
+# kept showing `project_search` calls with kitchen-sink regexes — the
+# replacement tools were never in the request payload. Fixed: the
+# loader now follows the comment in the JSON file itself and treats
+# `chat_request.json` as authoritative.
+_AI_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "ai",
-    "chat_request.json",
 )
+_REQUEST_TEMPLATE_PATH = os.path.join(_AI_DIR, "chat_request.json")
+# Fallback to the most recent snapshot if chat_request.json was deleted
+# locally — keeps tests / fresh checkouts working.
+if not os.path.exists(_REQUEST_TEMPLATE_PATH):
+    _REQUEST_TEMPLATE_PATH = os.path.join(_AI_DIR, "chat_request_v3.json")
 
 
 def _load_request_template() -> dict:
@@ -96,6 +119,68 @@ def _extract_system_prompt(template: dict) -> str:
 SYSTEM_PROMPT = _extract_system_prompt(_REQUEST_TEMPLATE)
 
 TOOLS = _REQUEST_TEMPLATE.get("tools", [])
+
+# ── Context-aware tool-list filtering (Phase 8 §8.13 follow-up) ─────────
+#
+# When the user names a specific file, the model still defaults to
+# `file_search` / `project_search` with a kitchen-sink regex even after
+# every prompt-only tightening in PLAN_MORE_LOCAL_AI_FUNCTIONS.md §8.13.
+# The only lever left is to remove those tools from the catalog for
+# file-named requests so the model is forced to pick `outline_file` /
+# `list_declarations` / `find_symbol_usages`.
+#
+# This is purely the LLM-tools view; the underlying HTTP endpoints
+# (`/api/file/search`, `/api/project/search`) and `_exec_tool` dispatch
+# are unchanged so existing HTTP consumers and other tool callers still
+# work. The OpenAPI document marks both endpoints as deprecated for the
+# file-named-question pathway and points integrators at the three
+# replacement endpoints.
+_GREP_TOOL_NAMES = ("file_search", "project_search")
+
+# A "file-named question" is one where the user message contains a token
+# that looks like a filename — either a path with a slash, or a bare
+# `name.ext` where `ext` is a known source/markup extension. Backticks
+# and quotes are common framing; the regex doesn't require them but the
+# extension allow-list keeps us from firing on prose like "see fig. 1".
+_FILE_EXT_ALLOWLIST = (
+    "py|js|ts|jsx|tsx|html|htm|css|scss|md|markdown|json|yaml|yml|toml|"
+    "xml|svg|vue|svelte|go|rs|java|kt|swift|c|cc|cpp|cxx|h|hpp|hh|m|mm|"
+    "sh|bash|zsh|sql|rb|php|lua|pl|r|scala|dart|ex|exs|erl|elm|fs|fsx|"
+    "ipynb|cfg|ini|conf|env|lock|txt|csv|tsv|proto|graphql|gql"
+)
+_FILE_NAMED_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:[\w./\\-]+/)?[\w.\-]+\.(?:" + _FILE_EXT_ALLOWLIST + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_file_named_question(message: str) -> bool:
+    """True when the user message names a specific file by path or `name.ext`.
+
+    Used to drop `file_search` / `project_search` from the tool catalog
+    so the model is forced toward `outline_file` / `list_declarations` /
+    `find_symbol_usages` (see PLAN_MORE_LOCAL_AI_FUNCTIONS.md §8.13).
+    """
+    if not message:
+        return False
+    return _FILE_NAMED_RE.search(message) is not None
+
+
+def _select_tools(message: str) -> list[dict]:
+    """Return the tools[] catalog filtered for the current question.
+
+    For file-named questions the grep tools are removed so the model
+    cannot fall back to a kitchen-sink regex as its first call.
+    """
+    if not _is_file_named_question(message):
+        return TOOLS
+    filtered = [
+        t for t in TOOLS
+        if (t.get("function") or {}).get("name") not in _GREP_TOOL_NAMES
+    ]
+    return filtered
+
 
 # Max tool-call rounds before we strip `tools=` and force the model to
 # write a final text answer. Bumped from 5 → 8 because Grok tends to
@@ -150,6 +235,34 @@ class ChatService:
             self.model = model
         else:
             self.model = get_provider(DEFAULT_PROVIDER)["default_model"]
+
+    # ── Project root resolution ────────────────────────────────────
+
+    def _current_root_dir(self) -> str | None:
+        """Return the root directory of the currently-open project.
+
+        Resolution order:
+
+        1. ``ProjectManager.root_dir`` if a project is open. This is the
+           live value that follows the user's "Open Folder" actions, so
+           tools always target the project they're looking at.
+        2. ``self.root_dir`` — the value cached at construction time
+           (e.g. from the server's ``--watch-dir`` flag). Used when no
+           project is open through the manager.
+
+        Without this fallback, opening a project via the UI never
+        propagated to ``ChatService`` and ``project_search`` aborted
+        with ``"No root configured; pass root explicitly."``.
+        """
+        pm = self._project_manager
+        if pm is not None:
+            try:
+                pm_root = getattr(pm, "root_dir", None)
+                if pm_root:
+                    return str(pm_root)
+            except Exception:
+                pass
+        return self.root_dir
 
     # ── Active provider resolution ─────────────────────────────────
 
@@ -383,26 +496,36 @@ class ChatService:
             ]
             return json.dumps({"node_id": node_id, "neighbors": trimmed}, default=str)
 
-        elif name in ("file_stats", "get_file_section", "get_function_source", "file_search", "project_search"):
+        elif name in ("file_stats", "get_file_section", "get_function_source",
+                      "file_search", "project_search",
+                      "list_declarations", "find_symbol_usages", "outline_file"):
             from apollo import file_inspect
+            # Prefer the live ProjectManager root over the cached
+            # ``self.root_dir`` so file tools always target the
+            # currently-open project. Without this fallback,
+            # ``project_search`` failed with "No root configured" whenever
+            # the chat service was constructed before a project was
+            # opened (e.g. server launched without --watch-dir, then user
+            # opens a folder via the UI).
+            root = self._current_root_dir()
             try:
                 if name == "file_stats":
-                    return json.dumps(file_inspect.file_stats(self.graph, self.root_dir, args["path"]), default=str)
+                    return json.dumps(file_inspect.file_stats(self.graph, root, args["path"]), default=str)
                 if name == "get_file_section":
                     return json.dumps(file_inspect.get_file_section(
-                        self.graph, self.root_dir,
+                        self.graph, root,
                         args["path"], int(args["start_line"]), int(args["end_line"]),
                         expected_md5=args.get("expected_md5"),
                     ), default=str)
                 if name == "get_function_source":
                     return json.dumps(file_inspect.get_function_source(
-                        self.graph, self.root_dir,
+                        self.graph, root,
                         args["path"], args["name"],
                         expected_md5=args.get("expected_md5"),
                     ), default=str)
                 if name == "file_search":
                     return json.dumps(file_inspect.file_search(
-                        self.graph, self.root_dir,
+                        self.graph, root,
                         args["path"], args["pattern"],
                         context=int(args.get("context", 5) or 5),
                         regex=bool(args.get("regex", True)),
@@ -410,12 +533,36 @@ class ChatService:
                     ), default=str)
                 if name == "project_search":
                     return json.dumps(file_inspect.project_search(
-                        self.graph, self.root_dir,
+                        self.graph, root,
                         args["pattern"],
                         root=args.get("root"),
                         context=int(args.get("context", 5) or 5),
                         file_glob=args.get("file_glob", "*.py") or "*.py",
                         regex=bool(args.get("regex", True)),
+                    ), default=str)
+                if name == "list_declarations":
+                    from apollo.chat import local_tools
+                    return json.dumps(local_tools.list_declarations(
+                        self.graph, root,
+                        args["path"],
+                        kinds=args.get("kinds"),
+                        limit=int(args.get("limit", 200) or 200),
+                    ), default=str)
+                if name == "find_symbol_usages":
+                    from apollo.chat import local_tools
+                    return json.dumps(local_tools.find_symbol_usages(
+                        self.graph, root,
+                        args["path"],
+                        symbol=args.get("symbol"),
+                        symbols=args.get("symbols"),
+                        kinds=args.get("kinds"),
+                    ), default=str)
+                if name == "outline_file":
+                    from apollo.chat import local_tools
+                    return json.dumps(local_tools.outline_file(
+                        self.graph, root,
+                        args["path"],
+                        depth=int(args.get("depth", 2) or 2),
                     ), default=str)
             except file_inspect.FileChangedError as e:
                 return json.dumps({"error": str(e), "expected_md5": e.expected, "actual_md5": e.actual, "status": 409})
@@ -456,24 +603,148 @@ class ChatService:
             except Exception as e:
                 return json.dumps({"error": f"annotation lookup failed: {e}"})
 
+        elif name == "batch_get_nodes":
+            from apollo.chat import local_tools
+            ids = args.get("node_ids") or []
+            include_source = bool(args.get("include_source", True))
+            include_edges = bool(args.get("include_edges", True))
+            return json.dumps(local_tools.batch_get_nodes(
+                self.graph, ids,
+                include_source=include_source,
+                include_edges=include_edges,
+            ), default=str)
+
+        elif name == "batch_file_sections":
+            from apollo.chat import local_tools
+            ranges = args.get("ranges") or []
+            return json.dumps(local_tools.batch_file_sections(
+                self.graph, self.root_dir, ranges,
+            ), default=str)
+
+        elif name == "get_directory_tree":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_directory_tree(
+                self.graph,
+                root=args.get("root", ".") or ".",
+                depth=int(args.get("depth", 3) or 3),
+                glob=args.get("glob") or None,
+                include_dirs=bool(args.get("include_dirs", True)),
+            ), default=str)
+
+        elif name == "project_stats_detailed":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.project_stats_detailed(
+                self.graph,
+                top_n=int(args.get("top_n", 20) or 20),
+                group=args.get("group", "dir") or "dir",
+            ), default=str)
+
+        elif name == "get_paths_between":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_paths_between(
+                self.graph,
+                start_node_id=args.get("start_node_id", ""),
+                end_node_id=args.get("end_node_id", ""),
+                max_length=int(args.get("max_length", 5) or 5),
+                max_paths=int(args.get("max_paths", 5) or 5),
+                edge_types=args.get("edge_types"),
+                shortest_only=bool(args.get("shortest_only", False)),
+            ), default=str)
+
+        elif name == "get_subgraph":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_subgraph(
+                self.graph,
+                seed_node_ids=args.get("seed_node_ids") or [],
+                depth=int(args.get("depth", 1) or 1),
+                edge_types=args.get("edge_types"),
+                max_nodes=int(args.get("max_nodes", 200) or 200),
+            ), default=str)
+
+        elif name == "get_inheritance_tree":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_inheritance_tree(
+                self.graph,
+                class_node_id=args.get("class_node_id", ""),
+                include_methods=bool(args.get("include_methods", False)),
+            ), default=str)
+
+        elif name == "get_transitive_imports":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_transitive_imports(
+                self.graph,
+                file_node_id=args.get("file_node_id", ""),
+                direction=args.get("direction", "in") or "in",
+                max_depth=int(args.get("max_depth", 5) or 5),
+            ), default=str)
+
+        elif name == "get_code_metrics":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_code_metrics(
+                self.graph,
+                node_ids=args.get("node_ids"),
+                top_n=int(args.get("top_n", 20) or 20),
+                sort_by=args.get("sort_by", "complexity") or "complexity",
+            ), default=str)
+
+        elif name == "search_graph_by_signature":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.search_graph_by_signature(
+                self.graph,
+                param_names=args.get("param_names"),
+                param_annotations=args.get("param_annotations"),
+                signature_hash=args.get("signature_hash"),
+                fuzzy=bool(args.get("fuzzy", False)),
+                top=int(args.get("top", 20) or 20),
+            ), default=str)
+
+        elif name == "find_test_correspondents":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.find_test_correspondents(
+                self.graph,
+                node_id=args.get("node_id", ""),
+                include_heuristic=bool(args.get("include_heuristic", True)),
+            ), default=str)
+
+        elif name == "detect_entry_points":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.detect_entry_points(
+                self.graph,
+                kinds=args.get("kinds"),
+            ), default=str)
+
+        elif name == "get_git_context":
+            from apollo.chat import local_tools
+            return json.dumps(local_tools.get_git_context(
+                self.graph, self.root_dir,
+                path=args.get("path", ""),
+                name=args.get("name"),
+                line_start=args.get("line_start"),
+                line_end=args.get("line_end"),
+                limit=int(args.get("limit", 10) or 10),
+            ), default=str)
+
+        elif name == "search_notes_fulltext":
+            from apollo.chat import local_tools
+            mgr = self._get_annotation_manager()
+            return json.dumps(local_tools.search_notes_fulltext(
+                mgr,
+                query=args.get("query", ""),
+                type_filter=args.get("type"),
+                top=int(args.get("top", 10) or 10),
+            ), default=str)
+
         elif name == "get_wordcloud":
-            from collections import defaultdict
-            exclude = {"directory", "file", "import"}
+            # Strength + count are derived purely from the graph and do
+            # not depend on the chat call's arguments. We delegate to
+            # ``apollo.graph.indices.get_indices`` which caches the
+            # result by ``(num_nodes, num_edges)`` — repeated wordcloud
+            # invocations within a session reuse the same buckets.
+            exclude = frozenset({"directory", "file", "import"})
             mode = (args.get("mode") or "strong").lower()
-            strengths: dict[str, float] = defaultdict(float)
-            counts: dict[str, int] = defaultdict(int)
-            for nid, data in self.graph.nodes(data=True):
-                if data.get("type", "") in exclude:
-                    continue
-                n = data.get("name", "")
-                if not n:
-                    continue
-                try:
-                    deg = self.graph.degree(nid)
-                except Exception:
-                    deg = 0
-                strengths[n] += deg
-                counts[n] += 1
+            from apollo.graph.indices import get_indices
+            indices = get_indices(self.graph)
+            strengths, counts = indices.wordcloud(exclude)
             items = [
                 {"name": n, "strength": float(strengths[n]), "count": counts[n]}
                 for n in strengths
@@ -566,17 +837,19 @@ class ChatService:
         use_model = model or self.active_model
         rid = uuid.uuid4().hex[:8]
         t_start = time.time()
+        active_tools = _select_tools(message)
         logger.info(
             "chat.request id=%s mode=blocking provider=%s model=%s history=%d "
-            "ctx=%s msg=%s",
+            "ctx=%s tools=%d file_named=%s msg=%s",
             rid, self.active_provider, use_model, len(history or []),
-            context_node_id, _preview(message, 300),
+            context_node_id, len(active_tools),
+            _is_file_named_question(message), _preview(message, 300),
         )
 
         for round_idx in range(_MAX_TOOL_ROUNDS):
             t_round = time.time()
             response = client.chat.completions.create(
-                model=use_model, messages=messages, tools=TOOLS,
+                model=use_model, messages=messages, tools=active_tools,
             )
             choice = response.choices[0]
             logger.info(
@@ -666,11 +939,14 @@ class ChatService:
         use_model = model or self.active_model
         rid = uuid.uuid4().hex[:8]
         t_start = time.time()
+        active_tools = _select_tools(message)
+        file_named = _is_file_named_question(message)
         logger.info(
             "chat.request id=%s mode=stream provider=%s model=%s history=%d "
-            "ctx=%s msg=%s",
+            "ctx=%s tools=%d file_named=%s msg=%s",
             rid, self.active_provider, use_model, len(history or []),
-            context_node_id, _preview(message, 300),
+            context_node_id, len(active_tools), file_named,
+            _preview(message, 300),
         )
         yield {
             "type": "step",
@@ -680,6 +956,8 @@ class ChatService:
             "model": use_model,
             "history_len": len(history or []),
             "context_node": context_node_id,
+            "tools_count": len(active_tools),
+            "file_named": file_named,
         }
 
         # Tool-calling loop (non-streamed so we can process tool calls)
@@ -688,13 +966,38 @@ class ChatService:
             t_round = time.time()
             try:
                 response = client.chat.completions.create(
-                    model=use_model, messages=messages, tools=TOOLS,
+                    model=use_model, messages=messages, tools=active_tools,
                 )
             except Exception as e:
                 logger.exception(
                     "chat.error id=%s round=%d phase=tools total_dt=%.2fs",
                     rid, round_idx, time.time() - t_start,
                 )
+                # Classify so the UI can show a useful daisyUI toast instead
+                # of dumping the raw provider stack-trace text on the user.
+                err_cls = type(e).__name__
+                provider_label = self.active_provider
+                if err_cls in ("APIConnectionError", "APITimeoutError",
+                               "ConnectError", "ConnectTimeout", "ReadTimeout"):
+                    error_kind = "connection_error"
+                    user_message = (
+                        f"Cannot reach {provider_label} provider — "
+                        "check your internet connection and try again."
+                    )
+                elif err_cls in ("AuthenticationError", "PermissionDeniedError"):
+                    error_kind = "auth_error"
+                    user_message = (
+                        f"{provider_label} rejected the API key — "
+                        "verify the credentials in your environment."
+                    )
+                elif err_cls == "RateLimitError":
+                    error_kind = "rate_limit"
+                    user_message = (
+                        f"{provider_label} rate-limit hit — wait a moment and retry."
+                    )
+                else:
+                    error_kind = "error"
+                    user_message = f"Chat failed ({err_cls}): {e}"
                 yield {
                     "type": "step",
                     "phase": "error",
@@ -702,8 +1005,11 @@ class ChatService:
                     "where": "tools",
                     "round": round_idx,
                     "message": str(e),
+                    "error_kind": error_kind,
+                    "user_message": user_message,
                 }
-                raise
+                # Raise a clean message so the SSE `[ERROR]` frame stays readable.
+                raise RuntimeError(user_message) from e
             choice = response.choices[0]
             last_round_finish = choice.finish_reason
             tool_call_count = len(choice.message.tool_calls or []) if choice.message else 0

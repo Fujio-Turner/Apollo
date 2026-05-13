@@ -61,6 +61,15 @@ Lists immediate subdirectories of a given path.
 
 Returns a recursive directory/file tree of the indexed project.
 
+**Query Params**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `depth` | integer | no | Maximum tree depth from root (0-indexed). When omitted the full tree is returned. |
+| `glob` | string | no | Optional fnmatch pattern (e.g. `*.py`) applied to file paths. Non-matching files are dropped; directories are kept. |
+
+When both params are omitted the legacy behaviour is preserved. With params,
+this endpoint is in parity with the AI `get_directory_tree` tool.
+
 ---
 
 ## Indexing
@@ -348,6 +357,142 @@ AST-extract a function, method, or class by name. `name` may be `foo`, `MyClass.
 | `name` | string | Symbol name *(required)*                          |
 | `md5`  | string | Optional version check. 409 on mismatch.          |
 
+### `GET /api/files/declarations`
+
+List every top-level declaration in a file (functions, classes, methods, and `const/let/var/def` bindings — including `new Map()` / `WeakMap()` / `Set()` / `WeakSet()`). Reads from the parser's `defines` edges and falls back to a single regex pass for files indexed by `text_parser`. Mirrors the AI's `list_declarations` tool.
+
+| Param   | Type   | Default | Description                                                                                              |
+|---------|--------|---------|----------------------------------------------------------------------------------------------------------|
+| `path`  | string | —       | File path *(required)*                                                                                   |
+| `kinds` | string | —       | Comma-separated kind filter: `function,class,method,const,let,var,def,map_decl,weakmap_decl,set_decl,weakset_decl` |
+| `limit` | int    | `200`   | Max declarations to return (capped at 500)                                                               |
+
+**Response**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "accuracy": "ast",
+  "count": 5,
+  "truncated": false,
+  "declarations": [
+    { "name": "parseTimeCache", "kind": "map_decl", "line_start": 2, "line_end": 2, "is_exported": false, "parent": "" },
+    { "name": "clearCaches",    "kind": "function", "line_start": 5, "line_end": 8, "is_exported": true,  "parent": "" }
+  ]
+}
+```
+
+`accuracy` is one of `ast` (parser produced the rows), `regex` (regex fallback used), or `graph_only` (file unreadable; only graph rows returned).
+
+### `GET /api/files/usages`
+
+Every line in a file that references one or more symbols, classified as `declaration` / `read` / `write` / `call` / `comment` / `string`. Returns line numbers + a single trimmed line per hit, no surrounding context (~10× less data than `/api/file/search`). Mirrors the AI's `find_symbol_usages` tool.
+
+**Two input modes (pass exactly one):**
+
+- `symbol=foo` — single-symbol mode. Returns the legacy flat shape.
+- `symbols=foo,bar,baz` — **batch mode** (max 20). Reads the file ONCE
+  and classifies every line against every requested symbol. Strongly
+  preferred when checking ≥2 symbols in the same file: folds N
+  round-trips into 1. See [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+  for the benchmark trace that motivated this addition.
+
+| Param     | Type   | Description                                                                                  |
+|-----------|--------|----------------------------------------------------------------------------------------------|
+| `path`    | string | File path *(required)*                                                                       |
+| `symbol`  | string | Single symbol name. Use this **OR** `symbols` (one of the two is required)                   |
+| `symbols` | string | Comma-separated list (max 20). Triggers batch mode and returns the `results[]` shape         |
+| `kinds`   | string | Comma-separated kind filter: `declaration,read,write,call,comment,string` (applies to all)   |
+
+**Response — single-symbol mode (`symbol=…`)**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "symbol": "parseTimeCache",
+  "md5": "...",
+  "accuracy": "text",
+  "count": 4,
+  "usages": [
+    { "line_no": 2,  "kind": "declaration", "text": "const parseTimeCache = new Map();" },
+    { "line_no": 6,  "kind": "write",       "text": "parseTimeCache.clear();" },
+    { "line_no": 10, "kind": "read",        "text": "if (parseTimeCache.has(s)) return parseTimeCache.get(s);" },
+    { "line_no": 11, "kind": "write",       "text": "parseTimeCache.set(s, 0);" }
+  ]
+}
+```
+
+**Response — batch mode (`symbols=parseTimeCache,clearCaches`)**
+```json
+{
+  "path": "/abs/project/cache.js",
+  "md5": "...",
+  "accuracy": "text",
+  "total": 5,
+  "results": [
+    {
+      "symbol": "parseTimeCache",
+      "count": 4,
+      "usages": [
+        { "line_no": 2,  "kind": "declaration", "text": "const parseTimeCache = new Map();" },
+        { "line_no": 6,  "kind": "write",       "text": "parseTimeCache.clear();" }
+      ]
+    },
+    {
+      "symbol": "clearCaches",
+      "count": 1,
+      "usages": [
+        { "line_no": 5, "kind": "declaration", "text": "function clearCaches() {" }
+      ]
+    }
+  ]
+}
+```
+
+### `GET /api/files/outline`
+
+Sub-second outline of a file. Source files: top-level declaration tree (kinds + line ranges, `accuracy: "ast"`). HTML: regex-derived tag tree of landmark elements (`head`/`body`/`script`/`style`/`<h1..h6>`/`<section>`/`<main>`/…) plus the JS function/class/const declarations found inside each `<script>` block (`accuracy: "regex"`). For other files outside the parser graph, returns `outline: []` and `accuracy: "none"` rather than guessing. Mirrors the AI's `outline_file` tool.
+
+| Param   | Type | Default | Description                                |
+|---------|------|---------|--------------------------------------------|
+| `path`  | string | — | File path *(required)*                       |
+| `depth` | int    | `2` | Max nesting depth to descend (max 6). For HTML, the depth caps tag nesting; JS decls inside `<script>` are emitted as content (one level deeper than the script row) whenever `depth ≥ 2`. |
+
+**Response — source file (`accuracy: "ast"`)**
+```json
+{
+  "path": "cache.js",
+  "accuracy": "ast",
+  "count": 2,
+  "depth": 2,
+  "outline": [
+    { "kind": "function", "name": "clearCaches",  "line_start": 5, "line_end": 8,  "depth": 1 },
+    { "kind": "function", "name": "getOperators", "line_start": 9, "line_end": 13, "depth": 1 }
+  ]
+}
+```
+
+**Response — HTML file (`accuracy: "regex"`)**
+
+Replaces `file_search` for "what's in this HTML?" — the [§8.13 benchmark trace](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md) showed the model burning a round on `get_function_source` (which can't parse HTML) before this fallback existed.
+
+```json
+{
+  "path": "en/index.html",
+  "accuracy": "regex",
+  "count": 6,
+  "depth": 3,
+  "outline": [
+    { "kind": "tag",      "name": "<head>",            "line_start": 3,  "line_end": 5,  "depth": 2 },
+    { "kind": "tag",      "name": "<body>",            "line_start": 6,  "line_end": 18, "depth": 2 },
+    { "kind": "heading",  "name": "<h1>",              "line_start": 7,  "line_end": 7,  "depth": 1 },
+    { "kind": "tag",      "name": "<section #main>",   "line_start": 8,  "line_end": 10, "depth": 3 },
+    { "kind": "script",   "name": "<script>",          "line_start": 11, "line_end": 17, "depth": 3 },
+    { "kind": "function", "name": "clearCaches",       "line_start": 12, "line_end": 12, "depth": 4 },
+    { "kind": "const",    "name": "operatorsCache",    "line_start": 15, "line_end": 15, "depth": 4 },
+    { "kind": "class",    "name": "Helper",            "line_start": 16, "line_end": 16, "depth": 4 }
+  ]
+}
+```
+
 ---
 
 ## Search
@@ -367,7 +512,23 @@ Full-text search over indexed symbols.
 { "results": [{ "id": "abc", "name": "parse_file", "type": "function", "path": "src/parser.py", "line_start": 12, "score": 0.95 }] }
 ```
 
-### `POST /api/project/search`
+### `POST /api/project/search` ⚠️ Deprecated for AI/LLM file-named queries
+
+> **Deprecated.** Prefer the Phase 8 endpoints when the user already
+> knows the target file or symbol:
+> - [`GET /api/files/outline`](#get-apifilesoutline) for "what's in file X"
+> - [`GET /api/files/declarations`](#get-apifilesdeclarations) for
+>   "list everything declared in file X" (replaces regexes like
+>   `function|class|def`)
+> - [`GET /api/files/usages`](#get-apifilesusages) for "where is symbol Y
+>   used in file X"
+>
+> The chat service now strips `project_search` and `file_search` from
+> the LLM tool catalog whenever the user names a specific file. See
+> [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+> for the trace that motivated the change. The HTTP route is still
+> served unchanged for non-LLM callers; there is no scheduled removal
+> date.
 
 Grep across the indexed project. Returns matches with file/line/context. Read-only. Mirrors the AI's `project_search` tool. Hard caps: 500 matches or 200 KB of snippet bytes (whichever first).
 
@@ -394,7 +555,23 @@ Grep across the indexed project. Returns matches with file/line/context. Read-on
 }
 ```
 
-### `POST /api/file/search`
+### `POST /api/file/search` ⚠️ Deprecated for AI/LLM file-named queries
+
+> **Deprecated.** Use one of the structured Phase 8 endpoints instead:
+> - [`GET /api/files/outline`](#get-apifilesoutline) — sub-second
+>   declaration tree of a file. Use this on first contact.
+> - [`GET /api/files/declarations`](#get-apifilesdeclarations) — exact
+>   list of every top-level declaration with line ranges.
+> - [`GET /api/files/usages`](#get-apifilesusages) — every line in a
+>   file that references a given symbol, classified as
+>   `declaration` / `read` / `write` / `call` / `comment` / `string`.
+>
+> The chat service now strips `file_search` and `project_search` from
+> the LLM tool catalog whenever the user names a specific file. See
+> [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8.13](./work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+> for the rationale and the benchmark trace. The HTTP route is still
+> served unchanged for non-LLM callers; there is no scheduled removal
+> date.
 
 Grep within a single file. Read-only. Mirrors the AI's `file_search` tool. Cap: 200 matches.
 
@@ -815,6 +992,143 @@ Folder tree of the current project, used by the bootstrap wizard.
 | Param   | Type | Default | Description                |
 |---------|------|---------|----------------------------|
 | `depth` | int  | `3`     | Maximum recursion depth    |
+
+---
+
+## Local AI Tools
+
+These endpoints mirror the AI agent's extended tool catalog (see
+`PLAN_MORE_LOCAL_AI_FUNCTIONS`). Each one is a single-call replacement for
+a multi-grep dance the model would otherwise perform. All read-only.
+
+### `POST /api/nodes/batch`
+
+Get up to 20 node payloads in one call. Replaces sequential `GET /api/node/{id}`.
+
+**Request Body**
+
+| Field            | Type      | Required | Description                          |
+|------------------|-----------|----------|--------------------------------------|
+| `ids`            | string[]  | yes      | Up to 20 node IDs                    |
+| `include_source` | boolean   | no       | Default `true`                       |
+| `include_edges`  | boolean   | no       | Default `true`                       |
+
+Returns `{ nodes[], missing[], requested }`. Unknown IDs land in `missing[]`.
+
+### `POST /api/files/sections`
+
+Read up to 10 line ranges across files in one call. Per-range cap is 400
+lines. Errors on individual ranges are inlined without failing the batch.
+
+**Request Body**
+
+```json
+{ "ranges": [ { "path": "x.py", "start": 1, "end": 40 } ] }
+```
+
+### `GET /api/stats/detailed`
+
+Deeper aggregation over the existing graph — group counts, top-N largest
+files, top-N most-connected nodes.
+
+| Param   | Type   | Default | Description                                  |
+|---------|--------|---------|----------------------------------------------|
+| `top_n` | int    | 20      | 1..50                                        |
+| `group` | string | dir     | One of `dir`, `lang`, `ext`                  |
+
+### `GET /api/paths`
+
+Find paths between two nodes via `nx.all_simple_paths` (or
+`shortest_path` when `shortest_only=true`) over an undirected,
+edge-type-filtered view.
+
+| Param           | Type    | Default | Description                                  |
+|-----------------|---------|---------|----------------------------------------------|
+| `start`         | string  | —       | Start node ID                                |
+| `end`           | string  | —       | End node ID                                  |
+| `max_length`    | int     | 5       | 1..8                                         |
+| `max_paths`     | int     | 5       | 1..20                                        |
+| `edge_types`    | csv     | —       | e.g. `calls,imports`                         |
+| `shortest_only` | boolean | false   | Return only the shortest path                |
+
+### `POST /api/subgraph`
+
+Subgraph induced by N seeds plus depth-K neighbours.
+
+```json
+{ "seed_node_ids": ["func::main.py::main"], "depth": 1, "max_nodes": 200 }
+```
+
+### `GET /api/inheritance/{class_id}`
+
+Full ancestor chain + descendants for a class node.
+
+| Param              | Type    | Default | Description                              |
+|--------------------|---------|---------|------------------------------------------|
+| `include_methods`  | boolean | false   | Roll up `defines→method` edges per class |
+
+### `GET /api/imports/{file_id}`
+
+Transitive import set in either direction.
+
+| Param       | Type   | Default | Description                                      |
+|-------------|--------|---------|--------------------------------------------------|
+| `direction` | string | in      | `in`, `out`, or `both`                           |
+| `max_depth` | int    | 5       | 1..10                                            |
+
+### `GET /api/metrics`
+
+Top-N most complex / largest functions project-wide.
+
+| Param     | Type   | Default     | Description                              |
+|-----------|--------|-------------|------------------------------------------|
+| `top_n`   | int    | 20          | 1..100                                   |
+| `sort_by` | string | complexity  | `complexity`, `loc`, or `param_count`    |
+
+### `POST /api/signature/search`
+
+Find functions whose parameter list matches a pattern. Cannot be
+answered correctly by grep — the indexer's resolved param list is the
+only ground truth.
+
+```json
+{ "param_names": ["user_id", "amount"], "fuzzy": false, "top": 20 }
+```
+
+Either `param_names`, `param_annotations`, or `signature_hash` must be
+supplied.
+
+### `GET /api/tests/{node_id}`
+
+Probable tests covering a function/class node — explicit `tests` edges
+first, then heuristic matches (`test_<name>`, `Test<Name>`).
+
+| Param               | Type    | Default | Description                  |
+|---------------------|---------|---------|------------------------------|
+| `include_heuristic` | boolean | true    | Include name-pattern matches |
+
+### `GET /api/entry-points`
+
+Probable entry points: `__main__` markers, FastAPI/Flask/Django routes,
+Click/Typer CLI commands, well-known basenames.
+
+| Param   | Type | Description                                                |
+|---------|------|------------------------------------------------------------|
+| `kinds` | csv  | Optional filter (`cli`, `http_route`, `main`, …)           |
+
+### `GET /api/git/blame`
+
+`git log` + `git blame -L` for a file (or function/line range). Returns
+`{ git_available: false }` cleanly on non-git roots and on missing
+`git` binaries — never raises.
+
+| Param        | Type   | Default | Description                                           |
+|--------------|--------|---------|-------------------------------------------------------|
+| `path`       | string | —       | Project-relative file path                            |
+| `name`       | string | —       | Optional function/class name → resolved to a range    |
+| `line_start` | int    | —       | Start line for blame (inclusive)                      |
+| `line_end`   | int    | —       | End line for blame (inclusive)                        |
+| `limit`      | int    | 10      | 1..30 — max recent commits returned                   |
 
 ---
 

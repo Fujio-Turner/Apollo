@@ -123,46 +123,101 @@ DEFAULT_SETTINGS = {
 }
 
 
+# Cache for ``_load_settings`` — many request handlers call it on every
+# hit, and the previous implementation re-walked ``plugins/`` and rewrote
+# ``data/settings.json`` whenever the detected plugin map differed from
+# what was persisted. The cache holds the (mtime, payload) of the file so
+# we only re-read on disk change, and re-runs ``detect_installed_plugins``
+# at most once per ``_PLUGIN_REFRESH_INTERVAL`` seconds.
+_SETTINGS_CACHE: dict = {"mtime": -1.0, "payload": None, "plugin_check_at": 0.0}
+_SETTINGS_LOCK = threading.Lock()
+_PLUGIN_REFRESH_INTERVAL = 30.0  # seconds
+
+
 def _load_settings():
-    if SETTINGS_PATH.exists():
-        with open(SETTINGS_PATH) as f:
-            settings = json_mod.load(f)
-    else:
-        settings = dict(DEFAULT_SETTINGS)
-    # Refresh the plugins section from the live plugins/ directory so
-    # settings.json is always an accurate mirror of what's installed.
-    # IMPORTANT: the ``config`` slot inside each plugin entry is reserved
-    # for **user overrides** written by ``PATCH /api/settings/plugins/
-    # <name>/config`` (Phase 2B). We must therefore strip the on-disk
-    # ``config.json`` mirror that ``detect_installed_plugins()`` puts
-    # into that slot — otherwise the next call to ``_load_settings``
-    # would stomp anything the user just patched. The on-disk values
-    # are still available live via ``detect_installed_plugins()`` /
-    # ``load_plugin_config()``; we just don't *persist* them here.
-    try:
-        from apollo.projects.settings import detect_installed_plugins
-        detected = detect_installed_plugins()
-        existing = settings.get("plugins") or {}
-        new_plugins: dict = {}
-        for name, meta in detected.items():
-            entry = {k: v for k, v in meta.items() if k != "config"}
-            user_override = (existing.get(name) or {}).get("config")
-            if isinstance(user_override, dict) and user_override:
-                entry["config"] = user_override
-            new_plugins[name] = entry
-        if new_plugins != settings.get("plugins"):
-            settings["plugins"] = new_plugins
-            _save_settings(settings)
-    except Exception:
-        # Detection is best-effort; never block settings load on it.
-        pass
-    return settings
+    """Return the merged settings dict, with a small in-memory cache.
+
+    The caller treats this as cheap; the original implementation was a
+    full file read + JSON parse + plugin-directory walk + (sometimes)
+    file write on every call. We keep the same semantics but skip the
+    re-read when the file's ``mtime`` is unchanged, and skip the
+    plugin-detection refresh when the last refresh was recent.
+    """
+    import time as _time
+
+    with _SETTINGS_LOCK:
+        try:
+            mtime = SETTINGS_PATH.stat().st_mtime if SETTINGS_PATH.exists() else 0.0
+        except OSError:
+            mtime = 0.0
+
+        cache = _SETTINGS_CACHE
+        cached = cache["payload"]
+        if cached is not None and cache["mtime"] == mtime:
+            # Still need to occasionally refresh the plugins block, but
+            # rate-limit it so the common request path is just a dict copy.
+            now = _time.time()
+            if now - cache["plugin_check_at"] < _PLUGIN_REFRESH_INTERVAL:
+                # Hand back a shallow copy so callers that mutate don't
+                # corrupt the cache (matches old read-load-modify pattern).
+                return dict(cached)
+            cache["plugin_check_at"] = now
+            settings = dict(cached)
+        else:
+            if SETTINGS_PATH.exists():
+                with open(SETTINGS_PATH) as f:
+                    settings = json_mod.load(f)
+            else:
+                settings = dict(DEFAULT_SETTINGS)
+            cache["plugin_check_at"] = _time.time()
+
+        # Refresh the plugins section from the live plugins/ directory.
+        # The ``config`` slot inside each plugin entry is reserved for
+        # user overrides written by ``PATCH /api/settings/plugins/
+        # <name>/config``. We therefore strip the on-disk ``config.json``
+        # mirror that ``detect_installed_plugins`` puts there before
+        # comparing — otherwise this loader would stomp anything the
+        # user just patched.
+        try:
+            from apollo.projects.settings import detect_installed_plugins
+            detected = detect_installed_plugins()
+            existing = settings.get("plugins") or {}
+            new_plugins: dict = {}
+            for name, meta in detected.items():
+                entry = {k: v for k, v in meta.items() if k != "config"}
+                user_override = (existing.get(name) or {}).get("config")
+                if isinstance(user_override, dict) and user_override:
+                    entry["config"] = user_override
+                new_plugins[name] = entry
+            if new_plugins != settings.get("plugins"):
+                settings["plugins"] = new_plugins
+                _save_settings(settings)
+        except Exception:
+            # Detection is best-effort; never block settings load on it.
+            pass
+
+        # Update cache. We re-stat after a possible ``_save_settings``
+        # so the next call sees the new mtime and skips the read.
+        try:
+            cache["mtime"] = SETTINGS_PATH.stat().st_mtime if SETTINGS_PATH.exists() else 0.0
+        except OSError:
+            cache["mtime"] = 0.0
+        cache["payload"] = settings
+        return dict(settings)
 
 
 def _save_settings(settings):
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_PATH, "w") as f:
         json_mod.dump(settings, f, indent=2)
+    # Invalidate the cache so the next ``_load_settings`` re-reads from
+    # disk. Without this an immediately-following load would keep
+    # serving the pre-write payload until the cached mtime expired.
+    try:
+        _SETTINGS_CACHE["payload"] = None
+        _SETTINGS_CACHE["mtime"] = -1.0
+    except Exception:
+        pass
 
 
 def _record_last_project(path):
@@ -259,19 +314,172 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     # Initialize ProjectManager for project lifecycle management
     project_manager = ProjectManager(version=version)
 
+    # ── Per-project store resolution ────────────────────────────────
+    # The store passed into create_app is the *startup* store (typically
+    # the legacy global ``data/graph.json`` or ``data/graph.cblite2``).
+    # When the user opens a different project via /api/projects/open or
+    # the auto-restore path below, we swap to that project's per-project
+    # store living under ``<root>/_apollo/`` so each folder gets its own
+    # graph + database (the design users see in the dev-mode "delete
+    # database" tool). Without this swap the chat/search would keep
+    # answering against whichever store happened to be opened at startup
+    # regardless of the active project.
+    from pathlib import Path as _Path
+
+    def _resolve_project_store_location(project_path, project_backend: str) -> str:
+        """Return the per-project store path for the given project root."""
+        apollo_dir = _Path(project_path) / "_apollo"
+        if project_backend == "cblite":
+            # Reuse ProjectManager's hashing convention so the path matches
+            # what the manifest expects (and what reprocess()/leave() act on).
+            db_hash = project_manager._compute_db_hash(project_path)
+            return str(apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2")
+        return str(apollo_dir / "graph.json")
+
+    @app.get("/api/active-store")
+    def get_active_store():
+        """Diagnostic: report the currently-active store location/backend."""
+        loc = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
+        return {"backend": backend, "location": loc, "root_dir": root_dir}
+
+    def _swap_to_project_store(project_path) -> None:
+        """Close the active store and reopen the per-project store for
+        ``project_path``. Reloads the graph, rebuilds search, and refreshes
+        the chat service so subsequent chat/search/graph queries see the
+        new project. Called from ``/api/projects/open`` and the startup
+        auto-open path so opening an already-indexed project no longer
+        leaves the chat answering against the previous project's data.
+        """
+        nonlocal store, graph, q, search, chat_service, root_dir, backend, reindex_service
+
+        from apollo.storage import open_store as _open_store
+        from apollo.graph.query import GraphQuery as _GraphQuery
+        import networkx as _nx
+
+        project_path_str = str(_Path(project_path).resolve())
+
+        # Prefer the manifest's recorded backend (each project picks its
+        # own backend at init time); fall back to the startup backend.
+        target_backend = backend
+        try:
+            if (
+                project_manager.manifest
+                and project_manager.manifest.storage
+                and project_manager.manifest.storage.backend
+            ):
+                target_backend = project_manager.manifest.storage.backend
+        except Exception:
+            pass
+
+        new_location = _resolve_project_store_location(project_path_str, target_backend)
+        current_location = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
+        if (
+            current_location
+            and _Path(current_location).resolve() == _Path(new_location).resolve()
+            and target_backend == backend
+            and root_dir
+            and _Path(root_dir).resolve() == _Path(project_path_str).resolve()
+        ):
+            return  # Already pointing at this project's store.
+
+        # Close the previously-active store before swapping.
+        try:
+            if hasattr(store, "close"):
+                store.close()
+        except Exception:
+            logger.exception("failed to close previous store at %s", current_location)
+
+        _Path(new_location).parent.mkdir(parents=True, exist_ok=True)
+        new_store = _open_store(target_backend, new_location)
+        store = new_store
+        backend = target_backend
+        root_dir = project_path_str
+
+        # Load the graph from the new store. A brand-new project (no graph
+        # yet) should yield an empty graph instead of an exception.
+        include_embeddings = backend != "cblite"
+        try:
+            graph = new_store.load(include_embeddings=include_embeddings)
+        except FileNotFoundError:
+            graph = _nx.DiGraph()
+        except Exception:
+            logger.exception("failed to load graph from %s; starting empty", new_location)
+            graph = _nx.DiGraph()
+        q = _GraphQuery(graph)
+
+        # Rebuild the search index against the new store/graph. The
+        # embedder is a process-wide singleton so swapping projects costs
+        # only the search-index wrapper rebuild — not a fresh model load.
+        try:
+            from apollo.embeddings.embedder import get_shared_embedder as _shared
+            if backend == "cblite":
+                from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
+                search = CouchbaseLiteSemanticSearch(new_store, _shared())
+            else:
+                from apollo.search.semantic import SemanticSearch
+                search = SemanticSearch(graph, _shared())
+        except Exception:
+            logger.warning("search index unavailable for %s", project_path_str)
+            search = None
+
+        # Refresh chat_service references in place so any captured handle
+        # keeps working (mirrors the pattern in /api/index).
+        if chat_service is not None:
+            try:
+                chat_service.graph = graph
+                chat_service.search = search
+                chat_service.root_dir = root_dir
+                chat_service._query = None
+            except Exception:
+                logger.exception("failed to refresh chat_service after project swap")
+
+        # Re-bind the background reindex service to the new project so its
+        # sweeps target the right tree + store.
+        try:
+            if reindex_service is not None:
+                reindex_service = ReindexService(root_dir, new_store, reindex_service.config)
+            else:
+                reindex_service = ReindexService(
+                    root_dir,
+                    new_store,
+                    ReindexConfig(
+                        strategy="auto",
+                        sweep_interval_minutes=30,
+                        sweep_on_session_start=True,
+                        local_max_hops=1,
+                        force_full_after_runs=50,
+                    ),
+                )
+        except Exception:
+            logger.exception("failed to rebind reindex service after project swap")
+
+        logger.info(
+            "swapped active store: backend=%s location=%s nodes=%d",
+            backend, new_location, graph.number_of_nodes(),
+        )
+
     # Auto-open the project on startup so project-scoped features
     # (annotations, etc.) work without forcing the user to re-open the
     # folder via the UI after every restart. We try, in order:
     #   1) the directory the server was launched against (--watch-dir)
-    #   2) the path recorded in settings.json by the previous session
+    #   2) the path recorded in settings.json by the previous session,
+    #      but ONLY when the caller didn't explicitly pass a root_dir
+    #      (otherwise an explicit watch-dir without a manifest would get
+    #      silently overridden by the previous session's project, which
+    #      breaks tests/callers that pass a one-off root_dir).
     # Either path needs an `_apollo/apollo.json` manifest to count.
-    from pathlib import Path as _Path
-    _candidates = [p for p in (root_dir, _get_last_project()) if p]
+    if root_dir:
+        _candidates = [root_dir]
+    else:
+        _last = _get_last_project()
+        _candidates = [_last] if _last else []
+    _startup_project_opened = False
     for _candidate in _candidates:
         try:
             if (_Path(_candidate) / "_apollo" / "apollo.json").exists():
                 project_manager.open(_candidate)
                 _record_last_project(_candidate)
+                _startup_project_opened = _candidate
                 break
         except Exception:
             logger.exception("failed to auto-open project at startup for %s", _candidate)
@@ -345,20 +553,23 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     search: Optional[object] = None
     embedder = None
 
-    # Set up search backend
+    # Set up search backend. ``get_shared_embedder`` returns a process-wide
+    # singleton so the SentenceTransformer weights are loaded once per
+    # process — important because ``_swap_to_project_store`` re-runs this
+    # block whenever the user opens a different project.
     if backend == "cblite":
         try:
-            from apollo.embeddings.embedder import Embedder
+            from apollo.embeddings.embedder import get_shared_embedder
             from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-            embedder = Embedder()
+            embedder = get_shared_embedder()
             search = CouchbaseLiteSemanticSearch(store, embedder)
         except Exception:
             search = None
     else:
         try:
-            from apollo.embeddings.embedder import Embedder
+            from apollo.embeddings.embedder import get_shared_embedder
             from apollo.search.semantic import SemanticSearch
-            embedder = Embedder()
+            embedder = get_shared_embedder()
             search = SemanticSearch(graph, embedder)
         except Exception:
             search = None
@@ -463,8 +674,27 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 import logging
                 logging.warning(f"Failed to start reindex service: {e}")
 
+    # If a project was successfully auto-opened on startup, swap to its
+    # per-project store now (after graph/q/search/chat_service/reindex
+    # have all been initialized so the nonlocals in _swap_to_project_store
+    # have valid bindings to mutate).
+    if _startup_project_opened:
+        try:
+            _swap_to_project_store(_startup_project_opened)
+        except Exception:
+            logger.exception(
+                "failed to swap to per-project store at startup for %s",
+                _startup_project_opened,
+            )
+
     # ── Register project management routes ────────────────────────
-    register_project_routes(app, project_manager, store, backend, on_project_open=_record_last_project)
+    def _on_project_open(path):
+        # Persist last-opened path for next server start, then swap the
+        # active store/graph/search/chat to this project's _apollo/ data.
+        _record_last_project(path)
+        _swap_to_project_store(path)
+
+    register_project_routes(app, project_manager, store, backend, on_project_open=_on_project_open)
 
     # ------------------------------------------------------------------ API --
 
@@ -640,10 +870,30 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t1 = time.time()
             logger.info("indexing step 2/4: generating embeddings for %d nodes", n_nodes)
             try:
-                from apollo.embeddings import Embedder
-                emb = Embedder()
-                emb.embed_graph(graph)
-                logger.info("embeddings generated in %.2fs", time.time() - t1)
+                from apollo.embeddings.embedder import (
+                    extract_cache_from_graph,
+                    get_shared_embedder,
+                )
+                # Reuse the previously-active graph's vectors keyed by
+                # content hash. After ``builder.build()`` rebuilt ``graph``
+                # the local ``self.graph`` reference here is the *new*
+                # graph, but the previously loaded ``store`` still holds
+                # the old in-memory copy via the chat_service / search
+                # references. We pull from the most recently saved store
+                # to populate the cache so unchanged nodes don't pay the
+                # SentenceTransformer encode cost again.
+                prev_cache: dict = {}
+                try:
+                    prev_graph = store.load()
+                    prev_cache = extract_cache_from_graph(prev_graph)
+                except Exception:
+                    prev_cache = {}
+                emb = get_shared_embedder()
+                emb.embed_graph(graph, prev_cache=prev_cache)
+                logger.info(
+                    "embeddings generated in %.2fs (reused %d cached)",
+                    time.time() - t1, len(prev_cache),
+                )
             except Exception:
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
@@ -663,17 +913,38 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t3 = time.time()
             logger.info("indexing step 4/4: rebuilding search index (backend=%s)", backend)
             try:
+                from apollo.embeddings.embedder import get_shared_embedder as _shared
                 if backend == "cblite":
                     from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                    from apollo.embeddings.embedder import Embedder as Emb
-                    search = CouchbaseLiteSemanticSearch(store, Emb())
+                    search = CouchbaseLiteSemanticSearch(store, _shared())
                 else:
                     from apollo.search.semantic import SemanticSearch
-                    from apollo.embeddings.embedder import Embedder as Emb
-                    search = SemanticSearch(graph, Emb())
+                    search = SemanticSearch(graph, _shared())
                 logger.info("search index ready in %.2fs", time.time() - t3)
             except Exception:
                 logger.warning("search index unavailable after %.2fs", time.time() - t3)
+
+            # Refresh ChatService's references so its tools see the new
+            # project. ChatService is constructed once during create_app()
+            # with the *initial* graph / root_dir; without this mutation
+            # the chat would keep answering against the previous project's
+            # graph after the user opened or re-indexed a different folder
+            # (root cause of the stale "no such file" / wrong-stats bug).
+            # We mutate the existing instance instead of reassigning so
+            # any in-flight WebSocket / HTTP handler that already captured
+            # `chat_service` keeps working.
+            if chat_service is not None:
+                try:
+                    chat_service.graph = graph
+                    chat_service.search = search
+                    chat_service.root_dir = target
+                    chat_service._query = None  # force lazy GraphQuery rebuild
+                    logger.info(
+                        "chat service refreshed: root=%s nodes=%d",
+                        target, graph.number_of_nodes(),
+                    )
+                except Exception:
+                    logger.exception("failed to refresh chat_service after indexing")
 
             total = time.time() - t0
             logger.info(
@@ -1288,6 +1559,75 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             regex=bool(body.get("regex", True)),
         )
 
+    # ── Phase 8: file-shaped tools (declarations / usages / outline) ──
+
+    @app.get("/api/files/declarations")
+    def api_files_declarations(
+        path: str = Query(...),
+        kinds: Optional[str] = Query(
+            None,
+            description="Comma-separated list of declaration kinds to include.",
+        ),
+        limit: int = Query(200, ge=1, le=500),
+    ):
+        from apollo.chat import local_tools
+        kinds_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        return _file_inspect_call(
+            local_tools.list_declarations,
+            graph, root_dir, path,
+            kinds=kinds_list, limit=limit,
+        )
+
+    @app.get("/api/files/usages")
+    def api_files_usages(
+        path: str = Query(...),
+        symbol: Optional[str] = Query(
+            None,
+            description="Single symbol name. Use this OR `symbols`.",
+        ),
+        symbols: Optional[str] = Query(
+            None,
+            description="Comma-separated list of symbol names (batch mode, "
+                        "max 20). Reads the file once and returns "
+                        "`results: [{symbol, usages, count}, …]`.",
+        ),
+        kinds: Optional[str] = Query(
+            None,
+            description="Comma-separated list of usage kinds to include "
+                        "(declaration, read, write, call, comment, string).",
+        ),
+    ):
+        from apollo.chat import local_tools
+        if not symbol and not symbols:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either `symbol` or `symbols`.",
+            )
+        kinds_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        symbols_list = (
+            [s.strip() for s in symbols.split(",") if s.strip()]
+            if symbols else None
+        )
+        return _file_inspect_call(
+            local_tools.find_symbol_usages,
+            graph, root_dir, path,
+            symbol=symbol,
+            symbols=symbols_list,
+            kinds=kinds_list,
+        )
+
+    @app.get("/api/files/outline")
+    def api_files_outline(
+        path: str = Query(...),
+        depth: int = Query(2, ge=0, le=6),
+    ):
+        from apollo.chat import local_tools
+        return _file_inspect_call(
+            local_tools.outline_file,
+            graph, root_dir, path, depth=depth,
+        )
+
     @app.get("/api/wordcloud")
     def wordcloud(
         path: Optional[str] = Query(None),
@@ -1302,23 +1642,38 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
           - relevant : top 100, strength >= 2 (compact "Show More" view)
           - all      : everything, capped at 500 (full "show every relationship")
         """
-        strengths: dict[str, float] = defaultdict(float)
-        counts: dict[str, int] = defaultdict(int)
-        for nid, data in graph.nodes(data=True):
-            ntype = data.get("type", "")
-            if ntype in EXCLUDE_TYPES_WORDCLOUD:
-                continue
-            if path and not data.get("path", "").startswith(path):
-                continue
-            name = data.get("name", "")
-            if not name:
-                continue
-            try:
-                deg = graph.degree(nid)
-            except Exception:
-                deg = 0
-            strengths[name] += deg
-            counts[name] += 1
+        # Unfiltered ``path is None`` calls hit a cached aggregate built
+        # by ``apollo.graph.indices`` — repeated wordcloud requests
+        # against an unchanged graph reuse the same dict. The
+        # path-filtered case still walks because the filter changes the
+        # answer per-call.
+        if not path:
+            from apollo.graph.indices import get_indices
+            cached_strengths, cached_counts = get_indices(graph).wordcloud(
+                frozenset(EXCLUDE_TYPES_WORDCLOUD)
+            )
+            strengths = cached_strengths
+            counts = cached_counts
+        else:
+            strengths_d: dict[str, float] = defaultdict(float)
+            counts_d: dict[str, int] = defaultdict(int)
+            for nid, data in graph.nodes(data=True):
+                ntype = data.get("type", "")
+                if ntype in EXCLUDE_TYPES_WORDCLOUD:
+                    continue
+                if not data.get("path", "").startswith(path):
+                    continue
+                name = data.get("name", "")
+                if not name:
+                    continue
+                try:
+                    deg = graph.degree(nid)
+                except Exception:
+                    deg = 0
+                strengths_d[name] += deg
+                counts_d[name] += 1
+            strengths = dict(strengths_d)
+            counts = dict(counts_d)
 
         items = [
             {"name": n, "value": float(strengths[n]), "count": counts[n]}
@@ -1348,7 +1703,16 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         }
 
     @app.get("/api/tree")
-    def tree():
+    def tree(
+        depth: Optional[int] = Query(None, description="Maximum tree depth from root (0-indexed). When omitted the full tree is returned."),
+        glob: Optional[str] = Query(None, description="Optional fnmatch pattern (e.g. '*.py') applied to file paths; non-matching files are dropped, directories are kept."),
+    ):
+        # Resolves the §7.3 known follow-up from PLAN_MORE_LOCAL_AI_FUNCTIONS.md:
+        # honour `depth` and `glob` query params on the human-facing /api/tree
+        # endpoint so it stays in parity with the AI `get_directory_tree` tool.
+        # When both params are omitted, behaviour is unchanged.
+        import fnmatch as _fnmatch
+
         dir_nodes: dict[str, dict] = {}
         file_nodes: dict[str, dict] = {}
 
@@ -1391,6 +1755,42 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             if nid not in child_ids:
                 roots.append(node)
 
+        # Apply optional `depth` cap. depth=0 returns roots only with no children.
+        if depth is not None:
+            try:
+                max_depth = max(0, int(depth))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="`depth` must be an integer >= 0")
+
+            def _trim(node: dict, current: int) -> None:
+                if current >= max_depth:
+                    node["children"] = []
+                    return
+                for child in node["children"]:
+                    _trim(child, current + 1)
+
+            for r in roots:
+                _trim(r, 0)
+
+        # Apply optional `glob` filter on file paths. Empty directories are
+        # left in place — callers can collapse client-side if they want.
+        if glob:
+            pattern = glob
+
+            def _filter(node: dict) -> None:
+                kept: list[dict] = []
+                for child in node["children"]:
+                    if child.get("type") == "file":
+                        if _fnmatch.fnmatch(child.get("path") or "", pattern):
+                            kept.append(child)
+                    else:
+                        _filter(child)
+                        kept.append(child)
+                node["children"] = kept
+
+            for r in roots:
+                _filter(r)
+
         if len(roots) == 1:
             return roots[0]
         return {"name": "root", "path": "", "type": "directory", "children": roots}
@@ -1398,6 +1798,153 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     @app.get("/api/stats")
     def stats():
         return q.stats()
+
+    # ── PLAN_MORE_LOCAL_AI_FUNCTIONS endpoints ─────────────────────────
+    # Mirror the new chat-agent tools as HTTP endpoints so the human-facing
+    # UI has parity with the AI's view (per plan §0 rule 5).
+
+    @app.post("/api/nodes/batch")
+    async def api_nodes_batch(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        ids = body.get("ids") or body.get("node_ids") or []
+        if not isinstance(ids, list):
+            raise HTTPException(status_code=400, detail="`ids` must be a list")
+        include_source = bool(body.get("include_source", True))
+        include_edges = bool(body.get("include_edges", True))
+        # Opt-in: when the active backend is Couchbase Lite the caller
+        # can ask for parallel CBL document gets (asyncio.to_thread +
+        # gather) instead of the in-memory NetworkX path. CBL queries
+        # are single-threaded; using the async fan-out keeps the event
+        # loop free while the per-doc gets run on worker threads.
+        use_cbl = bool(body.get("use_cbl", False)) and backend == "cblite"
+        if use_cbl:
+            return await local_tools.abatch_get_nodes(
+                graph, ids,
+                include_source=include_source,
+                include_edges=include_edges,
+                cbl_store=store,
+            )
+        return local_tools.batch_get_nodes(
+            graph, ids,
+            include_source=include_source,
+            include_edges=include_edges,
+        )
+
+    @app.post("/api/files/sections")
+    async def api_files_sections(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        ranges = body.get("ranges") or []
+        if not isinstance(ranges, list):
+            raise HTTPException(status_code=400, detail="`ranges` must be a list")
+        return local_tools.batch_file_sections(graph, root_dir, ranges)
+
+    @app.get("/api/stats/detailed")
+    def api_stats_detailed(
+        top_n: int = Query(20, ge=1, le=50),
+        group: str = Query("dir", pattern="^(dir|lang|ext)$"),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.project_stats_detailed(graph, top_n=top_n, group=group)
+
+    @app.get("/api/paths")
+    def api_paths(
+        start: str = Query(...),
+        end: str = Query(...),
+        max_length: int = Query(5, ge=1, le=8),
+        max_paths: int = Query(5, ge=1, le=20),
+        edge_types: Optional[str] = Query(None, description="Comma-separated edge types"),
+        shortest_only: bool = Query(False),
+    ):
+        from apollo.chat import local_tools
+        et = [t.strip() for t in edge_types.split(",")] if edge_types else None
+        return local_tools.get_paths_between(
+            graph, start, end,
+            max_length=max_length, max_paths=max_paths,
+            edge_types=et, shortest_only=shortest_only,
+        )
+
+    @app.post("/api/subgraph")
+    async def api_subgraph(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        return local_tools.get_subgraph(
+            graph,
+            seed_node_ids=body.get("seed_node_ids") or [],
+            depth=int(body.get("depth", 1) or 1),
+            edge_types=body.get("edge_types"),
+            max_nodes=int(body.get("max_nodes", 200) or 200),
+        )
+
+    @app.get("/api/inheritance/{class_id:path}")
+    def api_inheritance(class_id: str, include_methods: bool = Query(False)):
+        from apollo.chat import local_tools
+        return local_tools.get_inheritance_tree(
+            graph, class_id, include_methods=include_methods,
+        )
+
+    @app.get("/api/imports/{file_id:path}")
+    def api_transitive_imports(
+        file_id: str,
+        direction: str = Query("in", pattern="^(in|out|both)$"),
+        max_depth: int = Query(5, ge=1, le=10),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_transitive_imports(
+            graph, file_id, direction=direction, max_depth=max_depth,
+        )
+
+    @app.get("/api/metrics")
+    def api_metrics(
+        top_n: int = Query(20, ge=1, le=100),
+        sort_by: str = Query("complexity", pattern="^(complexity|loc|param_count)$"),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_code_metrics(graph, top_n=top_n, sort_by=sort_by)
+
+    @app.post("/api/signature/search")
+    async def api_signature_search(request: Request):
+        from apollo.chat import local_tools
+        body = await request.json()
+        return local_tools.search_graph_by_signature(
+            graph,
+            param_names=body.get("param_names"),
+            param_annotations=body.get("param_annotations"),
+            signature_hash=body.get("signature_hash"),
+            fuzzy=bool(body.get("fuzzy", False)),
+            top=int(body.get("top", 20) or 20),
+        )
+
+    @app.get("/api/tests/{node_id:path}")
+    def api_test_correspondents(
+        node_id: str,
+        include_heuristic: bool = Query(True),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.find_test_correspondents(
+            graph, node_id, include_heuristic=include_heuristic,
+        )
+
+    @app.get("/api/entry-points")
+    def api_entry_points(kinds: Optional[str] = Query(None)):
+        from apollo.chat import local_tools
+        kk = [k.strip() for k in kinds.split(",")] if kinds else None
+        return local_tools.detect_entry_points(graph, kinds=kk)
+
+    @app.get("/api/git/blame")
+    def api_git_blame(
+        path: str = Query(...),
+        name: Optional[str] = Query(None),
+        line_start: Optional[int] = Query(None),
+        line_end: Optional[int] = Query(None),
+        limit: int = Query(10, ge=1, le=30),
+    ):
+        from apollo.chat import local_tools
+        return local_tools.get_git_context(
+            graph, root_dir, path,
+            name=name, line_start=line_start, line_end=line_end, limit=limit,
+        )
 
     # -------------------------------------------------------------- Logging --
 
@@ -1928,11 +2475,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if watch_dir is None:
             raise HTTPException(status_code=400, detail="No root directory configured")
 
-        # Set up embedder for live re-embedding
+        # Set up embedder for live re-embedding (singleton — model already
+        # loaded once at startup, so this is just a dict lookup).
         live_embedder = None
         try:
-            from apollo.embeddings.embedder import Embedder
-            live_embedder = Embedder()
+            from apollo.embeddings.embedder import get_shared_embedder
+            live_embedder = get_shared_embedder()
         except Exception:
             pass
 
@@ -1946,13 +2494,33 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         )
         watcher.start()
 
-        # Persist updated graph on each change
+        # Persist updated graph after watcher events. The previous
+        # implementation called ``store.save(graph)`` synchronously on
+        # *every* event batch, which means a full file rewrite of
+        # graph.json(.gz) per file save. Even on a 50k-node project this
+        # is hundreds of milliseconds of disk I/O for a one-character
+        # edit. We debounce instead so multiple events within the window
+        # collapse into one rewrite.
         original_on_update = watcher.on_update
-        def _on_update_and_save(update):
+        save_state = {"timer": None}
+        save_lock = threading.Lock()
+        SAVE_DEBOUNCE_SECONDS = 5.0
+
+        def _do_save():
             try:
                 store.save(graph)
             except Exception:
-                pass
+                logger.exception("debounced graph save failed")
+
+        def _on_update_and_save(update):
+            with save_lock:
+                t = save_state.get("timer")
+                if t is not None:
+                    t.cancel()
+                t = threading.Timer(SAVE_DEBOUNCE_SECONDS, _do_save)
+                t.daemon = True
+                save_state["timer"] = t
+                t.start()
             if original_on_update:
                 original_on_update(update)
         watcher.on_update = _on_update_and_save

@@ -35,3 +35,23 @@ Thumbs.db
 _dev_only/
 *.log
 _apollo*
+data/index.json
+
+# User-local Apollo state in data/ (created at runtime; user-specific
+# absolute paths and last-opened-project pointers must not be committed).
+data/settings.json
+data/_apollo/
+data/_apollo_web/
+data/logs/
+
+# Couchbase Lite databases (per-project + global). The .cblite2 directory
+# can grow to many MB; never commit it.
+*.cblite2
+*.cblite2/
+*.cblite2-shm
+*.cblite2-wal
+*.cblite2-journal
+
+# Local test/demo projects that aren't part of the repo
+sg-completed-requests/
+sg-log-reader-demo/

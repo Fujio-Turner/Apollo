@@ -128,6 +128,7 @@ Every endpoint belongs to exactly one tag. Tags group endpoints in the docs UI a
 | Chat | `/api/chat*` | AI chat, threads, history |
 | Images | `/api/image/*` | Image generation |
 | Watch | `/api/watch/*` | File watcher status and control |
+| Git | `/api/git/*` | Read-only git introspection (blame, recent commits) — degrades to `{git_available: false}` cleanly |
 | Realtime | `/ws` | WebSocket channel for live graph updates |
 
 When adding a new endpoint, assign it to an existing tag. If none fit, add a new tag entry to both the `tags:` list in `openapi.yaml` and the table above.

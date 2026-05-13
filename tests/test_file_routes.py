@@ -183,3 +183,71 @@ def test_error_responses_use_standard_envelope(client):
     assert "code" in body["error"]
     assert "message" in body["error"]
     assert body["status_code"] == 403
+
+
+# ── Phase 8: /api/files/outline, /api/files/declarations, /api/files/usages ─
+
+
+def test_outline_route_returns_uniform_array(client):
+    # File is in the graph but has no defines edges in this fixture, so
+    # outline returns empty rows and accuracy='none' — but the route shape
+    # must be valid + uniform.
+    resp = client.get("/api/files/outline", params={"path": "pkg/calc.py"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "outline" in body and "accuracy" in body
+    if body["outline"]:
+        keys = {tuple(sorted(e.keys())) for e in body["outline"]}
+        assert len(keys) == 1
+
+
+def test_declarations_route_finds_python_defs_via_regex(client):
+    # The fixture has no function nodes, so list_declarations falls back
+    # to its regex pass — which still surfaces `def add(...)` and `class Calculator`.
+    resp = client.get("/api/files/declarations", params={"path": "pkg/calc.py"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    names = {d["name"] for d in body["declarations"]}
+    assert "add" in names
+    assert "Calculator" in names
+    # Uniform shape — TOON-friendly.
+    keys = {tuple(sorted(d.keys())) for d in body["declarations"]}
+    assert len(keys) == 1
+
+
+def test_usages_route_classifies_lines(client):
+    resp = client.get(
+        "/api/files/usages",
+        params={"path": "pkg/calc.py", "symbol": "add"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert any(u["kind"] == "declaration" and u["line_no"] >= 1
+               for u in body["usages"])
+
+
+def test_usages_route_requires_symbol(client):
+    """When neither `symbol` nor `symbols` is given, the route 400s.
+
+    Both params are optional individually (so callers can pick the
+    single-symbol or batch shape), but at least one is required.
+    """
+    resp = client.get("/api/files/usages", params={"path": "pkg/calc.py"})
+    assert resp.status_code == 400
+
+
+def test_usages_route_batch_mode(client):
+    """`symbols=a,b` triggers batch mode and returns the `results[]` shape."""
+    resp = client.get(
+        "/api/files/usages",
+        params={"path": "pkg/calc.py", "symbols": "add,Calculator"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "results" in data
+    assert {r["symbol"] for r in data["results"]} == {"add", "Calculator"}
+    assert "total" in data
+    # `add` appears at least as a declaration; `Calculator` appears as a class decl.
+    by_sym = {r["symbol"]: r for r in data["results"]}
+    assert by_sym["add"]["count"] >= 1
+    assert by_sym["Calculator"]["count"] >= 1

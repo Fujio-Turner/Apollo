@@ -44,6 +44,32 @@ class TestGraphQuery:
         results = query.find("nonexistent_function")
         
         assert len(results) == 0
+
+    def test_find_with_comma_separated_type_filter(self, test_graph_data):
+        """`node_type` accepts a comma-separated list (issue #2)."""
+        query = GraphQuery(test_graph_data)
+        results = query.find("", node_type="function,class")
+
+        types = sorted({r["type"] for r in results})
+        assert types == ["class", "function"]
+        # All 2 functions + 1 class — but no method node.
+        assert all(r["type"] != "method" for r in results)
+
+    def test_find_with_list_type_filter(self, test_graph_data):
+        """`node_type` accepts a list of strings."""
+        query = GraphQuery(test_graph_data)
+        results = query.find("", node_type=["function", "method"])
+
+        types = sorted({r["type"] for r in results})
+        assert types == ["function", "method"]
+
+    def test_find_with_whitespace_padded_types(self, test_graph_data):
+        """Whitespace around comma-separated types is tolerated."""
+        query = GraphQuery(test_graph_data)
+        results = query.find("", node_type=" function , class ")
+
+        types = sorted({r["type"] for r in results})
+        assert types == ["class", "function"]
     
     def test_stats(self, test_graph_data):
         """Test getting graph statistics."""

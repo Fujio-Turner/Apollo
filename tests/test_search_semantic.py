@@ -66,6 +66,18 @@ class TestSemanticSearchSearch:
         assert all(r["type"] == "class" for r in results)
         assert {r["id"] for r in results} == {"b"}
 
+    def test_filter_by_comma_separated_node_types(self, graph_with_embeddings):
+        """`node_type` accepts a comma-separated list of types (issue #2)."""
+        s = SemanticSearch(graph_with_embeddings, FakeEmbedder())
+        results = s.search("anything", top_k=10, node_type="class,function")
+        assert {r["id"] for r in results} == {"a", "b", "c"}
+
+    def test_filter_by_node_type_list(self, graph_with_embeddings):
+        """`node_type` accepts a list of strings."""
+        s = SemanticSearch(graph_with_embeddings, FakeEmbedder())
+        results = s.search("anything", top_k=10, node_type=["class", "function"])
+        assert {r["id"] for r in results} == {"a", "b", "c"}
+
     def test_results_sorted_by_score_desc(self, graph_with_embeddings):
         s = SemanticSearch(graph_with_embeddings, FakeEmbedder())
         results = s.search("alpha", top_k=10)

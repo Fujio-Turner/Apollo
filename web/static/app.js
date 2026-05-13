@@ -71,22 +71,32 @@ function graphCacheSet(url, data) { _graphCache.set(url, { data, ts: Date.now() 
 function graphCacheClear() { _graphCache.clear(); }
 
 /* ── Theme ─────────────────────────────────────────────────────── */
+/* Swap the highlight.js stylesheet to match the active daisyUI theme.
+   GitHub Light/Dark were chosen over atom-one-* because atom-one's
+   string color is a low-contrast lime-green that disappears on the
+   chat bubble's translucent grey wash. The matcher accepts either
+   the legacy `atom-one-*` link or any `highlightjs` link so this
+   keeps working through hard refreshes after theme upgrades. */
+function syncHljsTheme(theme) {
+  let hlLink = document.querySelector('link[href*="highlightjs"]')
+            || document.querySelector('link[href*="atom-one"]');
+  if (!hlLink) {
+    hlLink = document.createElement('link');
+    hlLink.rel = 'stylesheet';
+    document.head.appendChild(hlLink);
+  }
+  hlLink.href = theme === 'dark'
+    ? 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css'
+    : 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css';
+}
+
 function toggleTheme() {
   const html = document.documentElement;
   const isDark = html.getAttribute('data-theme') === 'dark';
   const newTheme = isDark ? 'light' : 'dark';
   html.setAttribute('data-theme', newTheme);
   
-  // Swap highlight.js CSS for light/dark code block themes
-  let hlLink = document.querySelector('link[href*="atom-one"]');
-  if (!hlLink) {
-    hlLink = document.createElement('link');
-    hlLink.rel = 'stylesheet';
-    document.head.appendChild(hlLink);
-  }
-  hlLink.href = newTheme === 'dark'
-    ? 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-dark.min.css'
-    : 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css';
+  syncHljsTheme(newTheme);
   
   document.getElementById('theme-icon-moon').classList.toggle('hidden', !isDark);
   document.getElementById('theme-icon-sun').classList.toggle('hidden', isDark);
@@ -2358,17 +2368,45 @@ async function showWelcomePanel() {
 
     <div id="hub-pane-main" data-hub-pane="main">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="md-content">
-          <h2>My Hub</h2>
-          <p>Explore your codebase as an interactive graph. Click any node to inspect its source code, connections, and relationships.</p>
-          <h3>Quick Start</h3>
-          <ul>
-            <li><strong>My Files</strong> &mdash; index a folder to build the graph</li>
-            <li><strong>AI Chat</strong> &mdash; type a question; add <code>find:</code> for graph-only search or <code>chat:</code> for plain chat</li>
-            <li><strong>Click a node</strong> &mdash; view source and connections</li>
-            <li><strong>Click empty space</strong> &mdash; reset the view</li>
-            <li><strong>Depth slider</strong> &mdash; control how many nodes are shown</li>
-            <li><strong>Highlight text</strong> in a node detail panel to save a highlight or note; click ★ to bookmark a node</li>
+        <div class="hub-welcome">
+          <div class="hub-hero">
+            <div class="hub-hero-icon">🛰️</div>
+            <div>
+              <h2 class="hub-title">My Hub</h2>
+              <p class="hub-subtitle">Explore your codebase as an <span class="hub-accent">interactive graph</span>. Click any node to inspect its source, connections, and relationships.</p>
+            </div>
+          </div>
+
+          <div class="hub-section-label">
+            <span class="hub-section-dot"></span>
+            <span>Quick Start</span>
+          </div>
+
+          <ul class="hub-quickstart">
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-files">📁 My Files</span>
+              <span class="hub-qs-text">Index a folder to build the graph.</span>
+            </li>
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-chat">💬 AI Chat</span>
+              <span class="hub-qs-text">Ask a question — prefix <code class="hub-code">find:</code> for graph-only search or <code class="hub-code">chat:</code> for plain chat.</span>
+            </li>
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-click">🖱️ Click a node</span>
+              <span class="hub-qs-text">View its source and connections in the side panel.</span>
+            </li>
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-reset">✦ Empty space</span>
+              <span class="hub-qs-text">Click the canvas background to reset the view.</span>
+            </li>
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-depth">🎚️ Depth</span>
+              <span class="hub-qs-text">Use the slider to control how many nodes are shown.</span>
+            </li>
+            <li class="hub-qs-item">
+              <span class="hub-badge hub-badge-note">🖍️ Highlight</span>
+              <span class="hub-qs-text">Select text in a node panel to save a note; click <span class="hub-star">★</span> to bookmark a node.</span>
+            </li>
           </ul>
         </div>
         <div>
@@ -2775,11 +2813,20 @@ function _ensureTracePanel(bubble) {
   panel.className = 'chat-trace text-[10px]';
   panel.dataset.expanded = '0';
   panel.dataset.forBubble = wrapper.dataset.bubbleId;
+  // Header row carries the toggle on the left and a Copy button on the
+  // right (hidden until the panel is expanded so it doesn't clutter the
+  // collapsed strip). The body sits below and stretches the full width.
   panel.innerHTML =
-    '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
-    '<span class="chat-trace-caret">▸</span>' +
-    '<span class="chat-trace-summary">Trace</span>' +
-    '</button>' +
+    '<div class="chat-trace-header flex items-center justify-between gap-2">' +
+      '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
+        '<span class="chat-trace-caret">▸</span>' +
+        '<span class="chat-trace-summary">Trace</span>' +
+      '</button>' +
+      '<button type="button" class="chat-trace-copy btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 hidden" title="Copy trace to clipboard" aria-label="Copy trace to clipboard">' +
+        '<span class="chat-trace-copy-icon">📋</span>' +
+        '<span class="chat-trace-copy-label">Copy</span>' +
+      '</button>' +
+    '</div>' +
     '<div class="chat-trace-body hidden"></div>';
   parent.insertBefore(panel, wrapper.nextSibling);
   panel.querySelector('.chat-trace-toggle').addEventListener('click', () => {
@@ -2788,8 +2835,107 @@ function _ensureTracePanel(bubble) {
     panel.querySelector('.chat-trace-toggle').setAttribute('aria-expanded', expanded ? 'false' : 'true');
     panel.querySelector('.chat-trace-caret').textContent = expanded ? '▸' : '▾';
     panel.querySelector('.chat-trace-body').classList.toggle('hidden', expanded);
+    // Show Copy only while the trace is open AND we actually have steps.
+    const copyBtn = panel.querySelector('.chat-trace-copy');
+    const hasSteps = !!panel.dataset.steps;
+    copyBtn.classList.toggle('hidden', expanded || !hasSteps);
+  });
+  panel.querySelector('.chat-trace-copy').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    let steps = [];
+    try { steps = JSON.parse(panel.dataset.steps || '[]'); } catch { steps = []; }
+    const text = _traceToText(steps);
+    const btn = panel.querySelector('.chat-trace-copy');
+    const label = btn.querySelector('.chat-trace-copy-label');
+    const original = label.textContent;
+    try {
+      await _copyTextToClipboard(text);
+      label.textContent = 'Copied';
+      btn.classList.add('text-success');
+    } catch {
+      label.textContent = 'Copy failed';
+      btn.classList.add('text-error');
+    }
+    setTimeout(() => {
+      label.textContent = original;
+      btn.classList.remove('text-success', 'text-error');
+    }, 1500);
   });
   return panel;
+}
+
+/* Convert the structured trace steps back into a plain-text rendering
+   that mirrors what the user sees on screen (icons + summary lines).
+   Used by the Copy-trace button so users can paste a trace into a bug
+   report or another chat. */
+function _traceToText(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return '';
+  const stripTags = (v) => String(v == null ? '' : v).replace(/<[^>]*>/g, '');
+  const lines = [];
+  for (const s of steps) {
+    const ph = s.phase || '';
+    let icon = '·';
+    let line = ph;
+    if (ph === 'request') {
+      icon = '➤';
+      const ctx = s.context_node ? ` ctx=${s.context_node}` : '';
+      const hist = s.history_len ? ` hist=${s.history_len}` : '';
+      line = `request ${s.provider}/${s.model}${ctx}${hist}`;
+    } else if (ph === 'round') {
+      icon = '↻';
+      line = `round ${s.round} finish=${s.finish} ${s.dt}s · ${s.tool_calls} tc`;
+    } else if (ph === 'tool_call') {
+      icon = '🔧';
+      line = `${s.name} ${s.args_preview || ''}`.trimEnd();
+    } else if (ph === 'tool_return') {
+      icon = '↩';
+      const toonTag = (s.toon_bytes != null && s.toon_saved_pct != null)
+        ? ` · toon ${s.toon_bytes} B (-${s.toon_saved_pct}%)`
+        : '';
+      line = `${s.name} → ${s.bytes} B · ${s.dt}s${toonTag}`;
+      if (s.preview) line += `\n${s.preview}`;
+    } else if (ph === 'return_result') {
+      icon = '✓';
+      const files = (s.files || []).length;
+      const refs = (s.node_refs || []).length;
+      line = `return_result ${files} file${files === 1 ? '' : 's'} · ${refs} ref${refs === 1 ? '' : 's'} · ${s.confidence || '—'} · ${s.total_dt}s`;
+    } else if (ph === 'stream_begin') {
+      icon = '✎';
+      line = `stream begin elapsed=${s.elapsed}s`;
+    } else if (ph === 'done') {
+      icon = '●';
+      const tok = s.tokens != null ? `${s.tokens} tok · ` : '';
+      const by = s.bytes != null ? `${s.bytes} B · ` : '';
+      line = `done reason=${s.reason} ${tok}${by}${s.total_dt}s`;
+    } else if (ph === 'rounds_exhausted') {
+      icon = '⚠';
+      line = `rounds exhausted last=${s.last_finish}`;
+    } else if (ph === 'error') {
+      icon = '✗';
+      line = `error in ${s.where}: ${s.message}`;
+    }
+    lines.push(`${icon} ${stripTags(line)}`);
+  }
+  return lines.join('\n');
+}
+
+/* Copy text to the clipboard with a textarea fallback for non-secure
+   contexts where navigator.clipboard is unavailable. */
+async function _copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('execCommand copy failed');
+  } finally {
+    document.body.removeChild(ta);
+  }
 }
 
 function _renderTracePanel(panel, steps) {
@@ -2807,6 +2953,18 @@ function _renderTracePanel(panel, steps) {
 
   const body = panel.querySelector('.chat-trace-body');
   body.innerHTML = steps.map(_traceRowHtml).join('');
+
+  // Stash the raw steps so the Copy button can re-serialize them as
+  // plain text when clicked. Reveal the Copy button if the panel is
+  // currently expanded — the toggle handler already syncs visibility
+  // on user-driven open/close, this just keeps it in sync as new
+  // steps stream in.
+  panel.dataset.steps = JSON.stringify(steps);
+  const copyBtn = panel.querySelector('.chat-trace-copy');
+  if (copyBtn) {
+    const expanded = panel.dataset.expanded === '1';
+    copyBtn.classList.toggle('hidden', !expanded || steps.length === 0);
+  }
 }
 
 function _traceRowHtml(s) {
@@ -2924,7 +3082,21 @@ async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
       if (raw === '[DONE]') { tDone = true; return 'done'; }
       if (raw.startsWith('[ERROR]')) {
         console.error('[chat] server error frame:', raw);
-        ad.innerHTML = `<span class="text-error">${raw}</span>`;
+        // Prefer the classified user_message + toast captured from the
+        // most recent error STEP (set below); fall back to the raw frame.
+        const errStep = steps.slice().reverse().find(s => s.phase === 'error');
+        const friendly = errStep && errStep.user_message
+          ? errStep.user_message
+          : raw.replace(/^\[ERROR\]\s*/, '');
+        ad.innerHTML = `<span class="text-error">${escapeHtml(friendly)}</span>`;
+        // Toast type by error_kind so a network blip looks different from
+        // an auth failure or a rate-limit cool-down.
+        const toastType = errStep && errStep.error_kind === 'auth_error'
+          ? 'warning'
+          : errStep && errStep.error_kind === 'rate_limit'
+          ? 'warning'
+          : 'error';
+        showToast(friendly, toastType);
         return 'error';
       }
       if (raw.startsWith('[STEP] ')) {
@@ -2932,6 +3104,14 @@ async function _streamAssistantResponse(msg, ad, historyForCall, signal) {
           const ev = JSON.parse(raw.slice(7));
           steps.push(ev);
           _renderTracePanel(trace, steps);
+          // If the model layer classified an error, surface it immediately
+          // — the [ERROR] frame that follows will reuse the same message.
+          if (ev.phase === 'error' && ev.user_message) {
+            const toastType = ev.error_kind === 'auth_error' ? 'warning'
+              : ev.error_kind === 'rate_limit' ? 'warning'
+              : 'error';
+            showToast(ev.user_message, toastType);
+          }
         } catch (e) {
           console.warn('[chat] bad STEP frame:', raw, e);
         }
@@ -3917,6 +4097,10 @@ async function saveSettings() {
       // Apply theme immediately so user sees the change.
       if (extra.appearance?.theme) {
         document.documentElement.setAttribute('data-theme', extra.appearance.theme);
+        // Also swap the highlight.js stylesheet — without this, code
+        // blocks keep the old theme's colors (e.g. dark-theme cyan
+        // strings on a light bubble) and become unreadable.
+        syncHljsTheme(extra.appearance.theme);
       }
       await loadSettings();   // refresh masked keys / status badges
       checkChatStatus();

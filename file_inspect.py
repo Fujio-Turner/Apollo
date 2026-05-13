@@ -453,6 +453,75 @@ def _compile_pattern(pattern: str, regex: bool) -> re.Pattern:
         raise FileAccessError(f"Invalid regex: {e}", status_code=400)
 
 
+# ── Shared text classifier (Phase 8 §8.10 — re-used by find_symbol_usages
+#    and Phase 1 of PLAN_LLM_ROUND_REDUCTION). ───────────────────────────
+
+# Tokens that signal a declaration / binding for `symbol` on a line.
+# Order matters — the first match wins so `def foo(...)` is "declaration"
+# even when the line also contains a call.
+_DECL_HINTS = (
+    re.compile(r"^\s*(?:async\s+)?def\s+{name}\b"),
+    re.compile(r"^\s*class\s+{name}\b"),
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?function\s*\*?\s*{name}\b"),
+    re.compile(r"^\s*(?:export\s+(?:default\s+)?)?class\s+{name}\b"),
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+{name}\b"),
+    re.compile(r"^\s*{name}\s*[:=]\s*(?:function\b|\([^)]*\)\s*=>)"),
+)
+_WRITE_HINT = re.compile(r"\b{name}\s*(?:\[[^\]]*\])?\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|//=|\*\*=|&=|\|=|\^=|>>=|<<=)")
+_CALL_HINT = re.compile(r"\b{name}\s*\(")
+_MUTATING_METHOD_NAMES = ("set", "add", "delete", "clear", "push", "pop",
+                          "shift", "unshift", "splice", "fill", "update",
+                          "remove", "insert", "append", "extend", "sort",
+                          "reverse")
+_MUTATING_CALL = re.compile(
+    r"\b{name}\.(?:" + "|".join(_MUTATING_METHOD_NAMES) + r")\s*\("
+)
+
+
+def _classify_hit(line: str, symbol: str) -> str:
+    """Classify a single line that contains ``symbol``.
+
+    Returns one of: ``declaration``, ``write``, ``call``, ``comment``,
+    ``string``, ``read``. Heuristic / single-line; never raises.
+
+    Shared by ``find_symbol_usages`` and the Phase 1 hit-classifier in the
+    sibling round-reduction plan, so changes here ripple to both consumers.
+    """
+    if not symbol:
+        return "read"
+    name = re.escape(symbol)
+    stripped = line.lstrip()
+    # Comment first — comment-only lines never count as declarations.
+    if stripped.startswith(("#", "//", "/*", "*", "<!--")):
+        return "comment"
+
+    for tpl in _DECL_HINTS:
+        if re.search(tpl.pattern.format(name=name), line):
+            return "declaration"
+
+    if re.search(_MUTATING_CALL.pattern.format(name=name), line):
+        return "write"
+
+    if re.search(_WRITE_HINT.pattern.format(name=name), line):
+        # Don't misclassify equality / default-arg patterns. The regex
+        # already excludes `==`; nothing more to do here.
+        return "write"
+
+    if re.search(_CALL_HINT.pattern.format(name=name), line):
+        return "call"
+
+    # String-literal-only mention (very rough — only flag when the symbol
+    # appears inside a quoted span and nowhere else on the line).
+    quoted = [m.group(0) for m in re.finditer(r"(['\"])(?:\\.|(?!\1).)*\1", line)]
+    if quoted and any(symbol in q for q in quoted):
+        # Strip quoted spans and see if the symbol still appears outside.
+        stripped_no_q = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", line)
+        if symbol not in stripped_no_q:
+            return "string"
+
+    return "read"
+
+
 def file_search(
     graph: nx.DiGraph,
     root_dir: str | None,

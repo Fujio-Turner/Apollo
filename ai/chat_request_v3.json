@@ -1,0 +1,664 @@
+{
+  "_comment": "Boilerplate request payload sent to OpenAI-compatible chat APIs (xAI/Grok, OpenAI, Gemini, Anthropic, Llama-via-Groq). The model, dynamic context hints, conversation history, and the user message are appended at request time. Edit this file to tune the system prompt or tool catalog without touching code. The original (pre-tuning) version is preserved in chat_request_v1.json for rollback.",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You have no write access. Never attempt to modify files or run code.\n\nYou have tools to query the user's indexed graph. Use them when the question is about their files, code, functions, classes, imports, or project structure. For general questions (greetings, explanations, opinions, non-code topics), just answer directly \u2014 no tool needed.\n\nTool results come back in TOON (Token-Oriented Object Notation) instead of JSON to save context. TOON uses indentation for nesting and a CSV-like header `[N,]{field1,field2,\u2026}:` followed by one comma-separated row per item for uniform arrays. For example, `results[3,]{id,name,type,path,line_start}:` is followed by 3 lines of CSV data, and each row maps positionally to those fields.\n\nAlways respond in clean Markdown. Use ##, ###, bullets, **bold**, `inline code`, and fenced code blocks. Prefer short paragraphs.\n\nTool selection cheat-sheet (prefer the right-hand tool to save rounds):\n- Multiple nodes?            \u2192 batch_get_nodes (NOT sequential get_node)\n- Multiple file ranges?      \u2192 batch_file_sections (NOT sequential get_file_section)\n- Folder shape?              \u2192 get_directory_tree (NOT project_search)\n- 'How is X connected to Y?' \u2192 get_paths_between\n- 'What would break?'        \u2192 get_transitive_imports / get_inheritance_tree\n- 'Who changed this?'        \u2192 get_git_context\n- 'Where does this start?'   \u2192 detect_entry_points\n- 'Most complex code?'       \u2192 get_code_metrics\n- 'Tests for X?'             \u2192 find_test_correspondents\n- 'Same signature as X?'     \u2192 search_graph_by_signature\n- 'Notes mentioning X?'      \u2192 search_notes_fulltext\n\nWorkflow when the user asks a multi-file/multi-symbol question:\n1. Use `search_graph_multi` with synonyms when the topic is fuzzy (e.g. [\"couchbase\",\"cblite\",\"lite\"]).\n2. Use `get_neighbors` (not multiple `get_node` calls) when exploring a cluster of related nodes.\n3. **You are limited to a maximum of 3 tool-call rounds total per user message.** Prefer ONE `search_graph_multi` over many sequential `search_graph` calls. Do not re-issue near-duplicate queries \u2014 if you've already searched for \"work\" as a function, do NOT also search for \"work function\" / \"work method\" / \"work class\" one-by-one; pass them all to `search_graph_multi` in a single call.\n4. **As soon as you can answer the user's actual question with reasonable confidence, call `return_result`.** It is far better to ship a `confidence=med` answer than to keep digging and time out. Exhausting the round budget yields a worse user experience than a partial answer with a clear \"could not verify X\" caveat.\n5. `return_result(summary, files, node_refs)` \u2014 do NOT just emit prose. When you reference a code entity, wrap its node ID in double brackets like [[func::path/file.py::name]] so the UI can highlight it.\n   - The `summary` field MUST itself be well-formatted Markdown (headings, bullets, code blocks).\n   - Pass file paths in `files` and node IDs in `node_refs` \u2014 the UI renders them as clickable chips, so do NOT also list them inline in the summary.\n   - Set `confidence` to \"high\", \"med\", or \"low\" so the UI can show a status dot.\n\nWorkflow when the user asks about THEIR notes, bookmarks, highlights, or \"what did I save / annotate\":\n1. For keyword queries, prefer `search_notes_fulltext` over `list_notes`.\n2. Otherwise call `list_notes` (optionally with `type=\"note\"` or `type=\"bookmark\"`). This returns the user's own annotations with their `target` (file path or graph node ID), `content`, `tags`, and `created_at`. After calling `list_notes`, you may follow up with `notes_by_target` or `get_node` in the same round if needed.\n3. For each annotation pointing at a graph node, you may call `get_node` or `get_neighbors` to bring in relationship context (callers, callees, imports, defining file). For file targets, use `get_file_section`.\n4. Cite annotation IDs (e.g. `an::a1b2c3...`) and the target node IDs in your final `return_result` so the UI can chip them.\n\nWorkflow when debugging a specific file or unfamiliar source:\n1. On first contact with an unknown repo, prefer `detect_entry_points` \u2192 `get_directory_tree` \u2192 `get_wordcloud(strong)` over scattershot project_search calls.\n2. Call `file_stats(path)` first for any file question \u2014 it is extremely cheap and tells you size, line count, md5, function/class counts, and top-level imports.\n3. If the user is unsure which file is involved, use `project_search(pattern)` to grep across the indexed project. Default context is 5 lines before/after each match.\n4. Drill in with `get_function_source(path, name)` or `get_file_section(path, start, end)` to read targeted slices INSTEAD of asking the user to paste the file. When you need multiple ranges, use `batch_file_sections`. These tools are read-only \u2014 you can never modify files; just describe what should change and where.\n5. Always cite line numbers as `path:line_no` so the user can jump to them.\n\nBe concise but thorough."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_graph",
+        "description": "Search the knowledge graph by keyword or semantic similarity. Returns matching nodes (functions, classes, files, etc.) with their type, path, and line number.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query \u2014 a function name, class name, keyword, or natural-language description."
+            },
+            "top": {
+              "type": "integer",
+              "description": "Max results to return (default 10).",
+              "default": 10
+            },
+            "type": {
+              "type": "string",
+              "description": "Optional node type filter: function, class, method, file, directory, variable, import, section, code_block, link, table, task_item."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_node",
+        "description": "Get full details of a specific node by its ID, including source code, metadata, and all incoming/outgoing edges (callers, callees, imports, definitions).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node_id": {
+              "type": "string",
+              "description": "The node ID, e.g. 'func::src/utils.py::my_function' or 'class::models.py::User'."
+            }
+          },
+          "required": [
+            "node_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_stats",
+        "description": "Get summary statistics about the indexed graph: total nodes, total edges, counts by node type and edge type.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_wordcloud",
+        "description": "Get the most strongly-connected entity names in the graph, weighted by graph strength (sum of in+out degree across nodes sharing a name). Use this to understand which symbols are 'hubs' in the codebase \u2014 high-strength names are likely to be impacted by, or to impact, changes elsewhere. Returns up to `limit` items, each with `name`, `strength` (sum of degrees), and `count` (number of nodes sharing that name). Use `mode='all'` only when you need the long tail (weakly-connected helpers and singletons).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "strong",
+                "relevant",
+                "all"
+              ],
+              "description": "strong=top 30 hubs (default); relevant=top 100 with strength>=2; all=everything (capped at 500)."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Optional cap on returned items (defaults to the mode's natural cap)."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_graph_multi",
+        "description": "Run multiple graph searches in parallel and return a single deduped, score-merged result list. Preferred over multiple `search_graph` calls \u2014 use this whenever you have 2+ related terms (e.g. ['couchbase','cblite','lite']) instead of issuing N sequential search_graph calls.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "queries": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of search strings to run."
+            },
+            "top": {
+              "type": "integer",
+              "description": "Max results per query (default 10). The merged output may be larger.",
+              "default": 10
+            },
+            "type": {
+              "type": "string",
+              "description": "Optional node type filter applied to every sub-query."
+            }
+          },
+          "required": [
+            "queries"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_neighbors",
+        "description": "BFS-walk the knowledge graph from a node. Strongly preferred when exploring clusters \u2014 use this (instead of multiple get_node calls) to fetch callers/callees/importers in one round-trip.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node_id": {
+              "type": "string",
+              "description": "Starting node ID."
+            },
+            "depth": {
+              "type": "integer",
+              "description": "BFS depth (default 1).",
+              "default": 1
+            },
+            "edge_types": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional edge-type filter, e.g. ['calls','imports','defines']."
+            },
+            "direction": {
+              "type": "string",
+              "description": "'in' = predecessors, 'out' = successors, 'both' = both (default).",
+              "default": "both"
+            }
+          },
+          "required": [
+            "node_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "file_stats",
+        "description": "Cheap structural summary of a file (size, line count, md5, language, function/class counts, top-level imports). Read-only. Call this first for any file question \u2014 it is extremely cheap.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Absolute or project-relative file path."
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_file_section",
+        "description": "Return an inclusive 1-indexed line range from a file. Read-only. Hard cap 800 lines per call.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "start_line": {
+              "type": "integer"
+            },
+            "end_line": {
+              "type": "integer"
+            },
+            "expected_md5": {
+              "type": "string",
+              "description": "Optional. If provided and the file has changed, the call returns 409 with the new md5."
+            }
+          },
+          "required": [
+            "path",
+            "start_line",
+            "end_line"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_function_source",
+        "description": "AST-extract the full source of a function, method, or class by name. `name` can be `foo`, `MyClass.foo`, or `MyClass`. Includes decorators and docstring. Read-only.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "expected_md5": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "file_search",
+        "description": "Grep within a single file. Returns matches with N lines of context before/after. Read-only. Cap 200 matches.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            },
+            "context": {
+              "type": "integer",
+              "description": "Lines of context before AND after each match (default 5).",
+              "default": 5
+            },
+            "regex": {
+              "type": "boolean",
+              "description": "Treat pattern as regex (default true).",
+              "default": true
+            },
+            "expected_md5": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "pattern"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_search",
+        "description": "Grep across the indexed project. Returns matches with file/line/context. Read-only. Cap 500 matches or 200KB total. Use this when the user is unsure which file contains the issue.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string",
+              "description": "Optional sub-directory; defaults to the indexed root."
+            },
+            "context": {
+              "type": "integer",
+              "description": "Lines of context (default 5).",
+              "default": 5
+            },
+            "file_glob": {
+              "type": "string",
+              "description": "Comma-separated globs (default '*.py'). E.g. '*.py,*.md'.",
+              "default": "*.py"
+            },
+            "regex": {
+              "type": "boolean",
+              "description": "Treat pattern as regex (default true).",
+              "default": true
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_notes",
+        "description": "List the user's own annotations (highlights, NOTES, BOOKMARKS, tags) attached to files or graph nodes in the current project. Use this any time the user asks about THEIR notes, bookmarks, highlights, recent annotations, or 'what did I save'. Newest first. Each item has a `target` linking to either a file path or a graph node ID, which can then be expanded with `get_node` / `get_neighbors` for relationship context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "highlight",
+                "bookmark",
+                "note",
+                "tag"
+              ],
+              "description": "Optional type filter. Omit to list all annotations."
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max items to return (default 25).",
+              "default": 25
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "notes_by_target",
+        "description": "Find every annotation attached to a single file or graph node. Useful for joining the user's notes/bookmarks to graph context \u2014 e.g. fetch every note attached to a node returned by `search_graph`. Provide exactly one of `file` or `node`.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "Project-relative file path."
+            },
+            "node": {
+              "type": "string",
+              "description": "Graph node ID, e.g. `func::src/main.py::main`."
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "notes_by_tag",
+        "description": "Find every annotation carrying a given tag.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tag": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tag"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "batch_get_nodes",
+        "description": "Get full details (source, edges_in, edges_out, metadata) for up to 20 nodes in one call. Use this instead of multiple sequential get_node calls when you need to inspect a cluster of related nodes. Unknown IDs are returned in `missing[]` so you don't waste a round chasing typos.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "maxItems": 20,
+              "description": "List of node IDs (max 20)."
+            },
+            "include_source": {
+              "type": "boolean",
+              "default": true,
+              "description": "Include each node's source code (default true)."
+            },
+            "include_edges": {
+              "type": "boolean",
+              "default": true,
+              "description": "Include each node's edges_in/edges_out (default true)."
+            }
+          },
+          "required": ["node_ids"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "batch_file_sections",
+        "description": "Read multiple line ranges from one or more files in a single call. Each entry returns its own (path, start, end, source). Hard caps: 10 ranges per call, 400 lines per range.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ranges": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path":  { "type": "string" },
+                  "start": { "type": "integer" },
+                  "end":   { "type": "integer" }
+                },
+                "required": ["path", "start", "end"]
+              }
+            }
+          },
+          "required": ["ranges"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_directory_tree",
+        "description": "Recursive directory listing under the indexed project. Returns a flat array of {path, kind, depth, size_bytes, lang, node_count}. Honours the same plugin ignore lists used by the indexer. Use this to learn the SHAPE of an unfamiliar repo \u2014 project_search is grep, not 'ls -R'.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root":        { "type": "string", "default": ".", "description": "Sub-directory under the indexed root (default '.')." },
+            "depth":       { "type": "integer", "default": 3, "maximum": 6 },
+            "glob":        { "type": "string", "description": "Optional fnmatch pattern, e.g. '*.py' \u2014 filters file entries." },
+            "include_dirs":{ "type": "boolean", "default": true }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_stats_detailed",
+        "description": "Deeper project breakdown: node-counts grouped by directory/lang/ext, top N largest files (by node_count) and top N most-connected nodes (by degree). Use after get_stats when you need to know WHERE the code is concentrated.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "top_n": { "type": "integer", "default": 20, "maximum": 50 },
+            "group": { "type": "string", "enum": ["dir", "lang", "ext"], "default": "dir" }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_paths_between",
+        "description": "Find paths between two nodes in the knowledge graph. Returns up to `max_paths` paths, each as an ordered list of node IDs and the edge type at each step. Use this to answer 'how is X connected to Y' / refactoring blast-radius questions instead of multiple get_neighbors calls.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "start_node_id": { "type": "string" },
+            "end_node_id":   { "type": "string" },
+            "max_length":    { "type": "integer", "default": 5, "maximum": 8 },
+            "max_paths":     { "type": "integer", "default": 5, "maximum": 20 },
+            "edge_types":    { "type": "array", "items": { "type": "string" } },
+            "shortest_only": { "type": "boolean", "default": false }
+          },
+          "required": ["start_node_id", "end_node_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_subgraph",
+        "description": "Extract the subgraph induced by `seed_node_ids` plus their `depth` neighbours. Returns nodes[] and edges[]. Use this to explain a cluster.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "seed_node_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 10 },
+            "depth":         { "type": "integer", "default": 1, "maximum": 3 },
+            "edge_types":    { "type": "array", "items": { "type": "string" } },
+            "max_nodes":     { "type": "integer", "default": 200, "maximum": 500 }
+          },
+          "required": ["seed_node_ids"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_inheritance_tree",
+        "description": "For a class node, returns its full ancestor chain and all descendants reachable via `inherits` edges. Optionally pull each class's defines\u2192method edges so you can answer 'where is this method overridden?' in one round.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "class_node_id":    { "type": "string" },
+            "include_methods":  { "type": "boolean", "default": false }
+          },
+          "required": ["class_node_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_transitive_imports",
+        "description": "For a file or module node, returns the full transitive import set in either direction. `direction='out'` = what this file depends on; `direction='in'` = what depends on this file. Use to answer 'what would break if I change this module?'",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_node_id": { "type": "string" },
+            "direction":    { "type": "string", "enum": ["in", "out", "both"], "default": "in" },
+            "max_depth":    { "type": "integer", "default": 5 }
+          },
+          "required": ["file_node_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_code_metrics",
+        "description": "Return code metrics (LOC, cyclomatic complexity, parameter count, signature hash) for one or more functions/methods/files. If no node_ids given, returns the top `top_n` most complex nodes project-wide.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 50 },
+            "top_n":    { "type": "integer", "default": 20, "maximum": 100 },
+            "sort_by":  { "type": "string", "enum": ["complexity", "loc", "param_count"], "default": "complexity" }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_graph_by_signature",
+        "description": "Find functions/methods whose parameter list matches a pattern. Either pass `param_names` (ordered list of names) or `signature_hash` (exact match). Use this for 'what else has this signature?' questions \u2014 grep cannot answer this correctly.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "param_names":       { "type": "array", "items": { "type": "string" } },
+            "param_annotations": { "type": "array", "items": { "type": "string" } },
+            "signature_hash":    { "type": "string" },
+            "fuzzy":             { "type": "boolean", "default": false, "description": "If true, match when the function's params START with the given list." },
+            "top":               { "type": "integer", "default": 20, "maximum": 50 }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find_test_correspondents",
+        "description": "Given a function/class/method node, return likely test functions covering it: explicit `tests` edges first, then heuristic matches (test_<name>, Test<Name>).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node_id":           { "type": "string" },
+            "include_heuristic": { "type": "boolean", "default": true }
+          },
+          "required": ["node_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "detect_entry_points",
+        "description": "Find probable entry points: `if __name__ == '__main__'`, FastAPI/Flask/Django routes, Click/Typer CLI commands, top-level scripts. Returns kind + path + line. Use this on first contact with an unfamiliar repo.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "kinds": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional filter, e.g. ['cli','http_route','main']"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_git_context",
+        "description": "Git blame + recent commits for a file (optionally narrowed to a function name or line range). Returns commits[] and (if line range given) blame[] entries. Returns {git_available: false} cleanly on non-git roots.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path":       { "type": "string" },
+            "name":       { "type": "string", "description": "Optional function/class name; resolves to its line range via the graph." },
+            "line_start": { "type": "integer" },
+            "line_end":   { "type": "integer" },
+            "limit":      { "type": "integer", "default": 10, "maximum": 30 }
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_notes_fulltext",
+        "description": "Full-text search across all user notes, bookmarks, and highlights. Returns id, type, target, content, tags, score. Prefer this over list_notes for keyword queries.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "type":  { "type": "string", "enum": ["note", "bookmark", "highlight"] },
+            "top":   { "type": "integer", "default": 10, "maximum": 50 }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "return_result",
+        "description": "FINAL ANSWER. Call this exactly once when you have enough information to answer the user. Bounds the tool-call loop and supplies structured citations the UI renders as clickable chips. **Never emit normal text after calling `return_result` \u2014 this ends the turn.**",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string",
+              "description": "Markdown answer for the user."
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "File paths relevant to the answer (rendered as clickable chips)."
+            },
+            "node_refs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Node IDs referenced (rendered as clickable chips)."
+            },
+            "confidence": {
+              "type": "string",
+              "enum": [
+                "high",
+                "med",
+                "low"
+              ],
+              "description": "Self-rated confidence in the answer."
+            }
+          },
+          "required": [
+            "summary"
+          ]
+        }
+      }
+    }
+  ]
+}

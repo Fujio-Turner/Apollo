@@ -4,6 +4,10 @@ python-frontmatter>=1.0
 fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 numpy
+# Optional fast JSON encoder used by storage/json_store.py for index
+# (de)serialization. ~3–5× faster than stdlib json with smaller output;
+# the store falls back to stdlib json when this isn't installed.
+orjson>=3.9
 sentence-transformers
 openai>=1.0.0
 # TOON (Token-Oriented Object Notation) — encodes tool results sent back to

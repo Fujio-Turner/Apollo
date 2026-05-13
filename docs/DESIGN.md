@@ -173,6 +173,148 @@ Cross-file resolution is the hardest part. Strategy:
 - Build a global symbol table: `{qualified_name: node_id}`.
 - When a call like `mailer.emails()` is found, look up `mailer` in imports → resolve to `src/utils/mailer.py` → find `emails` in that file's symbols.
 
+#### 4.2.1 File-skipping invariants
+
+The chat tools, file-explorer tree, semantic search, and `safe_path()`
+sandbox all derive what files exist from the indexed graph (a `file::…`
+node is the source of truth). When a file the user can clearly see on
+disk is *missing* from the graph, every downstream tool surface lies to
+the user — chat answers "no such file", search returns no hits, and the
+file tree hides it.
+
+Two historical regressions caused exactly that, and the rules below
+codify the fixes:
+
+1. **No silent drops on parser failure.** When `_find_parser()` matches
+   a parser by extension but the parser returns `None` (size cap hit,
+   parse exception, blank file, …), `graph/builder.py::_parse_one`
+   *must* still return a minimal stub dict so the file gets a `file::`
+   node — the symbols are lost, the file is not. Any future change that
+   makes `_parse_one` return `None` to the parallel pool is a bug.
+2. **CLI and web-UI parser lists must match.** Both
+   `web.server._build_active_parsers` and `main._build_parsers` start
+   with `discover_plugins()` and *append* `TextFileParser` last. Wiring
+   plugin discovery into one but not the other (which used to be the
+   case for the CLI) means an `.html > 1 MB` file gets routed to
+   `TextFileParser`, fails its 1 MB cap, and disappears from the index.
+3. **Size caps are per-plugin and intentional.** Each plugin owns its
+   own `max_file_size_bytes` (e.g. 5 MB for html5, 1 MB for the generic
+   text parser). Don't widen the text parser's cap to "fix" a missing
+   plugin — fix the plugin discovery instead, otherwise huge data files
+   bloat embeddings without adding signal.
+4. **The fallback chain is single-attempt by extension.** `_find_parser`
+   returns the *first* parser whose `can_parse()` returns True. There is
+   no second-try with a different parser — invariant #1 makes that
+   unnecessary because the file always lands as a `file::` stub at
+   minimum.
+
+When debugging "Apollo can't see this file", check, in order: is the
+file in `_apollo/graph.json`? Does the active parser list include the
+plugin you expect? Is the file under a `_CORE_SKIP_DIRS` entry or a
+plugin's `ignore_dirs`? Almost every "indexing bug" report turns out to
+be one of those three.
+
+#### 4.2.2 Project-switch invariants
+
+The web server is long-lived: a single process serves multiple projects
+as the user clicks "Open Folder". `ChatService`, on the other hand, is
+constructed *once* in `web.server.create_app()` with whatever `graph` /
+`root_dir` / `search` were live at startup. If those references aren't
+kept in sync with the active project, the chat answers questions about
+the *previous* project — typical symptoms: "no such file" for files the
+explorer clearly shows, `get_stats` returning the old node count,
+`project_search` erroring `"No root configured"`.
+
+Three rules keep that from happening:
+
+1. **Re-indexing must refresh `chat_service`.** After
+   `web.server` finishes a `/api/index` run (new graph, new search), it
+   must mutate `chat_service.graph`, `chat_service.search`, and
+   `chat_service.root_dir` in place — and reset `chat_service._query`
+   so the lazy `GraphQuery` is rebuilt on the new graph. Mutating the
+   existing instance (rather than reassigning) keeps in-flight WebSocket
+   handlers alive.
+2. **`root_dir` lookups go through `ChatService._current_root_dir()`.**
+   That helper prefers `ProjectManager.root_dir` (the live value the
+   user is looking at) over `self.root_dir` (a snapshot from
+   construction). All `file_inspect` tool dispatch must use it.
+   Reading `self.root_dir` directly is a regression — a project opened
+   via the UI without re-indexing would still need its file paths
+   resolved against the right folder.
+3. **`/api/projects/open` must swap the active store.** The store handed
+   to `create_app()` is the *startup* store (the legacy global
+   `data/graph.cblite2` / `data/graph.json`). When the user opens a
+   different project, `web.server._swap_to_project_store(path)` closes
+   that handle, opens the project's own store under `<root>/_apollo/`
+   (cblite: `_apollo/cblite/apollo_<md5>.cblite2`; json:
+   `_apollo/graph.json`), reloads the graph, rebuilds `search`, and
+   refreshes the `chat_service` references the same way `/api/index`
+   does. Without the swap, an already-indexed project picked from the
+   UI would silently keep answering against whichever store happened to
+   load at boot — the same class of bug as rule #1, just one level up.
+   The swap is wired through `register_project_routes`'
+   `on_project_open` callback so `/api/projects/open` and the startup
+   auto-restore both go through the same path.
+
+#### 4.2.3 Per-project state and the `.gitignore` safeguard
+
+Every project Apollo opens accumulates state under two top-level
+sibling directories of the project root:
+
+| Directory      | Owner            | Contents                                                                 |
+|----------------|------------------|--------------------------------------------------------------------------|
+| `_apollo/`     | core indexer     | `apollo.json` manifest, `graph.json` (json backend) or `cblite/apollo_<md5>.cblite2` bundle, `embeddings.npy`, `file_hashes.json` (incremental indexer memory), `reindex_history.json` (background sweep telemetry), `annotations.json`, `chat/` history |
+| `_apollo_web/` | web capture flow | Captured HTML/PDF → Markdown (see §14.3)                                  |
+
+`file_hashes.json` and `reindex_history.json` are the two files that
+*used to* live in global locations (`data/file_hashes.json` for the CLI
+incremental indexer, `.apollo/file_hashes.json` /
+`.apollo/reindex_history.json` for the background sweep service). Both
+have been moved under `<root>/_apollo/` because they're per-project
+state — indexing project A then project B with a shared hash table
+silently skips files that genuinely differ between the two trees. The
+old global paths are still *read* on first run (legacy fallback) so
+upgrades don't pay a full rebuild, but new writes always land under the
+project's own `_apollo/`. See `apollo/reindex_service.py` (`_state_dir`,
+`_load_prev_hashes`, `_save_history`) and `main.py._hashes_path_for()`.
+
+These directories are deliberately *not* dot-prefixed so users can see
+them in their file browser and so Apollo's own indexer can hard-skip
+them by name (`graph.builder._SKIP_DIRS`). The downside is that they're
+visible to git too — and the cblite database in particular regularly
+grows into the multi-MB range. Committing it bloats the repo, churns
+diffs on every reindex, and exposes embeddings the user may not want
+to share.
+
+To prevent that, `ProjectManager.open()` and `ProjectManager.init()`
+both call `_ensure_gitignore_excludes_apollo(root)`, which:
+
+1. Returns immediately if `<root>/.gitignore` does not exist (we never
+   create one for projects that aren't already git-tracked).
+2. Scans the file for any non-comment line containing the substring
+   `_apollo` and bails if found — the rule covers `_apollo`,
+   `_apollo/`, `_apollo*`, `/_apollo/`, `**/_apollo`, etc., so users
+   who hand-rolled their own pattern aren't second-guessed.
+3. Otherwise appends a small block:
+
+   ```
+   # Apollo per-project state (graph, cblite database, embeddings,
+   # annotations, web captures). These directories can grow to many MB
+   # (the cblite database in particular) and are recreated locally on
+   # demand — keep them out of the repo.
+   _apollo/
+   _apollo_web/
+   ```
+
+The whole call is wrapped in `try/except` so a read-only filesystem
+or permission error can never break project open. The block is
+idempotent across repeated `open()` calls — the substring guard makes
+it safe to run on every session start.
+
+If a future feature adds a third state directory (e.g. `_apollo_cache/`),
+extend the block here so users get the new entry the next time they
+open the project.
+
 ### 4.3 Storage Backend
 
 #### 4.3.1 Graph Store
@@ -184,6 +326,97 @@ Stores nodes, edges, and node payloads (source text, file path, line range, meta
 | **NetworkX**         | Pure Python, rich traversal API, easy to start | In-memory only, no persistence (needs pickling or JSON export) |
 | **SQLite**           | Built-in, persistent, fast, SQL queries        | Graph traversal requires recursive CTEs     |
 | **Couchbase Lite**   | Persistent, JSON document model, SQL++ queries, built-in vector index | C binding complexity, less Python ecosystem support |
+
+##### 4.3.1.1 JSON store on-disk format
+
+The default backend (`storage/json_store.py`) persists the NetworkX `DiGraph`
+as a single JSON document. The original v1 format used flat arrays
+(`{"nodes": [...], "edges": [...]}`) which forced an O(N) scan to look up any
+node and rewrote the entire file on every save. For a real project the index
+grew to ~25 MB and reads paid the cost of decoding every node before answering
+any question.
+
+Two changes shipped together to take that down:
+
+1. **v2 dict-keyed shape** — adjacency-style maps so any node or edge is
+   reachable in O(1) without first walking a list:
+
+   ```json
+   {
+     "version": 2,
+     "nodes": {"<node-id>": {<attrs>}, ...},
+     "edges": {"<src-id>": {"<dst-id>": {<attrs>}, ...}, ...}
+   }
+   ```
+
+   The loader still accepts the v1 array shape transparently
+   (`isinstance(raw["nodes"], dict)` switch), so existing `data/index.json`
+   files keep loading after upgrade and migrate to v2 on the next save.
+
+2. **Optional gzip + orjson encoder** — when the configured path ends in
+   `.gz` the payload is gzipped on write; reads sniff the gzip magic bytes
+   (`0x1f 0x8b`) so the gzip-or-not decision is invisible to callers. The
+   serializer prefers `orjson` (pulled in via `requirements.txt`) and falls
+   back to stdlib `json` so the store still works in minimal environments.
+
+   On a real-world ~25 MB index this collapses to ~8.6 MB on disk
+   (≈3× smaller — the bulk of the file is repeated keys like `"id"`, `"type"`,
+   `"abs_path"`, `"source"`, `"target"`, which gzip dedupes trivially) and
+   `load()` actually got *faster* (~252 ms → ~182 ms) because orjson's parse
+   speedup more than offsets the gzip decompression cost. `save()` is slower
+   (~450 ms → ~1.25 s) but Apollo is read-dominated — sweeps fire every 30
+   minutes, not 30 times per second — so the trade is fine.
+
+`main.py`'s `_default_index_path()` prefers `data/index.json.gz` when it
+exists, falls back to the legacy `data/index.json` when only that one is
+present, and points new installs at the gzipped path. `JsonStore.delete()`
+removes both the configured path and its compression twin so neither variant
+survives a deliberate purge.
+
+Why this and not Fleece / a binary store today: Couchbase Fleece is faster and
+smaller still (~20× JSON parse speed, random access via mmap'd offset
+tables), but it's a C++ format with no first-class Python binding. The
+existing Couchbase Lite backend already uses Fleece internally, so when
+per-document writes (rather than a single-blob rewrite) become the bottleneck
+the right move is finishing the CBL backend rather than wrapping raw Fleece —
+CBL gives us Fleece *plus* per-document upserts, transactions, and indexes.
+Until then the v2/gzip/orjson trio is the high-value, low-risk middle ground.
+
+##### 4.3.1.2 Async multi-document reads on the CBL store
+
+Couchbase Lite's query layer is **single-threaded** — concurrent SQL++
+calls inside one database serialise behind an internal lock. The same
+holds for `CBLCollection_GetDocument` reads at the C level. That is
+fine for the per-request 1-doc reads in `chat/history.py`, but it
+makes any "fetch N documents by ID" loop the worst case: each
+`get_document_json` blocks the FastAPI event loop for the duration of
+the underlying ctypes call, and other requests stall behind it.
+
+To keep the event loop responsive when a handler legitimately needs
+many documents in one request, the CBL wrapper exposes async
+fan-out helpers:
+
+- [`CBL.aget_document_json(collection, doc_id)`](../storage/cblite/ctypes_api.py)
+  — `asyncio.to_thread` wrapper around the blocking single-doc read.
+- `CBL.aget_documents_json(collection, doc_ids)` — fans the per-ID
+  reads out via `asyncio.gather(asyncio.to_thread(...) for d in ids)`,
+  returning the JSON bodies in input order. Per-doc exceptions degrade
+  to `None` for that slot rather than failing the whole batch.
+- [`CouchbaseLiteStore.aget_node_docs(node_ids)`](../storage/cblite/store.py)
+  — convenience over `aget_documents_json` that targets the `nodes`
+  collection and JSON-decodes the results into `{node_id: attrs|None}`.
+
+The "parallelism" here is bounded by CBL's internal serialisation —
+this is not a path to faster CBL reads. The win is purely **event-loop
+liveness**: the per-doc ctypes calls run on the default executor's
+worker threads instead of the asyncio main thread, so other requests
+keep getting served while a multi-doc batch drains.
+
+**Usage rule.** Any new request handler that needs more than one CBL
+document MUST use these async helpers — never a serial `for nid in
+ids: cbl.get_document_json(...)` loop in async route code. The pattern
+is opt-in today on `/api/nodes/batch` (see §8.9) and is the model for
+any future endpoint that fetches multiple documents from CBL by ID.
 
 #### 4.3.2 Vector Index
 
@@ -894,6 +1127,116 @@ to watch a live request, or grep by `id=…` to follow a single conversation
 turn end-to-end. When a user reports "the AI got stuck", the `rid` shown in
 their browser console (printed as `[chat] stream closed { … }`) is the same
 ID the operator can grep in the server log.
+
+### 8.9 Extended Local Tool Catalog (PLAN_MORE_LOCAL_AI_FUNCTIONS)
+
+These tools live in [`chat/local_tools.py`](../chat/local_tools.py); each is
+also exposed under `/api/...` for parity with the human UI. They exist so
+the agent can answer architecture / refactoring / first-contact questions
+in **one round** instead of N grep-and-disambiguate rounds.
+
+| AI tool | HTTP endpoint | OpenAPI op-id | Phase |
+|---------|---------------|---------------|-------|
+| `batch_get_nodes` | `POST /api/nodes/batch` | `batchGetNodes` | 1 |
+| `batch_file_sections` | `POST /api/files/sections` | `batchFileSections` | 1 |
+| `get_directory_tree` | `GET /api/tree` (existing, reused) | `getTree` | 1 |
+| `project_stats_detailed` | `GET /api/stats/detailed` | `getStatsDetailed` | 1 |
+| `get_paths_between` | `GET /api/paths` | `getPathsBetween` | 2 |
+| `get_subgraph` | `POST /api/subgraph` | `getSubgraph` | 2 |
+| `get_inheritance_tree` | `GET /api/inheritance/{class_id}` | `getInheritanceTree` | 2 |
+| `get_transitive_imports` | `GET /api/imports/{file_id}` | `getTransitiveImports` | 2 |
+| `get_code_metrics` | `GET /api/metrics` | `getCodeMetrics` | 3 |
+| `search_graph_by_signature` | `POST /api/signature/search` | `searchBySignature` | 3 |
+| `find_test_correspondents` | `GET /api/tests/{node_id}` | `findTestCorrespondents` | 3 |
+| `detect_entry_points` | `GET /api/entry-points` | `detectEntryPoints` | 3 |
+| `get_git_context` | `GET /api/git/blame` | `getGitContext` | 4 |
+| `search_notes_fulltext` | (no HTTP) — pairs with existing `/api/annotations*` | — | 4 |
+| `list_declarations` | `GET /api/files/declarations` | `listDeclarations` | 8 |
+| `find_symbol_usages` | `GET /api/files/usages` | `findSymbolUsages` | 8 |
+| `outline_file` | `GET /api/files/outline` | `outlineFile` | 8 |
+
+**One-line semantics (full reference: `chat/local_tools.py`, `docs/openapi.yaml`):**
+
+- **Phase 1 — batching + cheap reads:** `batch_get_nodes` (≤20 nodes/call),
+  `batch_file_sections` (≤10 ranges/call, 400 LOC each),
+  `get_directory_tree` (flat `ls -R`, honours plugin ignore lists),
+  `project_stats_detailed` (group counts + top-N files / hubs).
+
+  *`batch_get_nodes` async opt-in.* By default the helper iterates the
+  in-memory NetworkX graph (`graph.nodes[nid]`), so no Couchbase Lite
+  reads happen per request. When the active backend is `cblite` the
+  caller can set `use_cbl: true` in the POST body to dispatch to the
+  async sibling [`abatch_get_nodes`](../chat/local_tools.py), which
+  fans the per-ID document reads out via
+  [`CouchbaseLiteStore.aget_node_docs`](../storage/cblite/store.py)
+  (see §4.3.1.2). Edge topology and any node missing from CBL fall
+  back to the in-memory graph. The flag is opt-in to preserve the
+  zero-IO fast path; any future handler that fetches multiple
+  documents straight from CBL should follow the same async fan-out
+  pattern instead of serialising the per-doc gets on the event loop.
+- **Phase 2 — graph algorithms:** `get_paths_between`
+  (`nx.all_simple_paths` over an edge-type-filtered, undirected view),
+  `get_subgraph` (BFS from N seeds, degree-capped),
+  `get_inheritance_tree` (transitive closure on `inherits`),
+  `get_transitive_imports` (BFS on `imports`, in/out/both).
+- **Phase 3 — surface metadata:** `get_code_metrics` (LOC / cyclomatic /
+  param-count / signature_hash), `search_graph_by_signature` (exact or
+  fuzzy match — grep cannot answer this correctly),
+  `find_test_correspondents` (explicit `tests` edges + name heuristic),
+  `detect_entry_points` (`main_block` / `fastapi_app` / CLI decorators /
+  well-known basenames).
+- **Phase 4 — git + notes full-text:** `get_git_context` (`git log` +
+  `git blame -L`; returns `{git_available: false}` cleanly on non-git
+  roots / missing binary), `search_notes_fulltext` (substring + token-OR
+  scoring over all annotations).
+- **Phase 8 — file-shaped tools (catalog-shape fix):** `outline_file`
+  (sub-second outline read off `defines` edges), `list_declarations`
+  (functions / classes / methods / `const|let|var|def` bindings,
+  including `new Map() / WeakMap() / Set() / WeakSet()` regex fallback),
+  `find_symbol_usages` (every line in a file referencing a symbol,
+  classified `declaration | read | write | call | comment | string` via
+  the shared `file_inspect._classify_hit` text classifier — same
+  classifier used by Phase 1 of [`PLAN_LLM_ROUND_REDUCTION.md`](work/PLAN_LLM_ROUND_REDUCTION.md)).
+  Names + first-sentence descriptions are deliberately shaped to match
+  the noun phrases users put in their questions ("what's in file X?",
+  "where is Y declared in file X?"), so the model picks them over
+  `file_search` without needing prompt discipline. See
+  [`PLAN_MORE_LOCAL_AI_FUNCTIONS.md` §8](work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md)
+  for the full design rationale.
+
+**Cross-cutting contracts:**
+
+1. **TOON-friendly shapes.** Every tool returns a uniform-shape array (or a
+   single-key object containing such an array) so the TOON re-encoding path
+   in `chat.service._to_toon_for_llm` collapses each result to one header
+   row + CSV body — preserving the 30–50 % byte savings.
+2. **Round-budget impact.** Phase 1 alone reduces average rounds-per-question
+   by 30–50 % (5× sequential `get_node` → 1× `batch_get_nodes`; 3× sequential
+   `get_file_section` → 1× `batch_file_sections`; 2× `project_search` for
+   folder shape → 1× `get_directory_tree`). The 3-round cap in the system
+   prompt is unchanged — the goal is "more answered per round," not "more
+   rounds."
+3. **Read-only.** No tool ever writes, renames, or deletes a file. `git`
+   subprocesses are timeout-bounded (5 s) and never raise into the response;
+   they degrade to `{git_available: false}` and log to `apollo.chat.local_tools`
+   at `DEBUG` level.
+4. **OpenAPI contract.** Every endpoint has a matching schema under
+   `components/schemas/` in [`docs/openapi.yaml`](openapi.yaml) and a section
+   in [`docs/API.md`](API.md). Errors flow through the standard
+   `{status_code, error, detail}` envelope (see [§3 — API_OPENAPI.md](../guides/API_OPENAPI.md)).
+5. **Logging.** `chat/local_tools.py` uses
+   `logger = logging.getLogger(__name__)` per
+   [`guides/LOGGING.md`](../guides/LOGGING.md) — no `print()`, no manually
+   constructed logger names. The dispatcher in `chat/service.py` already
+   logs every tool call at `tool.call` / `tool.return` so individual helpers
+   stay silent on the happy path.
+6. **Shared text classifier.** `find_symbol_usages` and the Phase 1
+   work in [`PLAN_LLM_ROUND_REDUCTION.md`](work/PLAN_LLM_ROUND_REDUCTION.md)
+   both call `file_inspect._classify_hit(line, symbol)` to label a hit as
+   `declaration | read | write | call | comment | string`. Keeping a
+   single classifier means the round-reduction work and the file-shaped
+   tools can never disagree about what counts as, say, a "write" — a
+   change to the heuristics ripples to both consumers in one PR.
 
 ---
 
@@ -1801,3 +2144,315 @@ family, mirroring the consolidation already done for highlights / notes
 | `readability-lxml` | Article extraction (strips nav, ads, chrome) | New |
 | `markdownify` | HTML → Markdown conversion | New |
 | Grok API | PDF content summarization → structured JSON → `.md` | Already integrated (Phase 4) |
+
+---
+
+## 15. IDE-Assistant Reindex Loop
+
+> **Status:** design — not yet implemented.
+> **Builds on:** [§9.4 — Change Detection via MD5 Hashing](#94-change-detection-via-md5-hashing--implemented),
+> [`docs/INCREMENTAL_REINDEX_GUIDE.md`](INCREMENTAL_REINDEX_GUIDE.md) (Option 1 / Option 2 strategies),
+> the existing `ReindexOrchestrator` and `/api/index/*` surface.
+
+### 15.1 Problem statement
+
+One of Apollo's primary deployment modes is as a **REST backend for IDE
+AI coding assistants**. The assistant indexes a project once, then
+queries the same project repeatedly via the chat / local-tool catalog
+([§8.9](#89-extended-local-tool-catalog-plan_more_local_ai_functions))
+to traverse it faster and more reliably than ad-hoc `grep`.
+
+The hard problem is **the project changes while the assistant is using
+it.** The assistant (or the human at the keyboard) is constantly:
+
+- adding files
+- removing files
+- editing existing files (line numbers shift, function bodies change,
+  signatures change, imports change)
+
+Any node in the graph whose source range moved or whose content changed
+is now **stale**. Stale `line_start` / `line_end` is the worst kind of
+stale — the assistant will read 20 lines starting at the wrong offset
+and answer with confidence based on the wrong text.
+
+The realistic edit cadence is **not** "100 saves a second" — an AI
+assistant typically edits a file every **2–30 seconds** during an
+active session, with bursts (multi-file refactors) interleaved with
+quiet periods (the model is thinking, the user is reading the diff).
+
+This section describes the design for keeping the index fresh under
+that workload without losing the sub-second query latency that makes
+Apollo useful as an assistant backend in the first place.
+
+### 15.2 What's already in place (do not re-implement)
+
+| Capability | Where |
+|---|---|
+| File-level + per-function MD5 hashing — "did anything change?" is O(stat+hash), not O(parse) | [§9.4](#94-change-detection-via-md5-hashing--implemented), `graph/builder.py` |
+| `resolve_local` strategy — parse changed files, re-resolve only affected files + direct dependents (~30–80 ms typical) | `graph/incremental.py`, [INCREMENTAL_REINDEX_GUIDE.md](INCREMENTAL_REINDEX_GUIDE.md) |
+| `resolve_full` strategy — parse changed files, rebuild full symbol table, re-resolve all edges (edge-correct by construction) | same |
+| `ReindexOrchestrator` — chooses foreground vs background strategy, force-full safety after N runs, persists run history | `apollo/projects/reindex.py` |
+| `GraphDiff` + transactional `store.save_diff()` for both JSON and CBL backends | `graph/incremental.py`, `storage/cblite/store.py` |
+| `/api/index/config`, `/api/index/history`, `/api/index/last`, `/api/index/summary` | `web/server.py` |
+
+The pieces that are **missing** for the IDE-assistant workflow are all
+about *when* and *how often* the existing reindex runs fire — not the
+reindex algorithms themselves.
+
+### 15.3 Design — four cooperating layers
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Layer 4: AI-side batching hint  (system-prompt rule, zero server LOC)│
+│  "If you're about to call edit_file on the same path again within    │
+│   ~5s, set more_coming=true on /api/index/touch."                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│  Layer 3: POST /api/index/touch  (async 202 endpoint)                │
+│  IDE / agent / file-watcher push dirty paths into the queue.         │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│  Layer 2: Debounced coalescing queue  (idle + max-wait timers)       │
+│  Coalesces a burst of touches into one resolve_local run over the    │
+│  union of dirty files. Single source of truth for "what to reindex". │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│  Layer 1: Existing reindex strategies + orchestrator                 │
+│  resolve_local foreground, resolve_full 30-min sweep, force-full     │
+│  every 50 runs.  RWLock'd graph swap; deferred disk flush optional.  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+The four layers are designed to be **independently shippable** and
+each defends against different failure modes of the layer above:
+
+- Layer 4 (AI hint) makes the well-behaved case fast.
+- Layer 3 (touch endpoint) makes any client — well-behaved or not —
+  able to participate.
+- Layer 2 (debounce queue) protects the indexer from clients that
+  ignore or don't know about the hint (formatter-on-save, `git pull`,
+  the human typing).
+- Layer 1 (already built) makes the actual reindex cheap.
+
+### 15.4 Layer 2 — debounced coalescing queue
+
+The single new piece of state on the server:
+
+```python
+class ReindexQueue:
+    dirty:       set[Path]      # paths to re-parse next run
+    deleted:     set[Path]      # paths known to have disappeared
+    timer:       threading.Timer | None
+    last_armed:  float           # monotonic; for max-wait calculation
+```
+
+Two timers control when the queue flushes:
+
+| Knob | Default | Why |
+|---|---|---|
+| **Idle window** | 750 ms | Long enough to swallow a 3-file multi-edit burst; short enough that queries 1 s after a save are fresh. |
+| **Max-wait** | 5 s | Prevents starvation under continuous edits — the queue is guaranteed to flush at least every 5 s, so queries never see a graph >5 s stale during heavy churn. |
+
+Flush logic:
+
+1. On each `touch`, union the new paths into `dirty` / `deleted` and
+   reset the idle timer (unless we're already within
+   `max-wait` of the first arming, in which case fire immediately).
+2. When the timer fires, snapshot `dirty` + `deleted`, clear them, and
+   hand the snapshot to `ReindexOrchestrator` as a `resolve_local` run.
+3. If a touch arrives **while** a reindex is in flight, append to a
+   *next-batch* set (queue-and-defer). Run it after the current
+   reindex completes. This avoids any concurrent-reindex locking
+   complexity; `resolve_local` for 5–10 files is ~80 ms, so even
+   pathological back-to-back edits stay sub-second.
+
+**Explicitly not added:** a "flush immediately if N files dirty" rule.
+`resolve_local` is fast enough that batch size doesn't matter;
+coalescing always wins.
+
+### 15.5 Layer 3 — `POST /api/index/touch`
+
+Minimum viable contract (async, returns immediately so it never
+blocks the agent's tool loop):
+
+```http
+POST /api/index/touch
+Content-Type: application/json
+
+{
+  "changed":     ["src/foo.py", "src/bar.py"],   // created or modified
+  "deleted":     ["src/old.py"],                  // optional
+  "more_coming": false                             // optional, see §15.7
+}
+
+→ 202 Accepted
+{
+  "queued":          3,
+  "scheduled_in_ms": 750,
+  "queue_depth":     3
+}
+```
+
+Design calls worth making explicit:
+
+- **No `force_now` parameter.** If a caller wants synchronous
+  reindex, it polls `/api/index/last` and waits for
+  `started_at > my_touch_time`. Keeping the endpoint async means it
+  can never block the agent's tool loop.
+- **The IDE does not compute hashes.** It just sends paths; the server
+  hashes on dequeue. The MD5 layer ([§9.4](#94-change-detection-via-md5-hashing--implemented))
+  filters out no-op saves (formatter that wrote identical bytes,
+  touch-only changes) for free — the IDE doesn't have to know.
+- **Deletes are paths-that-no-longer-exist.** `resolve_local` already
+  handles "missing from new parse → delete node + edges"
+  ([§9.4](#94-change-detection-via-md5-hashing--implemented) step 2).
+  The `deleted` array is an optimization so the server doesn't have to
+  `stat()` to discover the deletion.
+- **One queue, multiple producers.** If a `watchdog`-based filesystem
+  watcher is also running, it must call the *same internal queue* the
+  HTTP endpoint pushes to. Otherwise an AI edit followed by an
+  fsevent fires reindex twice.
+
+### 15.6 Layer 1 details — read-during-write consistency
+
+The existing `resolve_local` already builds the new graph off to the
+side. The only new requirement is **atomic publication** of the
+updated graph so a query landing mid-reindex never sees half-old /
+half-new state.
+
+Two mechanisms, ship in this order:
+
+#### A. RWLock + atomic pointer swap (ship first)
+
+```python
+# Reindex worker
+new_graph, new_hashes, new_dep_index = strategy.run(...)
+with self._graph_lock.write():        # blocks queries for ~µs
+    self._graph       = new_graph
+    self._hashes      = new_hashes
+    self._dep_index   = new_dep_index
+
+# Query path
+with self._graph_lock.read():
+    return query_engine.run(self._graph, ...)
+```
+
+Reindex takes the write lock only for the swap itself (the build is
+lock-free because `strategy.run` operates on a copy). Worst-case
+query latency added: low microseconds. ~20 LOC.
+
+#### B. Deferred disk flush (optional perf optimization)
+
+Independent of A. The reindex updates the in-memory graph
+synchronously; the on-disk persistence runs on a separate cadence:
+
+```
+N reindexes/min → graph in RAM is always current
+        ↓
+   every 30 s OR 100 dirty files OR shutdown
+        ↓
+   flush queued GraphDiff(s) to disk on a background thread
+```
+
+Why bother: with the JSON backend, persisting the entire 367 MB blob
+([§9.1](#91-problem-with-current-approach)) on every reindex is
+expensive; with diff-only flushes it's tolerable; with **deferred**
+diff flushes during an active editing burst it's free. For Couchbase
+Lite the existing `save_diff` is already transactional and fast, so
+B may never be needed there.
+
+**Crash recovery is free.** On startup, replay from the last on-disk
+graph + re-hash all files. Anything whose MD5 doesn't match → reparse.
+The hash layer turns crash recovery into a normal reindex pass — no
+WAL needed.
+
+### 15.7 Layer 4 — AI-side batching hint
+
+The cheapest leg of the system: a sentence in the assistant's system
+prompt or in the description of its `edit_file` tool. Two
+complementary patterns:
+
+1. **Multi-edit-to-same-file.** *"If you're about to call `edit_file`
+   on `foo.py` more than once in quick succession, prefer a single
+   multi-edit / patch call instead."* Most modern coding agents
+   already support this for unrelated reasons (atomicity, diff
+   readability).
+2. **`more_coming` flag.** When the agent calls `/api/index/touch`
+   and knows it will touch the same path again within a few seconds
+   (it's iterating on a fix), it sends `more_coming=true`. The server
+   resets the debounce timer on those touches instead of arming a
+   new one — so a chain of related edits collapses into a single
+   reindex once the agent stops.
+
+**Honest scope of this layer:**
+
+- It is an *optimization*, not the contract. You cannot trust an
+  external agent to follow timing rules. A different IDE, a script,
+  `git checkout`, formatter-on-save, or the human typing — none of
+  them read the system prompt. **The Layer 2 debounce is the safety
+  net; the AI hint is the fast path.**
+- The agent doesn't know its own future. It might "finish" editing
+  `foo.py`, get a test failure, and edit it again 3 s later. The
+  hint reduces the *common* case latency, not the worst case.
+
+### 15.8 Stale-edge tolerance under `resolve_local`
+
+A natural worry: "the AI needs perfect edges, so always use
+`resolve_full`." This is **wrong** for two reasons specific to the
+assistant workload:
+
+1. **The AI re-asks.** Unlike a human staring at a graph viz, the
+   assistant queries on demand for the current question. A stale
+   `calls` edge from a function that was renamed 3 s ago and renamed
+   back is invisible — by the time it asks, the next reindex has
+   corrected it.
+2. **`resolve_local` + 30-min `resolve_full` sweep is already
+   provably correct for "the question I'm asking right now."** Direct
+   dependents are always re-resolved; the only stale edges are 2+
+   hops out, on a rename that hasn't been swept yet — a case the
+   model recovers from with one additional `get_neighbors` call.
+
+**Decision:** default to `resolve_local` for the touch endpoint, keep
+`resolve_full` as the 30-min background sweep, and **do not** add a
+per-request "high accuracy mode" knob. If staleness is felt in
+practice, the right knob is shortening the sweep interval, not
+changing strategy per request.
+
+### 15.9 What this design explicitly does NOT add
+
+- **Per-keystroke reindex.** Always coalesced through the debounce.
+- **A separate "AI batch mode."** The same dirty-set queue serves
+  human saves, AI edits, and `git pull` equally.
+- **Partial-function reindexing inside an unchanged file.** Function-
+  level MD5 ([§9.4](#94-change-detection-via-md5-hashing--implemented))
+  already gives this for free — re-parse is per-file, but
+  re-embedding and edge re-resolution are per-function.
+- **A WAL or journaling layer.** MD5 + reparse-on-mismatch makes
+  startup recovery a no-op of the normal indexing path.
+
+### 15.10 Sequencing
+
+| Step | Layer | Risk | Notes |
+|---|---|---|---|
+| 1 | Layer 2 + Layer 1A (RWLock swap) | low | Internal only; can be exercised by an existing test that calls the orchestrator directly. |
+| 2 | Layer 3 (`POST /api/index/touch`) | low | Wraps step 1's queue; pure addition to `web/server.py`. Add OpenAPI entry per [`guides/API_OPENAPI.md`](../guides/API_OPENAPI.md). |
+| 3 | Layer 4 (AI prompt hint + `more_coming`) | low | One-line edit to `ai/chat_request.json` system prompt; `more_coming` is an optional field server-side so it's backward compatible. |
+| 4 | Layer 1B (deferred disk flush) | medium | Only if profiling shows JSON-backend disk writes dominate during sustained edits. Skip on CBL. |
+
+Ship steps 1–3 together — they form the smallest useful slice. Step 4
+is a pure optimization gated on observed need.
+
+### 15.11 Operability
+
+- All reindexes triggered through this loop go through
+  `ReindexOrchestrator.record_run`, so they appear in
+  `/api/index/history` exactly like manual reindexes do today.
+- Add a `trigger` field to `ReindexStats` (e.g. `"touch"`,
+  `"sweep"`, `"manual"`, `"force_full"`) so operators can grep the
+  history for "what caused this run?"
+- Log queue depth and idle/max-wait flushes at INFO under the
+  `apollo.reindex.queue` logger per [`guides/LOGGING.md`](../guides/LOGGING.md).
+  No `print()`.

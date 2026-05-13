@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.2.0 — 2026-05-13
+
+### New Features
+
+- **Expanded Local AI Tooling** — New `chat/local_tools.py` module with a large suite of local-first tool functions the chat agent can call directly against the graph, search index, and file store, dramatically reducing reliance on the remote LLM for common queries.
+- **Round-Reduction Chat Pipeline** — Optimized `chat/service.py` and request schemas (`ai/chat_request.json`, `ai/chat_request_v2.json`, `ai/chat_request_v3.json`, `ai/chat_request_v4.json`) to minimize tool-calling rounds. See `docs/work/BENCHMARK_ROUND_REDUCTION.md` for measurements.
+- **Tree Route Parameters** — New `/tree`-style API endpoints accept richer query parameters for filtering and traversing the file tree (`tests/test_tree_route_params.py`).
+- **File Inspection Utility** — New top-level `file_inspect.py` script for ad‑hoc inspection of indexed files.
+- **Project Manager Improvements** — `apollo/projects/manager.py` and `apollo/reindex_service.py` extended with new lifecycle and reindex hooks.
+- **Graph Indices Module** — New `graph/indices.py` providing additional index structures used by the optimized search and traversal paths.
+- **Couchbase Lite Storage Hooks** — Extended `storage/cblite/ctypes_api.py` and `storage/cblite/store.py` for richer semantic-search integration.
+- **Embedder Enhancements** — `embeddings/embedder.py` upgraded with new model/option handling used by the chat tools.
+
+### Bug Fixes
+
+- **Graph Query Fixes (#2)** — Corrected behavior in `graph/query.py`, `graph/incremental.py`, `search/semantic.py`, and `search/cblite_semantic.py`; covered by new tests in `tests/test_graph_query.py` and `tests/test_search_semantic.py`. UI updates in `web/static/app.js` / `app.css` reflect the corrected results.
+- **Settings & Project State Cleanup (#3)** — Stopped tracking machine-local `data/_apollo/apollo.json` and `data/settings.json`; expanded `.gitignore` and added project-manager safeguards.
+- **Stop Tracking Demo Runtime State** — Removed `demo/_apollo/apollo.json` from version control (per-machine runtime artifact).
+- **Chat Tool Routing (#5)** — Fixes in `web/server.py` for chat tool dispatch and tree-route handling, with new coverage in `tests/test_chat_local_tools.py`.
+
+### Changes
+
+- **Documentation** — New / expanded docs: `docs/AI_BEST_PRACTICES.md`, `docs/AI_MORE_LOCAL_FUNCTIONS.md`, `docs/work/PLAN_LLM_ROUND_REDUCTION.md`, `docs/work/PLAN_MORE_LOCAL_AI_FUNCTIONS.md`, `docs/work/BENCHMARK_ROUND_REDUCTION.md`, `docs/work/PLAN_ML_LIBS.md`, plus updates to `docs/DESIGN.md`, `docs/API.md`, and `docs/openapi.yaml`.
+- **Web Server** — `web/server.py` significantly expanded to expose the new local tool endpoints, tree-route parameters, and chat trace plumbing.
+- **Storage** — `storage/json_store.py` reworked to support the new project/state model.
+- **Watcher** — `watcher.py` overhauled for more robust incremental indexing.
+- **Tests** — Added/expanded test suites: `tests/test_chat_local_tools.py`, `tests/test_file_routes.py`, `tests/test_project_manager.py`, `tests/test_tree_route_params.py`, `tests/test_graph_query.py`, `tests/test_search_semantic.py`.
+- **Dependencies** — `requirements.txt` updated with packages required by the new local AI tooling.
+- **Ignore Rules** — `.gitignore` now excludes `data/index.json` and per-project runtime state.
+- **Version bump** — All version references updated from v1.1.0 to v1.2.0.
+
 ## v1.1.0 — 2026-04-30
 
 ### New Features

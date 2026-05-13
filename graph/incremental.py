@@ -347,7 +347,11 @@ class ResolveFullStrategy:
         files_to_parse = []
         files_skipped = 0
         
-        for parser, src_file, rel_path, _ in files_to_parse_all:
+        # ``_discover_files`` returns 5-tuples
+        # ``(parser, src_file, rel_path, source_text, file_md5_hex)``.
+        # The trailing two slots are placeholders here; we fill them
+        # ourselves below for files that actually need re-parsing.
+        for parser, src_file, rel_path, _src, _md5 in files_to_parse_all:
             try:
                 st = src_file.stat()
             except OSError:
@@ -378,6 +382,7 @@ class ResolveFullStrategy:
             except OSError:
                 continue
             file_hash = hashlib.sha256(content).hexdigest()
+            file_md5_hex = hashlib.md5(content).hexdigest()
             source_text = content.decode("utf-8", errors="replace")
             
             new_hashes[rel_path] = {
@@ -390,8 +395,10 @@ class ResolveFullStrategy:
                 files_skipped += 1
                 continue  # Content unchanged despite metadata change
             
-            # Pass source_text so parser doesn't re-read from disk
-            files_to_parse.append((parser, src_file, rel_path, source_text))
+            # Pass source_text + md5 so parser doesn't re-read from disk
+            files_to_parse.append(
+                (parser, src_file, rel_path, source_text, file_md5_hex)
+            )
         
         files_total = len(files_to_parse_all)
         files_parsed = len(files_to_parse)
@@ -604,7 +611,9 @@ class ResolveLocalStrategy:
         files_to_parse = []
         files_skipped = 0
         
-        for parser, src_file, rel_path, _ in files_to_parse_all:
+        # See note above (first call site) — discover yields 5-tuples;
+        # the trailing slots are placeholders we re-fill per file.
+        for parser, src_file, rel_path, _src, _md5 in files_to_parse_all:
             try:
                 st = src_file.stat()
             except OSError:
@@ -634,6 +643,7 @@ class ResolveLocalStrategy:
             except OSError:
                 continue
             file_hash = hashlib.sha256(content).hexdigest()
+            file_md5_hex = hashlib.md5(content).hexdigest()
             source_text = content.decode("utf-8", errors="replace")
             
             new_hashes[rel_path] = {
@@ -646,7 +656,9 @@ class ResolveLocalStrategy:
                 files_skipped += 1
                 continue
             
-            files_to_parse.append((parser, src_file, rel_path, source_text))
+            files_to_parse.append(
+                (parser, src_file, rel_path, source_text, file_md5_hex)
+            )
         
         files_total = len(files_to_parse_all)
         files_parsed = len(files_to_parse)
