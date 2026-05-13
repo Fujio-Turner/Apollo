@@ -140,6 +140,14 @@ class ProjectManager:
             # New project: create _apollo/ and manifest
             manifest = ProjectManifest.create_default(path, self.version, backend=self.default_backend)
         else:
+            # Sync the manifest's stored ``root_dir`` to the path we actually
+            # loaded from. This handles the case where the project (and its
+            # ``_apollo/apollo.json``) was checked into git on one machine
+            # and is being opened from a different absolute path on another
+            # — without this sync, ``manifest.save()`` below would try to
+            # write back to the original author's absolute path.
+            if str(path) != manifest.root_dir:
+                manifest.root_dir = str(path)
             # Check if project was moved (hash mismatch)
             if manifest.storage and manifest.storage.backend == "cblite":
                 current_hash = self._compute_db_hash(path)
