@@ -479,14 +479,17 @@ button.nav-item { background: none; border: none; text-align: left; width: 100%;
 /* User bubbles (`.chat-end`) never spawn a trace; if one ever does end
    up here, hide it so it doesn't clutter the layout. */
 .chat.chat-end + .chat-trace { display: none; }
-.chat-trace .chat-trace-toggle {
+.chat-trace .chat-trace-toggle,
+.chat-trace .chat-trace-copy {
   font-family: 'JetBrains Mono','Fira Code','Consolas',monospace;
   font-size: 10px;
   opacity: 0.7;
   text-transform: none;
 }
-.chat-trace .chat-trace-toggle:hover { opacity: 1; }
+.chat-trace .chat-trace-toggle:hover,
+.chat-trace .chat-trace-copy:hover { opacity: 1; }
 .chat-trace .chat-trace-caret { display: inline-block; width: 9px; }
+.chat-trace .chat-trace-copy-icon { display: inline-block; line-height: 1; }
 .chat-trace .chat-trace-body {
   margin-top: 4px;
   padding: 6px 8px;

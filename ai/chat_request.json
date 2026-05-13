@@ -135,7 +135,7 @@
             },
             "type": {
               "type": "string",
-              "description": "Optional node type filter: function, class, method, file, directory, variable, import, section, code_block, link, table, task_item."
+              "description": "Optional node type filter. Pass a single type (e.g. \"function\") OR a comma-separated list of types (e.g. \"function,class,method\"); a node matches if its type is in the set. Valid types: function, class, method, file, directory, variable, import, section, code_block, link, table, task_item."
             }
           },
           "required": [
@@ -221,7 +221,7 @@
             },
             "type": {
               "type": "string",
-              "description": "Optional node type filter applied to every sub-query."
+              "description": "Optional node type filter applied to every sub-query. Pass a single type (e.g. \"function\") OR a comma-separated list of types (e.g. \"function,class,method\")."
             }
           },
           "required": [

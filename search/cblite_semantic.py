@@ -10,6 +10,22 @@ import json
 
 import numpy as np
 
+from graph.query import _normalize_node_types
+
+
+def _type_clause(node_type, column: str) -> str:
+    """Build a SQL fragment restricting *column* to the requested type(s).
+
+    Returns an empty string when *node_type* is ``None`` (no filter).
+    Quotes are escaped to avoid breaking out of the string literal when
+    the LLM passes user-derived input as a type name.
+    """
+    type_set = _normalize_node_types(node_type)
+    if type_set is None:
+        return ""
+    quoted = ",".join('"' + t.replace('"', '""') + '"' for t in sorted(type_set))
+    return f"{column} IN ({quoted})"
+
 
 class CouchbaseLiteSemanticSearch:
     """Semantic search using embeddings stored in Couchbase Lite."""
@@ -29,7 +45,7 @@ class CouchbaseLiteSemanticSearch:
         self,
         query: str,
         top_k: int = 10,
-        node_type: str | None = None,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         query_embedding = self._embedder.embed_single(query)
         cbl = self._store.cbl
@@ -39,12 +55,11 @@ class CouchbaseLiteSemanticSearch:
         return self._search_brute_force(cbl, query_embedding, top_k, node_type)
 
     def _search_vector_index(
-        self, cbl, query_vec: list[float], top_k: int, node_type: str | None
+        self, cbl, query_vec: list[float], top_k: int, node_type
     ) -> list[dict]:
         """Use APPROX_VECTOR_DISTANCE (Enterprise Edition)."""
-        where = ""
-        if node_type:
-            where = f'WHERE n.type = "{node_type}"'
+        clause = _type_clause(node_type, "n.type")
+        where = f"WHERE {clause}" if clause else ""
 
         sql = (
             f"SELECT META(n).id AS _id, n.name, n.type, n.path, "
@@ -73,12 +88,13 @@ class CouchbaseLiteSemanticSearch:
         return results
 
     def _search_brute_force(
-        self, cbl, query_vec: list[float], top_k: int, node_type: str | None
+        self, cbl, query_vec: list[float], top_k: int, node_type
     ) -> list[dict]:
         """Fetch all embeddings from CBL and compute cosine similarity."""
         where = "WHERE embedding IS NOT NULL"
-        if node_type:
-            where += f' AND type = "{node_type}"'
+        clause = _type_clause(node_type, "type")
+        if clause:
+            where += f" AND {clause}"
 
         sql = (
             f"SELECT META().id AS _id, name, type, path, "

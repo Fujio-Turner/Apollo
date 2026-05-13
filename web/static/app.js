@@ -2813,11 +2813,20 @@ function _ensureTracePanel(bubble) {
   panel.className = 'chat-trace text-[10px]';
   panel.dataset.expanded = '0';
   panel.dataset.forBubble = wrapper.dataset.bubbleId;
+  // Header row carries the toggle on the left and a Copy button on the
+  // right (hidden until the panel is expanded so it doesn't clutter the
+  // collapsed strip). The body sits below and stretches the full width.
   panel.innerHTML =
-    '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
-    '<span class="chat-trace-caret">▸</span>' +
-    '<span class="chat-trace-summary">Trace</span>' +
-    '</button>' +
+    '<div class="chat-trace-header flex items-center justify-between gap-2">' +
+      '<button type="button" class="chat-trace-toggle btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1" aria-expanded="false">' +
+        '<span class="chat-trace-caret">▸</span>' +
+        '<span class="chat-trace-summary">Trace</span>' +
+      '</button>' +
+      '<button type="button" class="chat-trace-copy btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 hidden" title="Copy trace to clipboard" aria-label="Copy trace to clipboard">' +
+        '<span class="chat-trace-copy-icon">📋</span>' +
+        '<span class="chat-trace-copy-label">Copy</span>' +
+      '</button>' +
+    '</div>' +
     '<div class="chat-trace-body hidden"></div>';
   parent.insertBefore(panel, wrapper.nextSibling);
   panel.querySelector('.chat-trace-toggle').addEventListener('click', () => {
@@ -2826,8 +2835,107 @@ function _ensureTracePanel(bubble) {
     panel.querySelector('.chat-trace-toggle').setAttribute('aria-expanded', expanded ? 'false' : 'true');
     panel.querySelector('.chat-trace-caret').textContent = expanded ? '▸' : '▾';
     panel.querySelector('.chat-trace-body').classList.toggle('hidden', expanded);
+    // Show Copy only while the trace is open AND we actually have steps.
+    const copyBtn = panel.querySelector('.chat-trace-copy');
+    const hasSteps = !!panel.dataset.steps;
+    copyBtn.classList.toggle('hidden', expanded || !hasSteps);
+  });
+  panel.querySelector('.chat-trace-copy').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    let steps = [];
+    try { steps = JSON.parse(panel.dataset.steps || '[]'); } catch { steps = []; }
+    const text = _traceToText(steps);
+    const btn = panel.querySelector('.chat-trace-copy');
+    const label = btn.querySelector('.chat-trace-copy-label');
+    const original = label.textContent;
+    try {
+      await _copyTextToClipboard(text);
+      label.textContent = 'Copied';
+      btn.classList.add('text-success');
+    } catch {
+      label.textContent = 'Copy failed';
+      btn.classList.add('text-error');
+    }
+    setTimeout(() => {
+      label.textContent = original;
+      btn.classList.remove('text-success', 'text-error');
+    }, 1500);
   });
   return panel;
+}
+
+/* Convert the structured trace steps back into a plain-text rendering
+   that mirrors what the user sees on screen (icons + summary lines).
+   Used by the Copy-trace button so users can paste a trace into a bug
+   report or another chat. */
+function _traceToText(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return '';
+  const stripTags = (v) => String(v == null ? '' : v).replace(/<[^>]*>/g, '');
+  const lines = [];
+  for (const s of steps) {
+    const ph = s.phase || '';
+    let icon = '·';
+    let line = ph;
+    if (ph === 'request') {
+      icon = '➤';
+      const ctx = s.context_node ? ` ctx=${s.context_node}` : '';
+      const hist = s.history_len ? ` hist=${s.history_len}` : '';
+      line = `request ${s.provider}/${s.model}${ctx}${hist}`;
+    } else if (ph === 'round') {
+      icon = '↻';
+      line = `round ${s.round} finish=${s.finish} ${s.dt}s · ${s.tool_calls} tc`;
+    } else if (ph === 'tool_call') {
+      icon = '🔧';
+      line = `${s.name} ${s.args_preview || ''}`.trimEnd();
+    } else if (ph === 'tool_return') {
+      icon = '↩';
+      const toonTag = (s.toon_bytes != null && s.toon_saved_pct != null)
+        ? ` · toon ${s.toon_bytes} B (-${s.toon_saved_pct}%)`
+        : '';
+      line = `${s.name} → ${s.bytes} B · ${s.dt}s${toonTag}`;
+      if (s.preview) line += `\n${s.preview}`;
+    } else if (ph === 'return_result') {
+      icon = '✓';
+      const files = (s.files || []).length;
+      const refs = (s.node_refs || []).length;
+      line = `return_result ${files} file${files === 1 ? '' : 's'} · ${refs} ref${refs === 1 ? '' : 's'} · ${s.confidence || '—'} · ${s.total_dt}s`;
+    } else if (ph === 'stream_begin') {
+      icon = '✎';
+      line = `stream begin elapsed=${s.elapsed}s`;
+    } else if (ph === 'done') {
+      icon = '●';
+      const tok = s.tokens != null ? `${s.tokens} tok · ` : '';
+      const by = s.bytes != null ? `${s.bytes} B · ` : '';
+      line = `done reason=${s.reason} ${tok}${by}${s.total_dt}s`;
+    } else if (ph === 'rounds_exhausted') {
+      icon = '⚠';
+      line = `rounds exhausted last=${s.last_finish}`;
+    } else if (ph === 'error') {
+      icon = '✗';
+      line = `error in ${s.where}: ${s.message}`;
+    }
+    lines.push(`${icon} ${stripTags(line)}`);
+  }
+  return lines.join('\n');
+}
+
+/* Copy text to the clipboard with a textarea fallback for non-secure
+   contexts where navigator.clipboard is unavailable. */
+async function _copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('execCommand copy failed');
+  } finally {
+    document.body.removeChild(ta);
+  }
 }
 
 function _renderTracePanel(panel, steps) {
@@ -2845,6 +2953,18 @@ function _renderTracePanel(panel, steps) {
 
   const body = panel.querySelector('.chat-trace-body');
   body.innerHTML = steps.map(_traceRowHtml).join('');
+
+  // Stash the raw steps so the Copy button can re-serialize them as
+  // plain text when clicked. Reveal the Copy button if the panel is
+  // currently expanded — the toggle handler already syncs visibility
+  // on user-driven open/close, this just keeps it in sync as new
+  // steps stream in.
+  panel.dataset.steps = JSON.stringify(steps);
+  const copyBtn = panel.querySelector('.chat-trace-copy');
+  if (copyBtn) {
+    const expanded = panel.dataset.expanded === '1';
+    copyBtn.classList.toggle('hidden', !expanded || steps.length === 0);
+  }
 }
 
 function _traceRowHtml(s) {

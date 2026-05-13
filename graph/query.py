@@ -9,21 +9,58 @@ from typing import Optional
 import networkx as nx
 
 
+def _normalize_node_types(
+    node_type: str | list[str] | tuple[str, ...] | None,
+) -> frozenset[str] | None:
+    """Normalize a ``node_type`` argument to a frozenset of types or None.
+
+    Accepts ``None``, a single type string, a comma- or whitespace-separated
+    string (``"function,class"``), or any iterable of strings. Empty or
+    whitespace-only input returns ``None`` so callers treat it as
+    "no filter".
+    """
+    if node_type is None:
+        return None
+    if isinstance(node_type, str):
+        # Split on comma; trim whitespace on each piece.
+        parts = [p.strip() for p in node_type.split(",")]
+        parts = [p for p in parts if p]
+        if not parts:
+            return None
+        return frozenset(parts)
+    # Treat as iterable.
+    parts = [str(p).strip() for p in node_type if str(p).strip()]
+    if not parts:
+        return None
+    return frozenset(parts)
+
+
 class GraphQuery:
     """Query interface for the code knowledge graph."""
 
     def __init__(self, graph: nx.DiGraph):
         self.graph = graph
 
-    def find(self, name: str, node_type: str | None = None) -> list[dict]:
-        """Find nodes by name (substring match) and optional type filter."""
+    def find(
+        self,
+        name: str,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Find nodes by name (substring match) and optional type filter.
+
+        ``node_type`` accepts a single type string (``"function"``), a
+        comma- or whitespace-separated string (``"function,class,method"``),
+        or a list/tuple of strings. When multiple types are supplied, a
+        node matches if its type is in the set.
+        """
         results = []
         name_lower = name.lower()
+        type_set = _normalize_node_types(node_type)
         for node_id, data in self.graph.nodes(data=True):
             node_name = data.get("name", "")
             if name_lower not in node_name.lower():
                 continue
-            if node_type and data.get("type") != node_type:
+            if type_set is not None and data.get("type") not in type_set:
                 continue
             results.append({"id": node_id, **data})
         return results
@@ -103,15 +140,23 @@ class GraphQuery:
                 return {"id": pred, **self.graph.nodes[pred]}
         return None
 
-    def children(self, node_id: str, node_type: str | None = None) -> list[dict]:
-        """Find nodes that this node defines/contains."""
+    def children(
+        self,
+        node_id: str,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Find nodes that this node defines/contains.
+
+        ``node_type`` accepts the same forms as :meth:`find`.
+        """
         results = []
+        type_set = _normalize_node_types(node_type)
         for succ in self.graph.successors(node_id):
             edge_data = self.graph.edges[node_id, succ]
             if edge_data.get("type") not in ("defines", "contains"):
                 continue
             data = self.graph.nodes[succ]
-            if node_type and data.get("type") != node_type:
+            if type_set is not None and data.get("type") not in type_set:
                 continue
             results.append({"id": succ, **data})
         return results

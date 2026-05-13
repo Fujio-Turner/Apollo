@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import networkx as nx
 
+from graph.query import _normalize_node_types
+
 
 class SemanticSearch:
     """Cosine-similarity search over node embeddings.
@@ -97,7 +99,7 @@ class SemanticSearch:
         self,
         query: str,
         top_k: int = 10,
-        node_type: str | None = None,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         self._ensure_matrix()
         if self._matrix is None or self._matrix.size == 0:
@@ -113,12 +115,13 @@ class SemanticSearch:
         # One matmul over the full normalized matrix → all cosine scores.
         scores = self._matrix @ q  # shape: (N,)
 
-        if node_type is not None:
-            # Mask to the requested node_type. Building this mask each
+        type_set = _normalize_node_types(node_type)
+        if type_set is not None:
+            # Mask to the requested node_type(s). Building this mask each
             # call is cheap (O(N) Python comparison), and avoids a more
             # complex per-type secondary index.
             mask = np.fromiter(
-                (m["type"] == node_type for m in self._meta),
+                (m["type"] in type_set for m in self._meta),
                 count=len(self._meta), dtype=bool,
             )
             if not mask.any():
