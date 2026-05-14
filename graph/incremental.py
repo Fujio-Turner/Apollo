@@ -427,9 +427,14 @@ class ResolveFullStrategy:
         for parsed in parsed_files:
             builder._resolve_calls(parsed)
         
-        # Add resolved edges from the builder
+        # Add resolved edges from the builder. We also merge "contains"
+        # edges so re-parsed files stay connected to their parent
+        # directory — otherwise removing the file node in step 2 strips
+        # the dir→file link, the file becomes an orphan root, and
+        # /api/tree starts returning a synthetic "root" wrapper after the
+        # next server restart (issue #11).
         for src, dst, data in builder.graph.edges(data=True):
-            if data.get("type") in ("calls", "inherits", "tests"):
+            if data.get("type") in ("calls", "inherits", "tests", "contains"):
                 new_graph.add_edge(src, dst, **data)
         
         # Compute diff
@@ -701,9 +706,11 @@ class ResolveLocalStrategy:
         for parsed in parsed_files:
             builder._resolve_calls(parsed)
         
-        # Add resolved edges from the builder
+        # Add resolved edges from the builder. "contains" edges are
+        # merged too so re-parsed files keep their dir→file link
+        # (see issue #11 / ResolveFullStrategy comment above).
         for src, dst, data in builder.graph.edges(data=True):
-            if data.get("type") in ("calls", "inherits", "tests"):
+            if data.get("type") in ("calls", "inherits", "tests", "contains"):
                 new_graph.add_edge(src, dst, **data)
         
         # Compute diff
