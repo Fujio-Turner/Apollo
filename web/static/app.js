@@ -1156,13 +1156,32 @@ function renderGraph(data) {
   // space and clearFocus() runs). Drag still works (draggable:true).
   const stable = true;
   const seedR = Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length)));
+  // ML lens: when index-time UMAP coords are present we use them as
+  // initial seed positions (auth code visibly clusters with auth, etc.).
+  // When HDBSCAN cluster_id is present we override the per-node colour
+  // with a cluster palette so visually-grouped code is also
+  // colour-grouped. Both fall back gracefully when ML never ran.
+  // See PLAN_ML_LIBS.md §1.1 / §1.2.
+  const umapBounds = _umapBounds(data.nodes || []);
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8,Math.min(40,n.symbolSize||12));
+    const cid = n.attributes?.cluster_id;
+    const baseColor = (cid != null && cid >= 0)
+      ? _clusterColor(cid)
+      : (NODE_COLORS[t] || '#888');
     const node = { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
-      itemStyle:{color:NODE_COLORS[t]||'#888', ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
-      _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line };
-    if (stable) {
+      itemStyle:{color:baseColor, ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
+      _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line,
+      _cluster: cid, _pagerank: n.attributes?.pagerank };
+    const xy = n.attributes?.umap_xy;
+    if (umapBounds && Array.isArray(xy) && xy.length === 2) {
+      // Scale UMAP's tight float range out to the layout canvas so the
+      // force layout doesn't immediately collapse them into a blob.
+      const [nx, ny] = _umapScale(xy, umapBounds, seedR);
+      node.x = nx;
+      node.y = ny;
+    } else if (stable) {
       const h = _g2HashStr(n.id);
       const ang = ((h % 3600) / 3600) * Math.PI * 2;
       const rad = (((h >>> 8) % 1000) / 1000) * seedR;
@@ -1173,7 +1192,7 @@ function renderGraph(data) {
   });
   const edges = (data.edges||[]).map(e => ({ source:e.source, target:e.target, lineStyle:{color:ec,opacity:0.5}, _rel:e.type||e.rel }));
   graphChart.setOption({
-    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+    tooltip: { trigger:'item', formatter: p => _mlTooltip(p),
       backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
@@ -1206,6 +1225,112 @@ function renderGraph(data) {
    - Within a cluster, node offset = deterministic hash of id → angle/
      radius. So clusters look organic but are stable.
    - lineStyle.color:'source' + curveness:0.3 mirrors Les Miserables. */
+/* ─── ML lens helpers (PLAN_ML_LIBS.md) ──────────────────────────────
+   Pure helpers for using index-time ML signals (UMAP coords + HDBSCAN
+   cluster_id) in the graph render. All are no-ops when the ML pass
+   never ran — the existing deterministic-hash layout / per-type colour
+   path is the fallback.
+*/
+
+// Stable cluster colour palette. 16 hues evenly spread around the
+// wheel, picked from the d3 categorical-style families. Index by
+// `cluster_id mod palette.length`.
+const _CLUSTER_PALETTE = [
+  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+  '#9467bd', '#8c564b', '#e377c2', '#17becf',
+  '#bcbd22', '#7f7f7f', '#aec7e8', '#ffbb78',
+  '#98df8a', '#ff9896', '#c5b0d5', '#c49c94',
+];
+function _clusterColor(cid) {
+  if (cid == null || cid < 0) return '#888';
+  return _CLUSTER_PALETTE[cid % _CLUSTER_PALETTE.length];
+}
+
+// Inspect the node list for `attributes.umap_xy`. Returns
+// `{minX,maxX,minY,maxY}` when at least one node has UMAP coords,
+// else null (caller falls back to hash layout).
+function _umapBounds(nodes) {
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let count = 0;
+  for (const n of nodes) {
+    const xy = n && n.attributes && n.attributes.umap_xy;
+    if (!Array.isArray(xy) || xy.length !== 2) continue;
+    const [x, y] = xy;
+    if (typeof x !== 'number' || typeof y !== 'number') continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    count++;
+  }
+  return count > 0 ? { minX, maxX, minY, maxY } : null;
+}
+
+// Map a (raw UMAP x, y) into the layout canvas range (-seedR, +seedR).
+function _umapScale(xy, b, seedR) {
+  const dx = (b.maxX - b.minX) || 1;
+  const dy = (b.maxY - b.minY) || 1;
+  const nx = ((xy[0] - b.minX) / dx) * 2 * seedR - seedR;
+  const ny = ((xy[1] - b.minY) / dy) * 2 * seedR - seedR;
+  return [nx, ny];
+}
+
+// Shared graph tooltip — surfaces ML signals (cluster_id + pagerank)
+// when present, falls back to the original Type / path:line format.
+function _mlTooltip(p) {
+  if (p.dataType !== 'node') return '';
+  const d = p.data || {};
+  let t = `<b>${d.name}</b><br/>Type: ${d._type || ''}`;
+  if (d._path) t += `<br/>${d._path}${d._line != null ? ':' + d._line : ''}`;
+  if (d._cluster != null && d._cluster >= 0) {
+    t += `<br/>Cluster: <b>${d._cluster}</b>`;
+  }
+  if (typeof d._pagerank === 'number') {
+    t += `<br/>PageRank: ${d._pagerank.toFixed(5)}`;
+  }
+  return t;
+}
+
+/* Public ML Lens API — invokable from the dev toolbar / chat trace
+   when the user wants to see the precomputed ML signals directly
+   instead of asking the AI. Each function fetches the matching
+   `/api/ml/*` endpoint and returns a JSON-friendly object. The chat
+   UI's existing JSON pretty-printer renders the result. */
+const MLLens = {
+  async listClusters(top = 50) {
+    return await apiFetch(`/api/ml/clusters?top=${top}`);
+  },
+  async getClusterMembers(cid, top = 50) {
+    return await apiFetch(`/api/ml/clusters/${cid}?top=${top}`);
+  },
+  async nodeImportance(nodeId) {
+    return await apiFetch(
+      `/api/ml/importance?node_id=${encodeURIComponent(nodeId)}`);
+  },
+  async searchKeyphrase(query, top = 10) {
+    return await apiFetch(
+      `/api/ml/keyphrase?query=${encodeURIComponent(query)}&top=${top}`);
+  },
+  async community(nodeId) {
+    return await apiFetch(
+      `/api/ml/community?node_id=${encodeURIComponent(nodeId)}`);
+  },
+  async findOutliers(top = 20, kind = 'function') {
+    return await apiFetch(
+      `/api/ml/outliers?top=${top}&kind=${encodeURIComponent(kind)}`);
+  },
+  async findDeadCode(kind = 'function') {
+    return await apiFetch(
+      `/api/ml/dead-code?kind=${encodeURIComponent(kind)}`);
+  },
+  async getTopics(top = 20) {
+    return await apiFetch(`/api/ml/topics?top=${top}`);
+  },
+};
+// Expose for ad-hoc use from DevTools console.
+if (typeof window !== 'undefined') window.MLLens = MLLens;
+
 function _g2HashStr(s) {
   // Simple 32-bit string hash (djb2-ish). Deterministic, no deps.
   let h = 5381;
@@ -1245,24 +1370,39 @@ function renderGraph2(data) {
     catSize[t] = (catSize[t]||0) + 1;
   });
 
+  // ML lens (PLAN_ML_LIBS.md): same UMAP-coords + cluster_id pattern
+  // as renderGraph(). Falls back cleanly when ML never ran.
+  const umapBounds = _umapBounds(data.nodes || []);
+  const seedR = ringR;
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8, Math.min(40, n.symbolSize||12));
     const ci = catIdx[t] ?? 0;
-    const center = catCenters[ci] || { x: 0, y: 0 };
-    const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
-    // Deterministic offset within the cluster from the node id hash.
-    const h = _g2HashStr(n.id);
-    const ang = ((h % 3600) / 3600) * Math.PI * 2;
-    const rad = ((h >>> 8) % 1000) / 1000 * inner;
-    const x = center.x + Math.cos(ang) * rad;
-    const y = center.y + Math.sin(ang) * rad;
+    const cid = n.attributes?.cluster_id;
+    const baseColor = (cid != null && cid >= 0)
+      ? _clusterColor(cid)
+      : (NODE_COLORS[t] || '#888');
+    let x, y;
+    const xy = n.attributes?.umap_xy;
+    if (umapBounds && Array.isArray(xy) && xy.length === 2) {
+      [x, y] = _umapScale(xy, umapBounds, seedR);
+    } else {
+      const center = catCenters[ci] || { x: 0, y: 0 };
+      const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
+      // Deterministic offset within the cluster from the node id hash.
+      const h = _g2HashStr(n.id);
+      const ang = ((h % 3600) / 3600) * Math.PI * 2;
+      const rad = ((h >>> 8) % 1000) / 1000 * inner;
+      x = center.x + Math.cos(ang) * rad;
+      y = center.y + Math.sin(ang) * rad;
+    }
     return {
       id: n.id, name: n.name||n.id, symbolSize: sz, category: ci, x, y,
-      itemStyle: { color: NODE_COLORS[t] || '#888', ...(NODE_BORDERS[t]||{}) },
+      itemStyle: { color: baseColor, ...(NODE_BORDERS[t]||{}) },
       // Match Les Mis: only label larger nodes to keep the picture readable.
       label: { show: sz > 22, position: 'right', fontSize: 10, color: tc, formatter: '{b}' },
       _type: t, _path: n.attributes?.path || n.path, _line: n.attributes?.line_start || n.line,
+      _cluster: cid, _pagerank: n.attributes?.pagerank,
     };
   });
   const edges = (data.edges||[]).map(e => ({
@@ -1271,7 +1411,7 @@ function renderGraph2(data) {
     _rel: e.type || e.rel,
   }));
   graphChart2.setOption({
-    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+    tooltip: { trigger:'item', formatter: p => _mlTooltip(p),
       backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },

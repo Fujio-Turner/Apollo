@@ -162,11 +162,21 @@ class CouchbaseLiteStore:
             self._cbl = None
 
     def delete(self) -> None:
-        """Close the database and remove the database directory."""
+        """Close the DB, remove the database directory, and wipe per-index
+        sidecars (``file_hashes.json``, ``reindex_history.json``) so a
+        "Delete index" leaves the same clean slate the JSON backend does.
+        Project manifest and chat history are preserved.
+        """
         self.close()
         db_dir = Path(self._db_path)
         if db_dir.exists():
             shutil.rmtree(db_dir)
+        # Defer to the shared helper so both backends scrub the same
+        # set of stale-after-delete files. The cblite db lives at
+        # ``<root>/_apollo/cblite/<file>.cblite2`` so the project's
+        # ``_apollo/`` directory is two levels up from ``self._db_path``.
+        from apollo.storage.json_store import _purge_index_sidecars
+        _purge_index_sidecars(db_dir.parent.parent)
 
     # -- Internal helpers ---
 

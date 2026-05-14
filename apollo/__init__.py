@@ -16,6 +16,7 @@ _SUBPACKAGES = (
     "chat",
     "watcher",
     "file_inspect",
+    "ml",
 )
 
 _PREFIX = __name__ + "."

@@ -179,8 +179,37 @@ class ReindexService:
         try:
             import networkx as nx
             
-            # Load current graph
-            graph_in = self.store.load(include_embeddings=False)
+            # Load current graph WITH embeddings + ML attrs so the sweep
+            # doesn't silently strip them on every save. Without
+            # ``include_embeddings=True`` (and the carry-over below) the
+            # background sweep wipes pagerank / cluster_id / umap_xy /
+            # ml_clusters / ml_topics / ml_dead_code on every server
+            # startup — see https://amp/T-019e23f2 for the regression.
+            #
+            # Defensive: a project can have an ``apollo.json`` manifest
+            # without ever having been indexed (user opens a fresh folder
+            # via the wizard, then closes the tab before clicking
+            # "Index"). In that case the store points at a non-existent
+            # ``graph.json`` and ``store.load()`` raises FileNotFoundError.
+            # Skip the sweep cleanly instead of crashing — there is
+            # literally nothing to re-resolve until the first index runs.
+            try:
+                graph_in = self.store.load(include_embeddings=True)
+            except FileNotFoundError:
+                logger.info(
+                    "sweep skipped: no graph.json yet at %s — "
+                    "run a full index first (POST /api/index or "
+                    "`python main.py index <dir>`).",
+                    getattr(self.store, "path", "<unknown>"),
+                )
+                return self.get_last_stats()
+            logger.info(
+                "sweep.in nodes=%d pagerank=%d cluster_id=%d graph_attrs=%s",
+                graph_in.number_of_nodes(),
+                sum(1 for _, d in graph_in.nodes(data=True) if d.get("pagerank") is not None),
+                sum(1 for _, d in graph_in.nodes(data=True) if d.get("cluster_id") is not None),
+                list(graph_in.graph.keys()),
+            )
             
             # Run full sweep strategy
             strategy = ResolveFullStrategy()
@@ -189,9 +218,45 @@ class ReindexService:
                 graph_in=graph_in,
                 prev_hashes=self._load_prev_hashes(),
             )
-            
+            logger.info(
+                "sweep.out nodes=%d pagerank=%d cluster_id=%d graph_attrs=%s files_parsed=%d skipped=%d",
+                result.graph_out.number_of_nodes(),
+                sum(1 for _, d in result.graph_out.nodes(data=True) if d.get("pagerank") is not None),
+                sum(1 for _, d in result.graph_out.nodes(data=True) if d.get("cluster_id") is not None),
+                list(result.graph_out.graph.keys()),
+                result.stats.files_parsed,
+                result.stats.files_skipped,
+            )
+
+            # Carry over per-node ML attrs (and embeddings) for nodes
+            # that survived the resolve so we don't lose precomputed
+            # work the parser doesn't re-emit. Restrict to a known
+            # whitelist so we never re-attach stale source/parser fields.
+            _PRESERVED_NODE_ATTRS = (
+                "embedding", "pagerank", "betweenness",
+                "in_degree", "out_degree",
+                "cluster_id", "umap_xy", "community_id",
+                "keyphrases", "topic_id",
+                "outlier_score", "outlier_reason",
+            )
+            graph_out = result.graph_out
+            for nid in graph_out.nodes():
+                if nid not in graph_in:
+                    continue
+                src = graph_in.nodes[nid]
+                dst = graph_out.nodes[nid]
+                for k in _PRESERVED_NODE_ATTRS:
+                    if k in src and k not in dst:
+                        dst[k] = src[k]
+
+            # Carry over graph-level ML sidecars (ml_clusters,
+            # ml_topics, ml_dead_code) the same way.
+            for k in ("ml_clusters", "ml_topics", "ml_dead_code"):
+                if k in graph_in.graph and k not in graph_out.graph:
+                    graph_out.graph[k] = graph_in.graph[k]
+
             # Save results
-            self.store.save(result.graph_out)
+            self.store.save(graph_out)
             self._save_prev_hashes(result.new_hashes)
             self.reindex_history.append(result.stats)
             self._save_history()

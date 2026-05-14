@@ -196,6 +196,31 @@ def cmd_index(args):
         coords = mapper.compute_all(graph)
         print(f"  Spatial coordinates assigned to {len(coords)} nodes.")
 
+    # Run ML passes (UMAP layout, HDBSCAN clusters, PageRank, KeyBERT,
+    # Louvain communities, IsolationForest outliers, BERTopic topics,
+    # vulture dead-code). All passes are graceful — missing libs just
+    # skip. See PLAN_ML_LIBS.md and ml/passes.py.
+    if not getattr(args, "no_ml", False):
+        try:
+            from apollo.ml import run_all_passes
+            print("Running ML passes...")
+            ml_embedder = None
+            try:
+                from apollo.embeddings import get_shared_embedder
+                ml_embedder = get_shared_embedder()
+            except Exception:
+                ml_embedder = None
+            ml_summary = run_all_passes(graph, root_dir=target_dir,
+                                          embedder=ml_embedder)
+            for k, v in ml_summary.items():
+                tag = "ok" if v.get("ml_available") else "skip"
+                detail = (f"computed={v.get('computed')}"
+                          if v.get("ml_available")
+                          else v.get("reason", "unavailable"))
+                print(f"  ML[{k}] {tag} — {detail}")
+        except Exception as e:
+            print(f"  ML passes skipped: {e}")
+
     store, out_path = _open_store(args)
     store.save(graph)
 
@@ -609,6 +634,7 @@ def main():
     p_index.add_argument("-o", "--output", dest="index", help="Output path")
     p_index.add_argument("--no-embeddings", action="store_true", help="Skip embedding generation")
     p_index.add_argument("--no-spatial", action="store_true", help="Skip spatial coordinate computation")
+    p_index.add_argument("--no-ml", action="store_true", help="Skip ML passes (UMAP, HDBSCAN, PageRank, KeyBERT, ...). See PLAN_ML_LIBS.md.")
     p_index.add_argument(
         "--parser",
         choices=["auto", "ast", "tree-sitter"],

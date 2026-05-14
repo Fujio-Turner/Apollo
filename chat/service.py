@@ -775,6 +775,62 @@ class ChatService:
                 "min_strength": min_strength,
             })
 
+        # ── ML tools (PLAN_ML_LIBS.md) ─────────────────────────────────
+        elif name == "list_clusters":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.list_clusters(
+                self.graph, top=int(args.get("top", 50) or 50),
+            ), default=str)
+
+        elif name == "get_cluster_members":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_cluster_members(
+                self.graph,
+                cluster_id=int(args.get("cluster_id", 0) or 0),
+                top=int(args.get("top", 50) or 50),
+            ), default=str)
+
+        elif name == "get_node_importance":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_node_importance(
+                self.graph, node_id=args.get("node_id", ""),
+            ), default=str)
+
+        elif name == "search_graph_by_keyphrase":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.search_graph_by_keyphrase(
+                self.graph,
+                query=args.get("query", ""),
+                top=int(args.get("top", 10) or 10),
+            ), default=str)
+
+        elif name == "get_community":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_community(
+                self.graph, node_id=args.get("node_id", ""),
+            ), default=str)
+
+        elif name == "find_outliers":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.find_outliers(
+                self.graph,
+                top=int(args.get("top", 20) or 20),
+                kind=args.get("kind", "function") or "function",
+            ), default=str)
+
+        elif name == "find_dead_code":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.find_dead_code(
+                self.graph,
+                kind=args.get("kind", "function") or "function",
+            ), default=str)
+
+        elif name == "get_topics":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_topics(
+                self.graph, top=int(args.get("top", 20) or 20),
+            ), default=str)
+
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     # ── Chat methods ───────────────────────────────────────────────

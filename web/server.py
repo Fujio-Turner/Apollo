@@ -898,6 +898,47 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
 
+            # Spatial coords + ML passes (UMAP/HDBSCAN/PageRank/KeyBERT/
+            # Louvain/IsolationForest/BERTopic/vulture). Mirrors the CLI
+            # ``main.py index`` path so the per-project ``_apollo/graph.json``
+            # ends up with the same ``cluster_id`` / ``umap_xy`` / ``pagerank``
+            # / ``community_id`` / ``keyphrases`` / ``topic_id`` /
+            # ``outlier_score`` attributes the chat ML tools (and the
+            # ``/api/ml/*`` HTTP twins) need to be useful. Without this
+            # block, ``list_clusters`` / ``get_topics`` / ``find_outliers`` /
+            # ``get_node_importance`` all return
+            # ``{ml_available: false, reason: "<pass> never ran"}`` for any
+            # graph that was indexed via the web UI rather than the CLI.
+            try:
+                from apollo.spatial import SpatialMapper
+                t_sp = time.time()
+                logger.info("indexing: computing spatial coordinates")
+                SpatialMapper().compute_all(graph)
+                logger.info("spatial coords in %.2fs", time.time() - t_sp)
+            except Exception:
+                logger.warning("spatial coordinates skipped (SpatialMapper unavailable?)")
+
+            try:
+                from apollo.ml import run_all_passes
+                t_ml = time.time()
+                logger.info("indexing: running ML passes")
+                ml_embedder = None
+                try:
+                    from apollo.embeddings.embedder import get_shared_embedder as _shared_emb
+                    ml_embedder = _shared_emb()
+                except Exception:
+                    ml_embedder = None
+                ml_summary = run_all_passes(graph, root_dir=target, embedder=ml_embedder)
+                for k, v in (ml_summary or {}).items():
+                    tag = "ok" if v.get("ml_available") else "skip"
+                    detail = (f"computed={v.get('computed')}"
+                              if v.get("ml_available")
+                              else v.get("reason", "unavailable"))
+                    logger.info("  ML[%s] %s — %s", k, tag, detail)
+                logger.info("ML passes in %.2fs", time.time() - t_ml)
+            except Exception as e:
+                logger.warning("ML passes skipped: %s", e)
+
             _indexing_status.update(step=3, step_label="Saving to store",
                                     detail="Embeddings done")
             t2 = time.time()
@@ -1012,21 +1053,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
        if reindex_service is None:
            raise HTTPException(status_code=503, detail="Reindex service not available")
        history = reindex_service.get_history(limit)
+       # ``ReindexStats`` carries strategy/started_at + file/edge counts.
+       # ``nodes_added``/``nodes_removed`` belong to ``GraphDiff`` and
+       # aren't surfaced here — use the graph stats endpoint for totals.
        return {
-           "history": [
-               {
-                   "duration_ms": s.duration_ms,
-                   "files_parsed": s.files_parsed,
-                   "nodes_added": s.nodes_added,
-                   "nodes_removed": s.nodes_removed,
-                   "edges_added": s.edges_added,
-                   "edges_removed": s.edges_removed,
-                   "timestamp": str(s.timestamp) if hasattr(s, 'timestamp') else None,
-                   "strategy": s.strategy if hasattr(s, 'strategy') else "unknown",
-               }
-               for s in history
-           ],
-           "count": len(history)
+           "history": [s.to_dict() for s in history],
+           "count": len(history),
        }
     
     @app.get("/api/index/last")
@@ -1042,16 +1074,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
            }
        return {
            "status": "success",
-           "last_stats": {
-               "duration_ms": stats.duration_ms,
-               "files_parsed": stats.files_parsed,
-               "nodes_added": stats.nodes_added,
-               "nodes_removed": stats.nodes_removed,
-               "edges_added": stats.edges_added,
-               "edges_removed": stats.edges_removed,
-               "timestamp": str(stats.timestamp) if hasattr(stats, 'timestamp') else None,
-               "strategy": stats.strategy if hasattr(stats, 'strategy') else "unknown",
-           }
+           "last_stats": stats.to_dict(),
        }
     
     @app.post("/api/index/sweep")
@@ -1071,14 +1094,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
            return {
                "status": "success",
                "message": f"Sweep complete in {stats.duration_ms}ms",
-               "stats": {
-                   "duration_ms": stats.duration_ms,
-                   "files_parsed": stats.files_parsed,
-                   "nodes_added": stats.nodes_added,
-                   "nodes_removed": stats.nodes_removed,
-                   "edges_added": stats.edges_added,
-                   "edges_removed": stats.edges_removed,
-               }
+               "stats": stats.to_dict(),
            }
        except Exception as e:
            raise HTTPException(status_code=500, detail=f"Sweep failed: {str(e)}")
@@ -1945,6 +1961,58 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             graph, root_dir, path,
             name=name, line_start=line_start, line_end=line_end, limit=limit,
         )
+
+    # ─────────────────────── ML endpoints (PLAN_ML_LIBS.md) ─────────────────
+    # Mirror the chat-agent ML tools as HTTP endpoints so the human-facing
+    # UI has parity with the AI's view (per API_OPENAPI.md §5 and the
+    # PLAN_MORE_LOCAL_AI_FUNCTIONS rule 5). Every endpoint reads only —
+    # heavy ML work happens at index time in `ml/passes.py`.
+
+    @app.get("/api/ml/clusters")
+    def api_ml_clusters(top: int = Query(50, ge=1, le=200)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.list_clusters(graph, top=top)
+
+    @app.get("/api/ml/clusters/{cluster_id}")
+    def api_ml_cluster_members(cluster_id: int,
+                                top: int = Query(50, ge=1, le=200)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_cluster_members(graph, cluster_id=cluster_id,
+                                              top=top)
+
+    @app.get("/api/ml/importance")
+    def api_ml_importance(node_id: str = Query(...)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_node_importance(graph, node_id=node_id)
+
+    @app.get("/api/ml/keyphrase")
+    def api_ml_keyphrase(query: str = Query(...),
+                         top: int = Query(10, ge=1, le=50)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.search_graph_by_keyphrase(graph, query=query, top=top)
+
+    @app.get("/api/ml/community")
+    def api_ml_community(node_id: str = Query(...)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_community(graph, node_id=node_id)
+
+    @app.get("/api/ml/outliers")
+    def api_ml_outliers(top: int = Query(20, ge=1, le=100),
+                        kind: str = Query("function",
+                                          pattern="^(function|method|class|any)$")):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.find_outliers(graph, top=top, kind=kind)
+
+    @app.get("/api/ml/dead-code")
+    def api_ml_dead_code(kind: str = Query("function",
+                                            pattern="^(function|class|variable|any)$")):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.find_dead_code(graph, kind=kind)
+
+    @app.get("/api/ml/topics")
+    def api_ml_topics(top: int = Query(20, ge=1, le=100)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_topics(graph, top=top)
 
     # -------------------------------------------------------------- Logging --
 
