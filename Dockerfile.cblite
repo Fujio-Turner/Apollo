@@ -7,15 +7,28 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends wget tar && \
     rm -rf /var/lib/apt/lists/*
 
-# Download and install Couchbase Lite C (community edition)
-ARG CBLITE_VERSION=4.0.3
-RUN wget -q "https://packages.couchbase.com/releases/couchbase-lite-c/${CBLITE_VERSION}/couchbase-lite-c-community-${CBLITE_VERSION}-linux-x86_64.tar.gz" \
-        -O /tmp/cblite.tar.gz && \
-    mkdir -p /opt/cblite && \
-    tar -xzf /tmp/cblite.tar.gz -C /tmp && \
-    cp -r /tmp/libcblite-${CBLITE_VERSION}/lib /opt/cblite/lib && \
-    cp -r /tmp/libcblite-${CBLITE_VERSION}/include /opt/cblite/include && \
-    rm -rf /tmp/cblite.tar.gz /tmp/libcblite-${CBLITE_VERSION}
+# Single source of truth for the libcblite version/edition lives in
+# /app/cblite_config.json (copied below). Build-arg overrides win when
+# explicitly passed via `docker build --build-arg CBLITE_VERSION=... --build-arg CBLITE_EDITION=...`.
+COPY cblite_config.json /app/cblite_config.json
+ARG CBLITE_VERSION=
+ARG CBLITE_EDITION=
+
+# Resolve final version/edition (build-args override the JSON), download, install.
+RUN set -eux; \
+    CFG_VERSION="$(python -c 'import json,sys; print(json.load(open("/app/cblite_config.json"))["version"])')"; \
+    CFG_EDITION="$(python -c 'import json,sys; print(json.load(open("/app/cblite_config.json"))["edition"])')"; \
+    CFG_PLATFORM="$(python -c 'import json,sys; print(json.load(open("/app/cblite_config.json")).get("platform","linux-x86_64"))')"; \
+    VERSION="${CBLITE_VERSION:-$CFG_VERSION}"; \
+    EDITION="${CBLITE_EDITION:-$CFG_EDITION}"; \
+    echo "Installing libcblite ${VERSION} (${EDITION}) for ${CFG_PLATFORM}"; \
+    wget -q "https://packages.couchbase.com/releases/couchbase-lite-c/${VERSION}/couchbase-lite-c-${EDITION}-${VERSION}-${CFG_PLATFORM}.tar.gz" \
+        -O /tmp/cblite.tar.gz; \
+    mkdir -p /opt/cblite; \
+    tar -xzf /tmp/cblite.tar.gz -C /tmp; \
+    cp -r /tmp/libcblite-${VERSION}/lib /opt/cblite/lib; \
+    cp -r /tmp/libcblite-${VERSION}/include /opt/cblite/include; \
+    rm -rf /tmp/cblite.tar.gz /tmp/libcblite-${VERSION}
 
 ENV CBLITE_LIB_PATH=/opt/cblite/lib/libcblite.so
 ENV LD_LIBRARY_PATH=/opt/cblite/lib:${LD_LIBRARY_PATH}

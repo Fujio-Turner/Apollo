@@ -290,6 +290,49 @@ def _build_active_parsers() -> list:
     return found
 
 
+def _cblite_info(active_backend: str) -> dict:
+    """Return libcblite version/edition metadata for the UI.
+
+    Reads ``cblite_config.json`` (repo root) for the *configured* target
+    edition/version and probes the loaded shared library (if any) for
+    the EE-only ``CBLCollection_CreateVectorIndex`` symbol to determine
+    the *loaded* edition. Always returns a dict so the frontend can
+    render a single consistent block; ``loaded_edition`` is ``None``
+    when libcblite isn't loaded (e.g. JSON backend on a host without
+    libcblite installed).
+    """
+    info: dict = {
+        "active_backend": active_backend,
+        "configured_version": None,
+        "configured_edition": None,
+        "loaded_edition": None,
+        "vector_index_available": False,
+    }
+    cfg_path = Path(__file__).parent.parent / "cblite_config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = json_mod.load(f) or {}
+        info["configured_version"] = cfg.get("version")
+        info["configured_edition"] = cfg.get("edition")
+    except (OSError, ValueError):
+        pass
+
+    # Probe the loaded shared library, if any. Importing CBL triggers
+    # _load_library() lazily; guard against import failures and
+    # CouchbaseLiteNotAvailable when the .so/.dylib isn't installed.
+    try:
+        from apollo.storage.cblite.ctypes_api import CBL
+        lib = CBL._get_lib()  # cached after first call
+        has_vec = hasattr(lib, "CBLCollection_CreateVectorIndex")
+        info["loaded_edition"] = "enterprise" if has_vec else "community"
+        info["vector_index_available"] = bool(has_vec)
+    except Exception:
+        # Library not present, mismatched arch, etc. — leave loaded_edition None.
+        pass
+
+    return info
+
+
 def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
     """Create and configure the FastAPI application."""
     # Bring up logging early using whatever the user has saved in
@@ -1813,7 +1856,11 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.get("/api/stats")
     def stats():
-        return q.stats()
+        data = dict(q.stats() or {})
+        # Enrich with libcblite edition/version info so the UI can
+        # surface CE-vs-EE in the "My Files Index Analytics" section.
+        data["cblite_info"] = _cblite_info(backend)
+        return data
 
     # ── PLAN_MORE_LOCAL_AI_FUNCTIONS endpoints ─────────────────────────
     # Mirror the new chat-agent tools as HTTP endpoints so the human-facing

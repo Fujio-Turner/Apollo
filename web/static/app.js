@@ -2534,6 +2534,37 @@ async function showWelcomePanel() {
       <div class="stat py-2 px-3"><div class="stat-title text-[10px]">Edges</div><div class="stat-value text-base text-secondary">${(stats.total_edges||0).toLocaleString()}</div></div>
     </div>`;
 
+    // Couchbase Lite edition/version badge — only shown when CBL info
+    // is available (configured edition present in cblite_config.json).
+    const cbl = stats.cblite_info;
+    if (cbl && cbl.configured_edition) {
+      const loaded = cbl.loaded_edition;          // 'enterprise' | 'community' | null
+      const configured = cbl.configured_edition;  // 'enterprise' | 'community'
+      const isEE = loaded === 'enterprise';
+      const editionLabel = isEE ? 'Enterprise (EE)' : (loaded === 'community' ? 'Community (CE)' : 'Not loaded');
+      const editionClass = isEE ? 'badge-success' : (loaded === 'community' ? 'badge-info' : 'badge-ghost');
+      const mismatch = loaded && loaded !== configured;
+      const vecAvail = cbl.vector_index_available;
+      const vecBadge = vecAvail
+        ? '<span class="badge badge-success badge-sm">✓ Vector Index</span>'
+        : '<span class="badge badge-ghost badge-sm" title="EE-only feature; falls back to NumPy vector store">✗ Vector Index</span>';
+      const mismatchBadge = mismatch
+        ? `<span class="badge badge-warning badge-sm" title="cblite_config.json requests '${configured}' but the loaded library is '${loaded}'">⚠ Mismatch</span>`
+        : '';
+      const versionLabel = cbl.configured_version ? ` v${cbl.configured_version}` : '';
+      statsHtml += `<div class="stats stats-horizontal shadow bg-base-200 w-full mb-3">
+        <div class="stat py-2 px-3">
+          <div class="stat-title text-[10px]">Couchbase Lite${versionLabel}</div>
+          <div class="stat-value text-sm flex items-center gap-2 flex-wrap">
+            <span class="badge ${editionClass} badge-sm">${editionLabel}</span>
+            ${vecBadge}
+            ${mismatchBadge}
+          </div>
+          <div class="stat-desc text-[10px] mt-1">Backend: ${cbl.active_backend} · Configured: ${configured}</div>
+        </div>
+      </div>`;
+    }
+
     const hasNodeTypes = stats.node_types && Object.keys(stats.node_types).length;
     const hasEdgeTypes = stats.edge_types && Object.keys(stats.edge_types).length;
 

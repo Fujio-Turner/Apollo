@@ -608,6 +608,66 @@ def cmd_inspect(args):
     store.close()
 
 
+def cmd_wipe(args):
+    """Wipe a project's Apollo state (cblite db, cache, chats, notes, bookmarks).
+
+    Removes ``<directory>/_apollo/`` (manifest, Couchbase Lite database,
+    annotations, per-project chat history) and ``<directory>/_apollo_web/``
+    (UI cache). Optionally also removes the global
+    ``.apollo/chat_history.json`` (used as the chat-history fallback when
+    no project is open).
+
+    The folder itself is left intact — re-run ``index`` (or open it in the
+    Web UI) to start fresh with the current ``cblite_config.json`` settings.
+    """
+    import shutil
+    from pathlib import Path
+
+    target = Path(args.directory).resolve()
+    if not target.exists():
+        print(f"Error: Directory not found: {target}", file=sys.stderr)
+        sys.exit(1)
+    if not target.is_dir():
+        print(f"Error: Not a directory: {target}", file=sys.stderr)
+        sys.exit(1)
+
+    apollo_dir = target / "_apollo"
+    apollo_web_dir = target / "_apollo_web"
+    candidates: list[Path] = []
+    if apollo_dir.exists():
+        candidates.append(apollo_dir)
+    if apollo_web_dir.exists():
+        candidates.append(apollo_web_dir)
+    if args.global_chat:
+        global_chat = Path(".apollo/chat_history.json")
+        if global_chat.exists():
+            candidates.append(global_chat)
+
+    if not candidates:
+        print(f"Nothing to wipe — no Apollo state found under {target}")
+        return
+
+    print("Will delete:")
+    for c in candidates:
+        print(f"  {c}")
+
+    if not args.confirm:
+        print("\nRefusing to delete without --confirm. Re-run with --confirm to proceed.")
+        sys.exit(2)
+
+    for c in candidates:
+        try:
+            if c.is_dir():
+                shutil.rmtree(c)
+            else:
+                c.unlink()
+            print(f"  ✓ removed {c}")
+        except OSError as e:
+            print(f"  ✗ failed to remove {c}: {e}", file=sys.stderr)
+
+    print("\nDone. Re-index this folder (or re-open it in the Web UI) to rebuild from scratch.")
+
+
 def _add_common_args(parser):
     """Add --index and --backend to a subparser."""
     parser.add_argument("--index", help="Index/database path")
@@ -716,6 +776,20 @@ def main():
     p_inspect.add_argument("node_id", help="Full node ID (e.g., func::src/main.py::my_func)")
     _add_common_args(p_inspect)
 
+    # wipe
+    p_wipe = subparsers.add_parser(
+        "wipe",
+        help="Wipe a project's Apollo state (cblite db, UI cache, chats, notes, bookmarks)",
+    )
+    p_wipe.add_argument("directory", help="Project root directory whose _apollo/ and _apollo_web/ should be deleted")
+    p_wipe.add_argument("--confirm", action="store_true", help="Required: actually perform the deletion")
+    p_wipe.add_argument(
+        "--global-chat",
+        dest="global_chat",
+        action="store_true",
+        help="Also delete the global .apollo/chat_history.json fallback",
+    )
+
     args = parser.parse_args()
 
     commands = {
@@ -728,6 +802,7 @@ def main():
         "spatial": cmd_spatial,
         "spatial-walk": cmd_spatial_walk,
         "inspect": cmd_inspect,
+        "wipe": cmd_wipe,
     }
     logger.info("CLI: %s", args.command)
     commands[args.command](args)

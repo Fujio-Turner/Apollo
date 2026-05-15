@@ -76,9 +76,22 @@ class CouchbaseLiteStore:
         self._create_indexes(cbl, nodes_col, edges_col, embedding_dim)
 
     def load(self, *, include_embeddings: bool = True) -> nx.DiGraph:
-        """Load the graph from CBL into a NetworkX DiGraph."""
+        """Load the graph from CBL into a NetworkX DiGraph.
+
+        Returns an empty DiGraph when the database is fresh (no
+        ``nodes`` / ``edges`` collections yet) — this is the expected
+        state immediately after ``apollo wipe`` before the first index.
+        """
         cbl = self._open()
         graph = nx.DiGraph()
+
+        # Ensure the collections exist before querying them. On a
+        # freshly-created database (e.g. right after ``apollo wipe`` when
+        # the user opens the project but hasn't indexed yet) the
+        # collections do not exist and ``SELECT … FROM nodes`` fails
+        # with ``no such collection "nodes"``.
+        cbl.get_or_create_collection("nodes")
+        cbl.get_or_create_collection("edges")
 
         # Load nodes
         rows = cbl.execute_query("SELECT META().id AS _id, * FROM nodes")
