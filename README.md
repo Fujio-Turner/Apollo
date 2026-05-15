@@ -134,6 +134,116 @@ To enable AI chat, set your Grok API key:
 XAI_API_KEY=your_key_here docker compose up --build
 ```
 
+## Couchbase Lite Backend (Optional)
+
+Apollo's default JSON backend is zero-dependency and fine for most projects. The **Couchbase Lite** backend trades a one-time install for SQL++ queries and — in **Enterprise Edition (EE)** — native vector indexes that can be 5–10× faster than the in-memory NumPy fallback on large graphs.
+
+| Edition | Vector Index | License | Where to get it |
+|---|---|---|---|
+| **Community (CE)** | ✗ (falls back to NumPy) | Free, open-source | Homebrew, official tarball |
+| **Enterprise (EE)** | ✓ Native HNSW | Free for dev/eval; commercial license required for production | [couchbase.com/downloads](https://www.couchbase.com/downloads/?family=couchbase-lite) (login required) |
+
+### Single source of truth: `cblite_config.json`
+
+The file [`cblite_config.json`](cblite_config.json) at the repo root pins the version & edition Apollo targets:
+
+```json
+{
+  "version": "4.0.3",
+  "edition": "community",
+  "platform": "linux-x86_64"
+}
+```
+
+- The Docker build ([`Dockerfile.cblite`](Dockerfile.cblite)) reads this to pick which tarball to download.
+- New projects record the version in their `_apollo/apollo.json` manifest.
+- The Web UI's **My Files Index Analytics** card shows configured vs. loaded edition with a ⚠ Mismatch badge if they disagree.
+
+### macOS
+
+**Community Edition** (free, easiest):
+
+```bash
+brew install --cask libcblite-community
+python main.py serve --backend cblite
+```
+
+That installs the dylib at `/opt/homebrew/lib/libcblite.dylib`, which Apollo finds automatically.
+
+**Enterprise Edition** (vector indexes):
+
+1. Download `couchbase-lite-c-enterprise-4.0.3-macos.zip` from [Couchbase Downloads](https://www.couchbase.com/downloads/?family=couchbase-lite) (free Couchbase account required).
+2. Unzip it somewhere stable, e.g. `~/cb-l/libcblite-4.0.3/`.
+3. Update [`cblite_config.json`](cblite_config.json) → `"edition": "enterprise"`.
+4. Point Apollo at the EE binary and start the server **on a single command line** (a line break would break the `export`):
+
+   ```bash
+   export CBLITE_LIB_PATH=~/cb-l/libcblite-4.0.3/lib/libcblite.4.0.3.dylib
+   python main.py serve --backend cblite
+   ```
+
+5. (Optional) Make it permanent — add the `export` line to `~/.zshrc`.
+
+Verify it's actually the EE binary:
+```bash
+nm -gU $CBLITE_LIB_PATH | grep CBLCollection_CreateVectorIndex   # should print one line
+env | grep CBLITE_LIB_PATH                                       # should show the path
+```
+
+### Windows
+
+**Community Edition:**
+
+1. Download `couchbase-lite-c-community-4.0.3-windows.zip` from the [official releases page](https://packages.couchbase.com/releases/couchbase-lite-c/4.0.3/).
+2. Extract to e.g. `C:\libcblite-4.0.3\`.
+3. Either copy `bin\cblite.dll` into `C:\Windows\System32\` (system-wide) or set the env var:
+
+   ```powershell
+   $env:CBLITE_LIB_PATH = "C:\libcblite-4.0.3\bin\cblite.dll"
+   python main.py serve --backend cblite
+   ```
+
+   To persist across sessions:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("CBLITE_LIB_PATH", "C:\libcblite-4.0.3\bin\cblite.dll", "User")
+   ```
+
+**Enterprise Edition** — same steps, but download `couchbase-lite-c-enterprise-4.0.3-windows.zip` from [Couchbase Downloads](https://www.couchbase.com/downloads/?family=couchbase-lite) and update [`cblite_config.json`](cblite_config.json) → `"edition": "enterprise"`.
+
+### Docker (cleanest for EE)
+
+The [`Dockerfile.cblite`](Dockerfile.cblite) image bakes libcblite straight in. To build an EE image, edit `cblite_config.json` to `"edition": "enterprise"` then:
+
+```bash
+docker build -f Dockerfile.cblite -t apollo-cblite .
+docker run -p 8080:8080 -v ./target:/data/target:ro apollo-cblite
+```
+
+Build-args override the JSON if needed:
+```bash
+docker build -f Dockerfile.cblite \
+  --build-arg CBLITE_VERSION=4.0.3 \
+  --build-arg CBLITE_EDITION=enterprise \
+  -t apollo-cblite .
+```
+
+### Switching CE → EE on an existing project
+
+The on-disk database schema differs between editions, so wipe before switching:
+
+```bash
+# 1. Stop the server.
+# 2. Wipe the project's _apollo/ + _apollo_web/ (cblite db, chats, notes, bookmarks)
+python main.py wipe /path/to/your/folder --confirm
+# 3. Edit cblite_config.json → "edition": "enterprise"
+# 4. export CBLITE_LIB_PATH=... (or set it on Windows)
+# 5. Restart and re-index — the Analytics card should now show "Enterprise (EE) ✓ Vector Index"
+```
+
+If `wipe` complains about a parent project, you have a stray `_apollo/` in a parent folder — wipe that too. Apollo forbids nested projects.
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -167,6 +277,11 @@ python main.py serve --watch-dir <directory>
 
 # Graph statistics
 python main.py status
+
+# Wipe a project's Apollo state (cblite db, UI cache, chats, notes, bookmarks)
+# — used when switching CE ↔ EE or starting fresh.
+python main.py wipe <directory> --confirm
+python main.py wipe <directory> --confirm --global-chat   # also clears global chat fallback
 ```
 
 ## Architecture
