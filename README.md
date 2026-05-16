@@ -14,7 +14,7 @@ An **Obsidian-for-your-filesystem** — a browser-based tool that scans any dire
 
 Instead of manually linking notes, Apollo **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
 
-![Version](https://img.shields.io/badge/Apollo-v1.2.0-brightgreen)
+![Version](https://img.shields.io/badge/Apollo-v1.3.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green)
 ![ECharts](https://img.shields.io/badge/ECharts-5-orange)
@@ -93,23 +93,12 @@ Requires Python 3.9+.
    In both cases the key ends up in `.env` (gitignored) and is loaded
    automatically on startup.
 
-5. **Put the directory you want to index in `./target/`** (or use any path)
-   ```bash
-   cp -r /path/to/your/project ./target
-   ```
-
-6. **Index it**
-   ```bash
-   python3 main.py index ./target
-   ```
-   This writes `data/index.json`.
-
-7. **Launch the web UI**
+5. **Launch the web UI**
    ```bash
    python3 main.py serve
    ```
 
-8. Open **http://localhost:8080**
+6. Open **http://localhost:8080** and pick the folder to index from the UI.
 
 When you're done, deactivate the virtualenv with `deactivate`.
 
@@ -133,6 +122,12 @@ To enable AI chat, set your Grok API key:
 ```bash
 XAI_API_KEY=your_key_here docker compose up --build
 ```
+
+> **Note:** When running inside Docker, Apollo can **only see and index
+> folders/files that live inside the container** — i.e. whatever you mount
+> into `./target/` (or another bind-mounted path). Paths on the host machine
+> outside the mounted volume are invisible to the container and cannot be
+> picked from the file-folder picker.
 
 ## Couchbase Lite Backend (Optional)
 
@@ -207,9 +202,23 @@ env | grep CBLITE_LIB_PATH                                       # should show t
 
 ### Windows
 
-**Community Edition:**
+**Community Edition** (easiest — let Apollo install it for you):
 
-1. Download `couchbase-lite-c-community-4.0.3-windows.zip` from the [official releases page](https://packages.couchbase.com/releases/couchbase-lite-c/4.0.3/).
+1. Start the server normally:
+   ```powershell
+   python main.py serve
+   ```
+2. Open **http://localhost:8080** → **Settings → Storage** tab.
+3. Click **Install Community Edition**. Apollo will download
+   `couchbase-lite-c-community-4.0.3-windows-x86_64.zip` from the
+   [official packages site](https://packages.couchbase.com/releases/couchbase-lite-c/4.0.3/),
+   extract it into `storage_binary/`, and activate the backend in-place.
+   No PATH edits, no `System32` copy, no env var required.
+
+**Community Edition — manual install** (if you'd rather not use the UI):
+
+1. Download `couchbase-lite-c-community-4.0.3-windows-x86_64.zip` from the
+   [official releases page](https://packages.couchbase.com/releases/couchbase-lite-c/4.0.3/).
 2. Extract to e.g. `C:\libcblite-4.0.3\`.
 3. Either copy `bin\cblite.dll` into `C:\Windows\System32\` (system-wide) or set the env var:
 
@@ -223,7 +232,7 @@ env | grep CBLITE_LIB_PATH                                       # should show t
    [System.Environment]::SetEnvironmentVariable("CBLITE_LIB_PATH", "C:\libcblite-4.0.3\bin\cblite.dll", "User")
    ```
 
-**Enterprise Edition** — same steps, but download `couchbase-lite-c-enterprise-4.0.3-windows.zip` from [Couchbase Downloads](https://www.couchbase.com/downloads/?family=couchbase-lite) and update [`cblite_config.json`](cblite_config.json) → `"edition": "enterprise"`.
+**Enterprise Edition** — same steps, but download `couchbase-lite-c-enterprise-4.0.3-windows-x86_64.zip` from [Couchbase Downloads](https://www.couchbase.com/downloads/?family=couchbase-lite) (login required) and update [`cblite_config.json`](cblite_config.json) → `"edition": "enterprise"`.
 
 ### Docker (cleanest for EE)
 
