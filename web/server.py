@@ -354,8 +354,10 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         allow_headers=["*"],
     )
     
-    # Initialize ProjectManager for project lifecycle management
-    project_manager = ProjectManager(version=version)
+    # Initialize ProjectManager for project lifecycle management.
+    # Pass through the active backend so new projects opened/initialized
+    # via the web UI inherit it (instead of always landing on "json").
+    project_manager = ProjectManager(version=version, default_backend=backend)
 
     # ── Per-project store resolution ────────────────────────────────
     # The store passed into create_app is the *startup* store (typically
@@ -2420,6 +2422,13 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         # Pair with the existing CBL probe so the UI can show loaded
         # edition + vector-index availability in one card.
         cbl_info = _cblite_info(backend)
+        # Surface the persisted default backend so the Settings → Storage
+        # UI can render the JSON ↔ cblite selector with the right option
+        # pre-selected. ``active_backend`` is what *this* server process
+        # actually booted with (CLI flag or persisted default); the saved
+        # value may differ until the user restarts.
+        settings = _load_settings() or {}
+        saved_backend = (settings.get("storage") or {}).get("default_backend")
         return {
             "platform": plat,
             "known_versions": cbi.KNOWN_VERSIONS,
@@ -2428,6 +2437,8 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "install_root": str(cbi.INSTALL_ROOT),
             "installed": installed,
             "active_lib_path": active,
+            "active_backend": backend,
+            "saved_default_backend": saved_backend,
             "cblite_info": cbl_info,
         }
 
@@ -2486,6 +2497,35 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "status": "saved",
             "active_lib_path": lib_path,
             "restart_required": True,
+        }
+
+    @app.post("/api/storage/backend")
+    async def storage_set_backend(request: Request):
+        """Persist the default storage backend for new server starts.
+
+        Body: ``{"backend": "json"|"cblite"}``. Saved under
+        ``storage.default_backend`` in ``data/settings.json``. Takes
+        effect the next time ``main.py serve`` is launched without an
+        explicit ``--backend`` flag (the CLI flag still wins). Returns
+        ``restart_required: true`` because the running process keeps the
+        backend it booted with.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        new_backend = ((body or {}).get("backend") or "").strip().lower()
+        if new_backend not in ("json", "cblite"):
+            raise HTTPException(status_code=400, detail="backend must be 'json' or 'cblite'")
+        settings = _load_settings() or {}
+        storage = settings.setdefault("storage", {})
+        storage["default_backend"] = new_backend
+        _save_settings(settings)
+        return {
+            "status": "saved",
+            "saved_default_backend": new_backend,
+            "active_backend": backend,
+            "restart_required": new_backend != backend,
         }
 
     @app.delete("/api/storage/install")

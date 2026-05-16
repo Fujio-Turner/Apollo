@@ -2636,6 +2636,16 @@ async function showWelcomePanel() {
       </div>
       ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
       ${statsHtml}
+      ${stats ? `
+      <div class="mt-4 p-3 rounded-lg border border-error/30 bg-error/5">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <div class="text-xs">
+            <div class="font-semibold text-error">Danger zone</div>
+            <div class="opacity-70 mt-0.5">Wipes the Apollo data for this folder: <code class="font-mono">_apollo/</code> (graph, Couchbase Lite db, embeddings, annotations) and <code class="font-mono">_apollo_web/</code> (web cache). Useful when switching CE ↔ EE or recovering from a corrupt index. The browser will refresh.</div>
+          </div>
+          <button id="hub-delete-project-btn" type="button" class="btn btn-sm btn-error" onclick="wipeCurrentProject()">🗑️ Delete</button>
+        </div>
+      </div>` : ''}
     </div>
 
     <div id="hub-pane-annotations" data-hub-pane="annotations" class="hidden">
@@ -4852,6 +4862,18 @@ function renderStoragePanel(info) {
     ? ''
     : '';
 
+  // Backend selector: persisted in data/settings.json via
+  // POST /api/storage/backend. The CLI flag still wins on the next start,
+  // so this is the default for `python main.py serve` without --backend.
+  // `active_backend` = what the running server actually booted with;
+  // `saved_default_backend` = what will be used on next restart.
+  const activeBackend = info.active_backend || cbl.active_backend || 'json';
+  const savedBackend = info.saved_default_backend || activeBackend;
+  const backendOpts = ['json', 'cblite'].map(b =>
+    `<option value="${b}" ${b === savedBackend ? 'selected' : ''}>${b === 'cblite' ? 'cblite (Couchbase Lite — supports vector indexes when EE is loaded)' : 'json (file-based — no libcblite required)'}</option>`
+  ).join('');
+  const backendMismatch = savedBackend !== activeBackend;
+
   root.innerHTML = `
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
       <div class="bg-base-200 rounded p-3">
@@ -4865,7 +4887,24 @@ function renderStoragePanel(info) {
           ${loadedBadge}
           ${cbl.vector_index_available ? '<span class="badge badge-success badge-sm">✓ Vector Index</span>' : '<span class="badge badge-ghost badge-sm">✗ Vector Index</span>'}
         </div>
-        <div class="text-[10px] opacity-50 mt-2">Backend: <code class="font-mono">${cbl.active_backend || '?'}</code></div>
+        <div class="text-[10px] opacity-50 mt-2">Backend: <code class="font-mono">${activeBackend}</code></div>
+      </div>
+    </div>
+
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Storage backend (for new server starts)</div>
+      <div class="flex flex-wrap items-end gap-2">
+        <select id="storage-backend-select" class="select select-xs select-bordered min-w-[300px]">${backendOpts}</select>
+        <button id="storage-backend-save-btn" class="btn btn-xs btn-primary" onclick="storageSaveBackend()">Save</button>
+        <span id="storage-backend-status" class="text-[11px] opacity-70"></span>
+      </div>
+      <div class="text-[10px] opacity-60 mt-2">
+        Running: <code class="font-mono">${activeBackend}</code> · Saved: <code class="font-mono">${savedBackend}</code>
+        ${backendMismatch ? '<span class="badge badge-warning badge-xs ml-2">restart required</span>' : ''}
+      </div>
+      <div class="text-[10px] opacity-50 mt-1">
+        <strong>json</strong> — graph stored in <code class="font-mono">_apollo/graph.json</code>, no libcblite needed.
+        <strong>cblite</strong> — graph + embeddings stored in a Couchbase Lite database; required for native vector indexes (EE only).
       </div>
     </div>
 
@@ -4956,6 +4995,42 @@ async function storageActivate(libPath, edition, version) {
   } catch (e) {
     alert(`Activate failed: ${e.message || e}`);
   } finally {
+    loadStorageInfo();
+  }
+}
+
+/* Persist the user's choice of default storage backend (json | cblite).
+   Saved under storage.default_backend in data/settings.json. The currently
+   running server process keeps the backend it booted with — switching
+   only takes effect on the next `python main.py serve` (without an
+   explicit --backend flag). */
+async function storageSaveBackend() {
+  const sel = document.getElementById('storage-backend-select');
+  const btn = document.getElementById('storage-backend-save-btn');
+  const status = document.getElementById('storage-backend-status');
+  if (!sel || !btn) return;
+  const choice = sel.value;
+  btn.disabled = true;
+  if (status) status.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/storage/backend', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({backend: choice}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    const msg = data.restart_required
+      ? `Saved. Restart the server (Ctrl+C, then re-run) to switch from "${data.active_backend}" to "${choice}".`
+      : `Saved. Backend "${choice}" already active.`;
+    if (window.showToast) window.showToast(msg, 'success');
+    else alert(msg);
+  } catch (e) {
+    if (window.showToast) window.showToast(`Save failed: ${e.message || e}`, 'error');
+    else alert(`Save failed: ${e.message || e}`);
+  } finally {
+    btn.disabled = false;
+    if (status) status.textContent = '';
     loadStorageInfo();
   }
 }
@@ -5376,6 +5451,44 @@ async function fetchIndexCount() {
     const ev = document.getElementById('edge-count-value');
     if (ev) ev.textContent = '0';
     return 0;
+  }
+}
+
+/* Wipe ALL Apollo data for the current project folder:
+   - _apollo/        graph, Couchbase Lite db, embeddings, annotations
+   - _apollo_web/    per-folder web cache
+   Then full-page reload so all in-memory caches (notes, bookmarks,
+   chat thread, hub recents, graph chart …) are dropped and the user
+   lands back on the empty My Hub. Useful for switching CE ↔ EE
+   builds of libcblite or recovering from a corrupt index. */
+async function wipeCurrentProject() {
+  let label = 'this folder';
+  try {
+    const cur = await apiFetch('/api/projects/current');
+    if (cur && cur.root_dir) label = cur.root_dir;
+  } catch (_) { /* not fatal — just fall back to generic label */ }
+
+  if (!confirm(
+    `Delete ALL Apollo data for:\n  ${label}\n\n` +
+    `This removes _apollo/ (graph, Couchbase Lite db, embeddings, ` +
+    `annotations) and _apollo_web/ (cache). The browser will then ` +
+    `refresh.\n\nThis cannot be undone.`
+  )) return;
+
+  const btn = document.getElementById('hub-delete-project-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span> Deleting…'; }
+  try {
+    await apiFetch('/api/projects/leave', {
+      method: 'POST',
+      body: { confirm: true },
+    });
+    // Hard reload (not just location.reload()) to make sure no stale
+    // module state from the wiped project survives.
+    window.location.replace(window.location.pathname);
+  } catch (e) {
+    if (window.showToast) showToast('Delete failed: ' + (e.message || e), 'error');
+    else alert('Delete failed: ' + (e.message || e));
+    if (btn) { btn.disabled = false; btn.innerHTML = '🗑️ Delete'; }
   }
 }
 

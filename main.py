@@ -78,7 +78,7 @@ def _default_index_path(backend: str) -> str:
 
 
 def _open_store(args):
-    backend = getattr(args, "backend", "json")
+    backend = _resolve_backend(args)
     location = args.index or _default_index_path(backend)
     return open_store(backend, location), location
 
@@ -386,22 +386,64 @@ def cmd_serve(args):
     import uvicorn
     from apollo.web.server import create_app
 
-    backend = getattr(args, "backend", "json")
+    backend = _resolve_backend(args)
 
-    # When the user picks the cblite backend, make sure libcblite is
-    # available before we try to open the store. ``apply_env_from_settings``
-    # promotes any persisted ``storage.cblite_lib_path`` into the
-    # process env; ``ensure_default_install`` does a one-shot download of
-    # libcblite CE on first run so a fresh clone works without the user
-    # having to fetch the dylib/dll by hand. The matching UI lives in
+    # Always promote the persisted ``storage.cblite_lib_path`` into the
+    # process env *before* anything imports CBL, even when the active
+    # backend is JSON. Otherwise the Settings → Storage report (and the
+    # Hub "Couchbase Lite" badge) loads whatever libcblite ctypes.util
+    # happens to find first (typically Homebrew's CE build) instead of
+    # the EE/CE edition the user just activated. ``ensure_default_install``
+    # only runs for the cblite backend — we don't want to surprise json
+    # users with a 30 MB download. The matching UI lives in
     # Settings → Storage.
+    from apollo.storage.cblite_installer import (
+        apply_env_from_settings, ensure_default_install, INSTALL_ROOT,
+    )
+    apply_env_from_settings()
     if backend == "cblite":
-        from apollo.storage.cblite_installer import (
-            apply_env_from_settings, ensure_default_install,
-        )
-        apply_env_from_settings()
         ensure_default_install()
         apply_env_from_settings()  # in case ensure_default_install just wrote it
+
+    # Print a storage banner so the operator can see at-a-glance which
+    # backend + libcblite (version, edition, absolute lib path) this
+    # process will use. Helpful when juggling CE ↔ EE builds or diagnosing
+    # "why is it still using CE?" issues. ``CBLITE_LIB_PATH`` was set by
+    # ``apply_env_from_settings`` above when one is configured.
+    print("─" * 70)
+    print(f"Storage backend        : {backend}")
+    print(f"storage_binary/ root   : {os.path.abspath(str(INSTALL_ROOT))}")
+    _active_lib = os.environ.get("CBLITE_LIB_PATH")
+    if _active_lib:
+        # Resolve to make symlinks obvious and confirm the file really exists.
+        try:
+            _resolved = os.path.realpath(_active_lib)
+        except OSError:
+            _resolved = _active_lib
+        print(f"libcblite library path : {_resolved}")
+        # Pull the *configured* version/edition from cblite_config.json
+        # (single source of truth, written by /api/storage/activate).
+        try:
+            import json as _json
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cblite_config.json")) as _f:
+                _cfg = _json.load(_f) or {}
+            print(f"libcblite version      : {_cfg.get('version', '?')}")
+            print(f"libcblite edition      : {_cfg.get('edition', '?')}")
+        except (OSError, ValueError):
+            pass
+        # Probe the dylib for the EE-only vector-index symbol so the user
+        # can spot a mismatch between configured edition and what's
+        # actually loadable from disk.
+        try:
+            import ctypes as _ct
+            _lib = _ct.cdll.LoadLibrary(_active_lib)
+            _has_vec = hasattr(_lib, "CBLCollection_CreateVectorIndex")
+            print(f"libcblite loaded as    : {'enterprise (EE — vector indexes available)' if _has_vec else 'community (CE — no vector indexes)'}")
+        except OSError as _exc:
+            print(f"libcblite load probe   : FAILED — {_exc}")
+    else:
+        print("libcblite library path : <none — JSON backend, libcblite not used>")
+    print("─" * 70)
 
     store, index_path = _open_store(args)
     parser_name = getattr(args, "parser", "auto")
@@ -690,9 +732,35 @@ def _add_common_args(parser):
     parser.add_argument(
         "--backend",
         choices=["json", "cblite"],
-        default="json",
-        help="Storage backend (default: json)",
+        # default=None so the resolver can tell "user didn't pass anything"
+        # apart from "user explicitly chose json", and fall back to the
+        # value saved in data/settings.json by the Settings → Storage UI.
+        default=None,
+        help="Storage backend (overrides data/settings.json; default: json)",
     )
+
+
+def _resolve_backend(args) -> str:
+    """Pick the backend to use for this command.
+
+    Priority: explicit ``--backend`` CLI flag > ``storage.default_backend``
+    saved by the Settings → Storage UI in ``data/settings.json`` > ``json``.
+    The CLI flag still wins so power users can override the persisted UI
+    choice on a single invocation.
+    """
+    explicit = getattr(args, "backend", None)
+    if explicit:
+        return explicit
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        with open(_P("data") / "settings.json") as f:
+            saved = ((_json.load(f) or {}).get("storage") or {}).get("default_backend")
+        if saved in ("json", "cblite"):
+            return saved
+    except (OSError, ValueError):
+        pass
+    return "json"
 
 
 def main():
