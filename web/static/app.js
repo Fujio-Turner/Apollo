@@ -2728,15 +2728,16 @@ function formatTimeAgo(iso) {
   return `${diffYr} ${diffYr === 1 ? 'year' : 'years'} ago`;
 }
 
-/* Fetch recent chats + notes, merge sorted by timestamp, render last 10. */
+/* Fetch recent chats + notes + bookmarks, merge sorted by timestamp, render last 10. */
 async function loadHubRecent() {
   const host = document.getElementById('hub-recent');
   if (!host) return;
   host.innerHTML = '<div class="opacity-60 italic p-3">Loading recent activity…</div>';
 
-  const [threads, notes] = await Promise.all([
+  const [threads, notes, bookmarks] = await Promise.all([
     apiFetch('/api/chat/threads').catch(() => []),
     apiFetch('/api/annotations?type=note').then(d => d.annotations || []).catch(() => []),
+    apiFetch('/api/annotations?type=bookmark').then(d => d.annotations || []).catch(() => []),
   ]);
 
   const items = [];
@@ -2767,14 +2768,31 @@ async function loadHubRecent() {
       subtitle: tgtLabel,
     });
   });
+  (bookmarks || []).forEach(a => {
+    const ts = a.last_modified_at || a.created_at || '';
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const title = (a.content || '').trim() || tgtLabel || 'Bookmark';
+    items.push({
+      kind: 'bookmark',
+      ts,
+      id: a.id,
+      nodeId: tgt.type === 'node' ? tgt.node_id : '',
+      filePath: tgt.type === 'file' ? tgt.file_path : '',
+      title: title.split('\n')[0].slice(0, 80),
+      subtitle: tgtLabel,
+    });
+  });
 
   items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
   const top = items.slice(0, 10);
 
   if (!top.length) {
-    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats or notes yet.</div>';
+    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats, notes, or bookmarks yet.</div>';
     return;
   }
+
+  const deleteBtn = `<button type="button" class="recent-delete" title="Delete" aria-label="Delete">✕</button>`;
 
   host.innerHTML = top.map(it => {
     const when = escapeHtml(formatTimeAgo(it.ts));
@@ -2784,8 +2802,20 @@ async function loadHubRecent() {
             <span class="recent-tag">CHAT</span>
             <span class="recent-title">${escapeHtml(it.title)}</span>
             <span class="recent-time">${when}</span>
+            ${deleteBtn}
           </div>
           <div class="recent-sub">${escapeHtml(it.subtitle)}</div>
+        </div>`;
+    }
+    if (it.kind === 'bookmark') {
+      return `<div class="recent-item recent-bookmark" data-recent-kind="bookmark" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open bookmark">
+          <div class="recent-row">
+            <span class="recent-tag">★ BOOKMARK</span>
+            <span class="recent-title">${escapeHtml(it.title)}</span>
+            <span class="recent-time">${when}</span>
+            ${deleteBtn}
+          </div>
+          ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
         </div>`;
     }
     return `<div class="recent-item recent-note" data-recent-kind="note" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open note">
@@ -2793,16 +2823,41 @@ async function loadHubRecent() {
           <span class="recent-tag">NOTE</span>
           <span class="recent-title">${escapeHtml(it.title)}</span>
           <span class="recent-time">${when}</span>
+          ${deleteBtn}
         </div>
         ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
       </div>`;
   }).join('');
 
   host.querySelectorAll('.recent-item').forEach(el => {
-    el.addEventListener('click', () => {
-      if (el.dataset.recentKind === 'chat') openRecentChat(el.dataset.recentId);
+    el.addEventListener('click', (ev) => {
+      // Skip when the delete button (or anything inside it) was clicked.
+      if (ev.target.closest('.recent-delete')) return;
+      const kind = el.dataset.recentKind;
+      if (kind === 'chat') openRecentChat(el.dataset.recentId);
       else openRecentNote(el.dataset.recentId, el.dataset.recentNode, el.dataset.recentFile);
     });
+    const del = el.querySelector('.recent-delete');
+    if (del) {
+      del.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const kind = el.dataset.recentKind;
+        const id = el.dataset.recentId;
+        const label = kind === 'chat' ? 'chat' : kind === 'bookmark' ? 'bookmark' : 'note';
+        if (!confirm(`Delete this ${label}? This cannot be undone.`)) return;
+        try {
+          if (kind === 'chat') {
+            await apiFetch(`/api/chat/threads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          } else {
+            await apiFetch(`/api/annotations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          }
+          showToast(`${label.charAt(0).toUpperCase() + label.slice(1)} deleted`, 'success');
+          loadHubRecent();
+        } catch (e) {
+          showToast(`Failed to delete ${label}: ${e.message || e}`, 'error');
+        }
+      });
+    }
   });
 }
 
@@ -2810,7 +2865,26 @@ async function loadHubRecent() {
 function openRecentChat(threadId) {
   if (!threadId) return;
   switchView('graph');
-  setTimeout(() => loadChatThread(threadId), 60);
+  // Make sure the bottom chat pane is generously visible — if the user
+  // had dragged the vertical splitter so the chat panel is tiny (or
+  // pushed the detail pane to 85%), restoring a chat into a 1‑line
+  // window makes it look like nothing happened. Force a 50/50 split.
+  const top = document.getElementById('left-vsplit-top');
+  if (top) {
+    top.style.flex = 'none';
+    top.style.height = '50%';
+  }
+  setTimeout(() => {
+    loadChatThread(threadId);
+    // Scroll the chat panel into view and briefly highlight so the
+    // user notices the messages were restored.
+    const pane = document.getElementById('left-vsplit-bottom');
+    if (pane) {
+      pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      pane.classList.add('chat-flash');
+      setTimeout(() => pane.classList.remove('chat-flash'), 900);
+    }
+  }, 60);
 }
 
 /* Open the file/node a note was taken on, without deleting the note. */
