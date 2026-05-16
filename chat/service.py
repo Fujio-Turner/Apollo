@@ -183,11 +183,16 @@ def _select_tools(message: str) -> list[dict]:
 
 
 # Max tool-call rounds before we strip `tools=` and force the model to
-# write a final text answer. Bumped from 5 → 8 because Grok tends to
-# explore aggressively (esp. for "which X is most used" style questions
-# that fan out across search_graph / get_neighbors / get_node) and 5
-# rounds was tipping requests into `rounds_exhausted` with no answer.
-_MAX_TOOL_ROUNDS = 8
+# write a final text answer. History:
+#   5  → too tight; Grok explores aggressively for "which X is most used" /
+#        fan-out questions across search_graph / get_neighbors / get_node and
+#        was tipping into `rounds_exhausted` with no answer.
+#   8  → previous setting.
+#   10 → matches the "hard ceiling 10" in the system prompt (see
+#        `## Round budget` in ai/chat_request.json). The prompt frames 10 as
+#        a stuck-detection backstop, not a target — the soft target is still
+#        3 (targeted) or 4–5 (exploratory).
+_MAX_TOOL_ROUNDS = 10
 
 
 class ChatService:
@@ -775,6 +780,62 @@ class ChatService:
                 "min_strength": min_strength,
             })
 
+        # ── ML tools (PLAN_ML_LIBS.md) ─────────────────────────────────
+        elif name == "list_clusters":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.list_clusters(
+                self.graph, top=int(args.get("top", 50) or 50),
+            ), default=str)
+
+        elif name == "get_cluster_members":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_cluster_members(
+                self.graph,
+                cluster_id=int(args.get("cluster_id", 0) or 0),
+                top=int(args.get("top", 50) or 50),
+            ), default=str)
+
+        elif name == "get_node_importance":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_node_importance(
+                self.graph, node_id=args.get("node_id", ""),
+            ), default=str)
+
+        elif name == "search_graph_by_keyphrase":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.search_graph_by_keyphrase(
+                self.graph,
+                query=args.get("query", ""),
+                top=int(args.get("top", 10) or 10),
+            ), default=str)
+
+        elif name == "get_community":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_community(
+                self.graph, node_id=args.get("node_id", ""),
+            ), default=str)
+
+        elif name == "find_outliers":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.find_outliers(
+                self.graph,
+                top=int(args.get("top", 20) or 20),
+                kind=args.get("kind", "function") or "function",
+            ), default=str)
+
+        elif name == "find_dead_code":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.find_dead_code(
+                self.graph,
+                kind=args.get("kind", "function") or "function",
+            ), default=str)
+
+        elif name == "get_topics":
+            from apollo.ml import tools as ml_tools
+            return json.dumps(ml_tools.get_topics(
+                self.graph, top=int(args.get("top", 20) or 20),
+            ), default=str)
+
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     # ── Chat methods ───────────────────────────────────────────────
@@ -952,6 +1013,7 @@ class ChatService:
             "type": "step",
             "phase": "request",
             "rid": rid,
+            "t_elapsed": round(time.time() - t_start, 3),
             "provider": self.active_provider,
             "model": use_model,
             "history_len": len(history or []),
@@ -1002,6 +1064,7 @@ class ChatService:
                     "type": "step",
                     "phase": "error",
                     "rid": rid,
+                    "t_elapsed": round(time.time() - t_start, 3),
                     "where": "tools",
                     "round": round_idx,
                     "message": str(e),
@@ -1022,6 +1085,7 @@ class ChatService:
                 "type": "step",
                 "phase": "round",
                 "rid": rid,
+                "t_elapsed": round(time.time() - t_start, 3),
                 "round": round_idx,
                 "finish": choice.finish_reason,
                 "dt": round(time.time() - t_round, 3),
@@ -1043,6 +1107,7 @@ class ChatService:
                             "type": "step",
                             "phase": "return_result",
                             "rid": rid,
+                            "t_elapsed": round(time.time() - t_start, 3),
                             "files": args.get("files") or [],
                             "node_refs": args.get("node_refs") or [],
                             "confidence": args.get("confidence") or "",
@@ -1053,6 +1118,7 @@ class ChatService:
                             "type": "step",
                             "phase": "done",
                             "rid": rid,
+                            "t_elapsed": round(time.time() - t_start, 3),
                             "reason": "return_result",
                             "total_dt": round(time.time() - t_start, 3),
                             "bytes": len(rendered),
@@ -1066,6 +1132,7 @@ class ChatService:
                         "type": "step",
                         "phase": "tool_call",
                         "rid": rid,
+                        "t_elapsed": round(time.time() - t_start, 3),
                         "name": tc.function.name,
                         "args_preview": _preview(json.dumps(args, default=str), 300),
                     }
@@ -1082,6 +1149,7 @@ class ChatService:
                         "type": "step",
                         "phase": "tool_return",
                         "rid": rid,
+                        "t_elapsed": round(time.time() - t_start, 3),
                         "name": tc.function.name,
                         "bytes": len(result),
                         "dt": round(time.time() - t_tool, 3),
@@ -1110,6 +1178,7 @@ class ChatService:
                 "type": "step",
                 "phase": "rounds_exhausted",
                 "rid": rid,
+                "t_elapsed": round(time.time() - t_start, 3),
                 "last_finish": last_round_finish,
             }
             # Without an explicit nudge the model often emits 0 tokens here:
@@ -1135,6 +1204,7 @@ class ChatService:
             "type": "step",
             "phase": "stream_begin",
             "rid": rid,
+            "t_elapsed": round(time.time() - t_start, 3),
             "elapsed": round(time.time() - t_start, 3),
         }
         token_count = 0
@@ -1159,6 +1229,7 @@ class ChatService:
                 "type": "step",
                 "phase": "error",
                 "rid": rid,
+                "t_elapsed": round(time.time() - t_start, 3),
                 "where": "stream",
                 "tokens": token_count,
                 "bytes": byte_count,
@@ -1174,6 +1245,7 @@ class ChatService:
             "type": "step",
             "phase": "done",
             "rid": rid,
+            "t_elapsed": round(time.time() - t_start, 3),
             "reason": "stream",
             "tokens": token_count,
             "bytes": byte_count,

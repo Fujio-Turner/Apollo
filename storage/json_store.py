@@ -68,6 +68,57 @@ _GZIP_MAGIC = b"\x1f\x8b"
 _CURRENT_VERSION = 2
 
 
+def _purge_index_sidecars(apollo_dir: Path) -> None:
+    """Delete the per-index sidecars that live alongside the graph file.
+
+    Wipes ``file_hashes.json`` (incremental-reindex state) and
+    ``reindex_history.json`` (sweep telemetry) inside ``apollo_dir`` and at
+    the legacy global locations used by Apollo before per-project state
+    moved into ``<root>/_apollo/``. Leaves ``apollo.json`` (project
+    manifest) and ``chat_history.json`` (user-owned thread history)
+    untouched — those have their own lifecycle.
+
+    Used by ``JsonStore.delete()`` and ``CouchbaseLiteStore.delete()`` so
+    "Delete index" wipes the same set of stale-after-delete files no
+    matter which storage backend is active.
+    """
+    sidecars = ("file_hashes.json", "reindex_history.json")
+    for name in sidecars:
+        p = apollo_dir / name
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    # Legacy / global locations from before the per-project _apollo/ move.
+    for legacy in (
+        Path(".apollo/file_hashes.json"),
+        Path(".apollo/reindex_history.json"),
+        Path("data/file_hashes.json"),
+    ):
+        if legacy.exists():
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+
+
+def _stringify_keys(obj: Any) -> Any:
+    """Recursively coerce dict keys to strings.
+
+    orjson refuses non-string keys; the ML sidecar dicts use int keys
+    (``ml_clusters``: ``{cluster_id → summary}``). Walk the structure
+    once on save so the encoder is happy. ``list_clusters`` /
+    ``get_topics`` iterate ``.values()`` only, so the round-trip key
+    type is irrelevant to consumers.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _stringify_keys(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_stringify_keys(v) for v in obj]
+    return obj
+
+
 def _serialize(payload: dict[str, Any]) -> bytes:
     """Serialize ``payload`` to compact UTF-8 bytes.
 
@@ -150,6 +201,13 @@ class JsonStore:
             "nodes": nodes,
             "edges": edges,
         }
+        # Graph-level attrs (e.g. ml_clusters, ml_topics, ml_dead_code
+        # sidecars written by ml/passes.py) live on `graph.graph`. Without
+        # this they get silently dropped on every save/load round-trip.
+        # orjson rejects non-str dict keys, so coerce nested int keys
+        # (cluster_id / topic_id) to strings; load() reverses this.
+        if graph.graph:
+            payload["graph_attrs"] = _stringify_keys(dict(graph.graph))
         _write_bytes(path, _serialize(payload))
 
     def load(self, filepath: str | None = None, *, include_embeddings: bool = True) -> nx.DiGraph:
@@ -191,6 +249,11 @@ class JsonStore:
                 dst = edge.pop("target")
                 graph.add_edge(src, dst, **edge)
 
+        # Restore graph-level attrs (ml_clusters, ml_topics, …) if present.
+        graph_attrs = raw.get("graph_attrs")
+        if isinstance(graph_attrs, dict):
+            graph.graph.update(graph_attrs)
+
         return graph
 
     # ------------------------------------------------------------------
@@ -215,11 +278,20 @@ class JsonStore:
         pass
 
     def delete(self) -> None:
-        """Delete the index file and associated incremental-hash sidecar.
+        """Delete the index file and all per-index sidecars.
 
-        Removes both the configured path and the sibling ``.gz`` /
-        non-``.gz`` twin so users who toggle compression don't end up with
-        a stale copy of the other variant masquerading as the live index.
+        Removes:
+          * the configured path and its ``.gz`` / non-``.gz`` twin (so users
+            who toggle compression don't leave a stale copy behind),
+          * the sibling ``file_hashes.json`` (incremental-reindex state —
+            stale once the graph it describes is gone),
+          * the sibling ``reindex_history.json`` (sweep telemetry — refers
+            to runs against an index that no longer exists).
+
+        Preserved on purpose: ``apollo.json`` (project manifest) and
+        ``chat_history.json`` (user-owned conversation history; deleting
+        chat threads gets its own button rather than being silently bundled
+        into "Delete index").
         """
         path = Path(self._filepath)
         # Remove both the chosen file and its compression twin so neither
@@ -232,16 +304,4 @@ class JsonStore:
         for p in twins:
             if p.exists():
                 p.unlink()
-        # Sibling file_hashes.json lives in the same _apollo/ directory
-        # as the graph file; remove it so a fresh reindex starts clean.
-        sibling_hashes = path.parent / "file_hashes.json"
-        if sibling_hashes.exists():
-            sibling_hashes.unlink()
-        # Best-effort cleanup of legacy global locations (left over from
-        # before per-project state moved into ``_apollo/``).
-        for legacy in (Path(".apollo/file_hashes.json"), Path("data/file_hashes.json")):
-            if legacy.exists():
-                try:
-                    legacy.unlink()
-                except OSError:
-                    pass
+        _purge_index_sidecars(path.parent)

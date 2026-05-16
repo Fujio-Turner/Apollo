@@ -290,6 +290,49 @@ def _build_active_parsers() -> list:
     return found
 
 
+def _cblite_info(active_backend: str) -> dict:
+    """Return libcblite version/edition metadata for the UI.
+
+    Reads ``cblite_config.json`` (repo root) for the *configured* target
+    edition/version and probes the loaded shared library (if any) for
+    the EE-only ``CBLCollection_CreateVectorIndex`` symbol to determine
+    the *loaded* edition. Always returns a dict so the frontend can
+    render a single consistent block; ``loaded_edition`` is ``None``
+    when libcblite isn't loaded (e.g. JSON backend on a host without
+    libcblite installed).
+    """
+    info: dict = {
+        "active_backend": active_backend,
+        "configured_version": None,
+        "configured_edition": None,
+        "loaded_edition": None,
+        "vector_index_available": False,
+    }
+    cfg_path = Path(__file__).parent.parent / "cblite_config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = json_mod.load(f) or {}
+        info["configured_version"] = cfg.get("version")
+        info["configured_edition"] = cfg.get("edition")
+    except (OSError, ValueError):
+        pass
+
+    # Probe the loaded shared library, if any. Importing CBL triggers
+    # _load_library() lazily; guard against import failures and
+    # CouchbaseLiteNotAvailable when the .so/.dylib isn't installed.
+    try:
+        from apollo.storage.cblite.ctypes_api import CBL
+        lib = CBL._get_lib()  # cached after first call
+        has_vec = hasattr(lib, "CBLCollection_CreateVectorIndex")
+        info["loaded_edition"] = "enterprise" if has_vec else "community"
+        info["vector_index_available"] = bool(has_vec)
+    except Exception:
+        # Library not present, mismatched arch, etc. — leave loaded_edition None.
+        pass
+
+    return info
+
+
 def create_app(store, backend: str = "json", root_dir: str | None = None, parsers: list | None = None, version: str = "0.7.2") -> FastAPI:
     """Create and configure the FastAPI application."""
     # Bring up logging early using whatever the user has saved in
@@ -311,8 +354,10 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         allow_headers=["*"],
     )
     
-    # Initialize ProjectManager for project lifecycle management
-    project_manager = ProjectManager(version=version)
+    # Initialize ProjectManager for project lifecycle management.
+    # Pass through the active backend so new projects opened/initialized
+    # via the web UI inherit it (instead of always landing on "json").
+    project_manager = ProjectManager(version=version, default_backend=backend)
 
     # ── Per-project store resolution ────────────────────────────────
     # The store passed into create_app is the *startup* store (typically
@@ -898,6 +943,47 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
 
+            # Spatial coords + ML passes (UMAP/HDBSCAN/PageRank/KeyBERT/
+            # Louvain/IsolationForest/BERTopic/vulture). Mirrors the CLI
+            # ``main.py index`` path so the per-project ``_apollo/graph.json``
+            # ends up with the same ``cluster_id`` / ``umap_xy`` / ``pagerank``
+            # / ``community_id`` / ``keyphrases`` / ``topic_id`` /
+            # ``outlier_score`` attributes the chat ML tools (and the
+            # ``/api/ml/*`` HTTP twins) need to be useful. Without this
+            # block, ``list_clusters`` / ``get_topics`` / ``find_outliers`` /
+            # ``get_node_importance`` all return
+            # ``{ml_available: false, reason: "<pass> never ran"}`` for any
+            # graph that was indexed via the web UI rather than the CLI.
+            try:
+                from apollo.spatial import SpatialMapper
+                t_sp = time.time()
+                logger.info("indexing: computing spatial coordinates")
+                SpatialMapper().compute_all(graph)
+                logger.info("spatial coords in %.2fs", time.time() - t_sp)
+            except Exception:
+                logger.warning("spatial coordinates skipped (SpatialMapper unavailable?)")
+
+            try:
+                from apollo.ml import run_all_passes
+                t_ml = time.time()
+                logger.info("indexing: running ML passes")
+                ml_embedder = None
+                try:
+                    from apollo.embeddings.embedder import get_shared_embedder as _shared_emb
+                    ml_embedder = _shared_emb()
+                except Exception:
+                    ml_embedder = None
+                ml_summary = run_all_passes(graph, root_dir=target, embedder=ml_embedder)
+                for k, v in (ml_summary or {}).items():
+                    tag = "ok" if v.get("ml_available") else "skip"
+                    detail = (f"computed={v.get('computed')}"
+                              if v.get("ml_available")
+                              else v.get("reason", "unavailable"))
+                    logger.info("  ML[%s] %s — %s", k, tag, detail)
+                logger.info("ML passes in %.2fs", time.time() - t_ml)
+            except Exception as e:
+                logger.warning("ML passes skipped: %s", e)
+
             _indexing_status.update(step=3, step_label="Saving to store",
                                     detail="Embeddings done")
             t2 = time.time()
@@ -1012,21 +1098,12 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
        if reindex_service is None:
            raise HTTPException(status_code=503, detail="Reindex service not available")
        history = reindex_service.get_history(limit)
+       # ``ReindexStats`` carries strategy/started_at + file/edge counts.
+       # ``nodes_added``/``nodes_removed`` belong to ``GraphDiff`` and
+       # aren't surfaced here — use the graph stats endpoint for totals.
        return {
-           "history": [
-               {
-                   "duration_ms": s.duration_ms,
-                   "files_parsed": s.files_parsed,
-                   "nodes_added": s.nodes_added,
-                   "nodes_removed": s.nodes_removed,
-                   "edges_added": s.edges_added,
-                   "edges_removed": s.edges_removed,
-                   "timestamp": str(s.timestamp) if hasattr(s, 'timestamp') else None,
-                   "strategy": s.strategy if hasattr(s, 'strategy') else "unknown",
-               }
-               for s in history
-           ],
-           "count": len(history)
+           "history": [s.to_dict() for s in history],
+           "count": len(history),
        }
     
     @app.get("/api/index/last")
@@ -1042,16 +1119,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
            }
        return {
            "status": "success",
-           "last_stats": {
-               "duration_ms": stats.duration_ms,
-               "files_parsed": stats.files_parsed,
-               "nodes_added": stats.nodes_added,
-               "nodes_removed": stats.nodes_removed,
-               "edges_added": stats.edges_added,
-               "edges_removed": stats.edges_removed,
-               "timestamp": str(stats.timestamp) if hasattr(stats, 'timestamp') else None,
-               "strategy": stats.strategy if hasattr(stats, 'strategy') else "unknown",
-           }
+           "last_stats": stats.to_dict(),
        }
     
     @app.post("/api/index/sweep")
@@ -1071,14 +1139,7 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
            return {
                "status": "success",
                "message": f"Sweep complete in {stats.duration_ms}ms",
-               "stats": {
-                   "duration_ms": stats.duration_ms,
-                   "files_parsed": stats.files_parsed,
-                   "nodes_added": stats.nodes_added,
-                   "nodes_removed": stats.nodes_removed,
-                   "edges_added": stats.edges_added,
-                   "edges_removed": stats.edges_removed,
-               }
+               "stats": stats.to_dict(),
            }
        except Exception as e:
            raise HTTPException(status_code=500, detail=f"Sweep failed: {str(e)}")
@@ -1797,7 +1858,11 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
 
     @app.get("/api/stats")
     def stats():
-        return q.stats()
+        data = dict(q.stats() or {})
+        # Enrich with libcblite edition/version info so the UI can
+        # surface CE-vs-EE in the "My Files Index Analytics" section.
+        data["cblite_info"] = _cblite_info(backend)
+        return data
 
     # ── PLAN_MORE_LOCAL_AI_FUNCTIONS endpoints ─────────────────────────
     # Mirror the new chat-agent tools as HTTP endpoints so the human-facing
@@ -1945,6 +2010,58 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             graph, root_dir, path,
             name=name, line_start=line_start, line_end=line_end, limit=limit,
         )
+
+    # ─────────────────────── ML endpoints (PLAN_ML_LIBS.md) ─────────────────
+    # Mirror the chat-agent ML tools as HTTP endpoints so the human-facing
+    # UI has parity with the AI's view (per API_OPENAPI.md §5 and the
+    # PLAN_MORE_LOCAL_AI_FUNCTIONS rule 5). Every endpoint reads only —
+    # heavy ML work happens at index time in `ml/passes.py`.
+
+    @app.get("/api/ml/clusters")
+    def api_ml_clusters(top: int = Query(50, ge=1, le=200)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.list_clusters(graph, top=top)
+
+    @app.get("/api/ml/clusters/{cluster_id}")
+    def api_ml_cluster_members(cluster_id: int,
+                                top: int = Query(50, ge=1, le=200)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_cluster_members(graph, cluster_id=cluster_id,
+                                              top=top)
+
+    @app.get("/api/ml/importance")
+    def api_ml_importance(node_id: str = Query(...)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_node_importance(graph, node_id=node_id)
+
+    @app.get("/api/ml/keyphrase")
+    def api_ml_keyphrase(query: str = Query(...),
+                         top: int = Query(10, ge=1, le=50)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.search_graph_by_keyphrase(graph, query=query, top=top)
+
+    @app.get("/api/ml/community")
+    def api_ml_community(node_id: str = Query(...)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_community(graph, node_id=node_id)
+
+    @app.get("/api/ml/outliers")
+    def api_ml_outliers(top: int = Query(20, ge=1, le=100),
+                        kind: str = Query("function",
+                                          pattern="^(function|method|class|any)$")):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.find_outliers(graph, top=top, kind=kind)
+
+    @app.get("/api/ml/dead-code")
+    def api_ml_dead_code(kind: str = Query("function",
+                                            pattern="^(function|class|variable|any)$")):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.find_dead_code(graph, kind=kind)
+
+    @app.get("/api/ml/topics")
+    def api_ml_topics(top: int = Query(20, ge=1, le=100)):
+        from apollo.ml import tools as ml_tools
+        return ml_tools.get_topics(graph, top=top)
 
     # -------------------------------------------------------------- Logging --
 
@@ -2289,6 +2406,154 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "config": existing_override,
             "active_parsers": n,
         }
+
+    # ----------------------------------------------------------- Storage --
+    # libcblite installer endpoints — back the Settings → Storage tab.
+    # Lets the user pick a Couchbase Lite C edition/version, download it
+    # into <repo>/storage_binary/, and activate it (persists the lib path
+    # to settings.json so the next server start picks it up).
+
+    @app.get("/api/storage/info")
+    def storage_info():
+        from apollo.storage import cblite_installer as cbi
+        plat = cbi.detect_platform()
+        installed = cbi.list_installed()
+        active = cbi.get_active_lib_path()
+        # Pair with the existing CBL probe so the UI can show loaded
+        # edition + vector-index availability in one card.
+        cbl_info = _cblite_info(backend)
+        # Surface the persisted default backend so the Settings → Storage
+        # UI can render the JSON ↔ cblite selector with the right option
+        # pre-selected. ``active_backend`` is what *this* server process
+        # actually booted with (CLI flag or persisted default); the saved
+        # value may differ until the user restarts.
+        settings = _load_settings() or {}
+        saved_backend = (settings.get("storage") or {}).get("default_backend")
+        return {
+            "platform": plat,
+            "known_versions": cbi.KNOWN_VERSIONS,
+            "editions": list(cbi.EDITIONS),
+            "default_version": cbi.DEFAULT_VERSION,
+            "install_root": str(cbi.INSTALL_ROOT),
+            "installed": installed,
+            "active_lib_path": active,
+            "active_backend": backend,
+            "saved_default_backend": saved_backend,
+            "cblite_info": cbl_info,
+        }
+
+    @app.post("/api/storage/install")
+    async def storage_install(request: Request):
+        """Download + extract one (version, edition) for the host OS.
+
+        Body: ``{"version": "4.0.3", "edition": "community"}``.
+        Synchronous — returns when the archive is extracted. Auto-activates
+        the install if nothing else is currently active.
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        version = (body or {}).get("version") or cbi.DEFAULT_VERSION
+        edition = (body or {}).get("edition") or "community"
+        if edition not in cbi.EDITIONS:
+            raise HTTPException(status_code=400, detail=f"edition must be one of {cbi.EDITIONS}")
+
+        try:
+            info = cbi.install(version, edition)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # First install wins activation automatically.
+        if not cbi.get_active_lib_path():
+            cbi.set_active_lib_path(info["lib_path"], edition=edition, version=version)
+            info["activated"] = True
+        else:
+            info["activated"] = False
+        return info
+
+    @app.post("/api/storage/activate")
+    async def storage_activate(request: Request):
+        """Persist ``lib_path`` as the active CBLITE_LIB_PATH.
+
+        Takes effect on the next server start (ctypes can't reload a
+        shared library mid-process).
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        lib_path = ((body or {}).get("lib_path") or "").strip()
+        if not lib_path or not Path(lib_path).exists():
+            raise HTTPException(status_code=400, detail=f"lib_path not found: {lib_path!r}")
+        edition = (body or {}).get("edition")
+        version = (body or {}).get("version")
+        cbi.set_active_lib_path(lib_path, edition=edition, version=version)
+        return {
+            "status": "saved",
+            "active_lib_path": lib_path,
+            "restart_required": True,
+        }
+
+    @app.post("/api/storage/backend")
+    async def storage_set_backend(request: Request):
+        """Persist the default storage backend for new server starts.
+
+        Body: ``{"backend": "json"|"cblite"}``. Saved under
+        ``storage.default_backend`` in ``data/settings.json``. Takes
+        effect the next time ``main.py serve`` is launched without an
+        explicit ``--backend`` flag (the CLI flag still wins). Returns
+        ``restart_required: true`` because the running process keeps the
+        backend it booted with.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        new_backend = ((body or {}).get("backend") or "").strip().lower()
+        if new_backend not in ("json", "cblite"):
+            raise HTTPException(status_code=400, detail="backend must be 'json' or 'cblite'")
+        settings = _load_settings() or {}
+        storage = settings.setdefault("storage", {})
+        storage["default_backend"] = new_backend
+        _save_settings(settings)
+        return {
+            "status": "saved",
+            "saved_default_backend": new_backend,
+            "active_backend": backend,
+            "restart_required": new_backend != backend,
+        }
+
+    @app.delete("/api/storage/install")
+    async def storage_uninstall(request: Request):
+        """Delete an extracted install directory.
+
+        Body: ``{"install_dir": "/abs/path"}``. The path must live under
+        ``storage_binary/`` — anything else is rejected.
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        target = ((body or {}).get("install_dir") or "").strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="install_dir required")
+        try:
+            cbi.uninstall(target)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Uninstall failed: {exc}")
+        # If we just deleted the active install, clear the saved pointer.
+        active = cbi.get_active_lib_path()
+        if active and target in active:
+            cbi.set_active_lib_path("", edition=None, version=None)
+        return {"status": "removed", "install_dir": target}
 
     # ---------------------------------------------------------------- Chat --
 

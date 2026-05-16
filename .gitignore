@@ -44,6 +44,14 @@ data/_apollo/
 data/_apollo_web/
 data/logs/
 
+# Couchbase Lite shared-library binaries downloaded by the in-app
+# installer (Settings → Storage). Tens of MB of platform-specific
+# .dylib/.dll/.so files — never commit. The folder itself is kept in
+# git (via storage_binary/.gitkeep) so the installer always has a
+# target dir to write into.
+storage_binary/*
+!storage_binary/.gitkeep
+
 # Couchbase Lite databases (per-project + global). The .cblite2 directory
 # can grow to many MB; never commit it.
 *.cblite2

@@ -26,3 +26,32 @@ tree-sitter-javascript>=0.23
 tree-sitter-typescript>=0.23
 tree-sitter-go>=0.23
 tree-sitter-rust>=0.23,<0.24
+
+# ─── ML extras (PLAN_ML_LIBS.md) ─────────────────────────────────────
+# All optional. The indexer's ML passes (`ml/passes.py`) and the
+# matching chat tools (`list_clusters`, `get_node_importance`,
+# `find_outliers`, `get_topics`, `find_dead_code`, ...) skip cleanly
+# with `ml_available=false` when these aren't installed. Install only
+# what you want; the per-pass cost is documented in
+# `docs/work/PLAN_ML_LIBS.md` §3.6.
+#
+# Phase 1 (UMAP layout, HDBSCAN clusters, KeyBERT keyphrases — ~80 MB):
+#   pip install umap-learn hdbscan keybert
+# Phase 2 (Louvain communities — ~5 MB; falls back to NetworkX
+# greedy_modularity_communities when missing):
+#   pip install python-louvain
+# Phase 3 (vulture dead-code — ~1 MB):
+#   pip install vulture
+# Phase 4 (BERTopic auto-labelled topics — ~30 MB):
+#   pip install bertopic
+# scikit-learn (already pulled in by sentence-transformers) is the
+# Phase 3.1 IsolationForest backend — no extra install needed.
+#
+# These intentionally are NOT in the always-required list to keep the
+# default install lean. Uncomment any you want bundled by default:
+# umap-learn>=0.5
+# hdbscan>=0.8
+# keybert>=0.8
+# python-louvain>=0.16
+# vulture>=2.10
+# bertopic>=0.16

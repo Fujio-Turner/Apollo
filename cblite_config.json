@@ -1,0 +1,6 @@
+{
+  "$comment": "Single source of truth for the Couchbase Lite C library version/edition Apollo targets. Read at Docker build time (Dockerfile.cblite) and at project-create time (apollo/projects/manifest.py).",
+  "version": "4.0.3",
+  "edition": "enterprise",
+  "platform": "linux-x86_64"
+}

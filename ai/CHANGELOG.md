@@ -1,0 +1,15 @@
+# `chat_request.json` snapshot history
+
+The live file is `ai/chat_request.json`. Before each tuning round we copy it to `chat_request_v{N}.json` so changes are rollback-able.
+
+| Version | Date       | Notes |
+|---------|------------|-------|
+| v1      | original   | Pre-tuning baseline. |
+| v2      | 2025-05-13 | After PLAN_MORE_LOCAL_AI_FUNCTIONS phases 1–4. |
+| v3      | 2025-05-13 | Pre-Phase-8 baseline. |
+| v4      | 2025-05-13 | Post-Phase 8. |
+| v5      | 2025-05-13 | Pre PLAN_ML_LIBS — UMAP / HDBSCAN / PageRank / KeyBERT / Louvain / IsolationForest / BERTopic / vulture. |
+| v6      | 2026-05-14 | Pre tool-catalog rewrite (single-source-of-truth routing rules + concise descriptions + bucketed cheat-sheet). |
+| v7      | 2026-05-15 | Pre ML-tool promotion rewrite. Live file now adds: (1) "First-turn defaults" MUST-rules forcing ML tools on overview / importance / concept / smell / dead-code / cohesion questions; (2) adversarial routing examples (obvious tool wrong); (3) tiered round budget (3 targeted / 5 exploratory); (4) ML tool descriptions reworded to lead with the question they answer instead of the algorithm. Targets the issue that the model previously almost never picked `get_topics` / `list_clusters` / `get_node_importance` / `search_graph_by_keyphrase` / `get_community` / `find_outliers` / `find_dead_code` / `get_cluster_members`. |
+| v8      | 2026-05-15 | Pre ML-weighting removal + return_result discipline. After confirming v7's MUST-rules made the model pick `find_outliers` correctly, the heavy weighting was rolled back. Live file now: (1) drops "First-turn defaults (MUST rules)" section; (2) drops "Adversarial routing examples" section; (3) drops all `(REQUIRED — see rule #N)` tags from the cheat-sheet so every tool competes on the merit of its description; (4) softens the ML tool descriptions (still question-led, but no more "REQUIRED" / "is a bug" wording); (5) ADDS a "Return-result discipline" section requiring `return_result` (with top node IDs in `node_refs`) as the next round after ANY ML insight tool — fixes the bare-stream-after-`find_outliers` behavior observed in the v7 trace. Kept: tiered round budget (3/5). |
+| v9      | 2026-05-15 | Pre round-budget softening. Live file replaces the hard tiered cap ("3 targeted / 5 exploratory") with a soft target + hard ceiling model: soft target 3 (targeted) or 4–5 (exploratory), HARD ceiling 10 rounds. Adds an explicit latency note ("each round doubles wall-clock time") and a "each extra round needs a reason" gate. Motivation: lifting the cap from 3 to 5 in v8 roughly doubled response time; we want exploration headroom WITHOUT making it cheap to burn rounds. The hard ceiling exists only as a stuck-detection backstop, not a target. |

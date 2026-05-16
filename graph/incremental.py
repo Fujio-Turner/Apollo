@@ -427,9 +427,14 @@ class ResolveFullStrategy:
         for parsed in parsed_files:
             builder._resolve_calls(parsed)
         
-        # Add resolved edges from the builder
+        # Add resolved edges from the builder. We also merge "contains"
+        # edges so re-parsed files stay connected to their parent
+        # directory — otherwise removing the file node in step 2 strips
+        # the dir→file link, the file becomes an orphan root, and
+        # /api/tree starts returning a synthetic "root" wrapper after the
+        # next server restart (issue #11).
         for src, dst, data in builder.graph.edges(data=True):
-            if data.get("type") in ("calls", "inherits", "tests"):
+            if data.get("type") in ("calls", "inherits", "tests", "contains"):
                 new_graph.add_edge(src, dst, **data)
         
         # Compute diff
@@ -613,12 +618,20 @@ class ResolveLocalStrategy:
         
         # See note above (first call site) — discover yields 5-tuples;
         # the trailing slots are placeholders we re-fill per file.
+        # ``_discover_files`` already captured (mtime_ns, size) for each
+        # file during its single os.walk pass, so we read them from
+        # ``builder._file_stats`` instead of doing a second per-file
+        # ``os.stat`` here. ("Do it less often.")
+        discovered_stats = builder._file_stats
         for parser, src_file, rel_path, _src, _md5 in files_to_parse_all:
-            try:
-                st = src_file.stat()
-            except OSError:
+            cached_st = discovered_stats.get(rel_path)
+            if cached_st is None:
+                # File vanished between discovery and now — skip it the
+                # same way the old per-file ``stat()`` would have.
                 continue
-            
+            cur_mtime = cached_st["mtime_ns"]
+            cur_size = cached_st["size"]
+
             prev = prev_hashes.get(rel_path)
             if isinstance(prev, dict):
                 prev_mtime = prev.get("mtime_ns")
@@ -628,15 +641,15 @@ class ResolveLocalStrategy:
                 prev_mtime = None
                 prev_size = None
                 prev_sha = prev
-            
+
             # Fast path: if mtime and size unchanged, skip read
             if (prev_mtime is not None
-                    and prev_mtime == st.st_mtime_ns
-                    and prev_size == st.st_size):
+                    and prev_mtime == cur_mtime
+                    and prev_size == cur_size):
                 new_hashes[rel_path] = prev
                 files_skipped += 1
                 continue
-            
+
             # Metadata changed — read and hash
             try:
                 content = src_file.read_bytes()
@@ -645,11 +658,11 @@ class ResolveLocalStrategy:
             file_hash = hashlib.sha256(content).hexdigest()
             file_md5_hex = hashlib.md5(content).hexdigest()
             source_text = content.decode("utf-8", errors="replace")
-            
+
             new_hashes[rel_path] = {
                 "sha256": file_hash,
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
+                "mtime_ns": cur_mtime,
+                "size": cur_size,
             }
             
             if file_hash == prev_sha:
@@ -693,9 +706,11 @@ class ResolveLocalStrategy:
         for parsed in parsed_files:
             builder._resolve_calls(parsed)
         
-        # Add resolved edges from the builder
+        # Add resolved edges from the builder. "contains" edges are
+        # merged too so re-parsed files keep their dir→file link
+        # (see issue #11 / ResolveFullStrategy comment above).
         for src, dst, data in builder.graph.edges(data=True):
-            if data.get("type") in ("calls", "inherits", "tests"):
+            if data.get("type") in ("calls", "inherits", "tests", "contains"):
                 new_graph.add_edge(src, dst, **data)
         
         # Compute diff
@@ -774,35 +789,23 @@ class FullBuildStrategy:
         # Full rebuild
         builder = self.builder or GraphBuilder()
         new_graph = builder.build(root_dir)
-        
-        # Compute new hashes for all files
-        root = Path(root_dir).resolve()
-        new_hashes: dict[str, dict] = {}
-        for dirpath, dirnames, filenames in os.walk(root):
-            # Hard skip Apollo's own state dirs (``_apollo`` / ``_apollo_web``
-            # — the per-project store and web-UI state — plus legacy
-            # ``.apollo``) and VCS metadata, plus the usual dependency /
-            # build directories. ``_apollo*`` does NOT start with a dot, so
-            # it must be named explicitly here.
-            dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith(".")
-                and d != "__pycache__"
-                and d not in {"_apollo", "_apollo_web", ".apollo", ".git",
-                              "venv", ".venv", "node_modules", "build", "dist"}
-            ]
-            
-            for fname in filenames:
-                if fname.startswith("."):
-                    continue
-                
-                src_file = Path(dirpath) / fname
-                rel_path = str(src_file.relative_to(root))
-                
-                try:
-                    new_hashes[rel_path] = _compute_file_hash(src_file)
-                except (OSError, IOError):
-                    continue
+
+        # Compute new hashes for all files.
+        #
+        # "Do less" optimization: this used to do a *second* full os.walk
+        # of the project, plus a per-file ``read()`` + SHA256 inside
+        # ``_compute_file_hash``. On a 10K-file project that meant 10K
+        # extra stat calls, 10K extra reads, and 10K extra SHA256
+        # computations — none of which is needed on first index, because
+        # the next incremental sweep's fast-path only consults the SHA256
+        # when ``mtime_ns + size`` already differ from the cached values.
+        #
+        # The builder now records ``{mtime_ns, size}`` for every file it
+        # discovered during its single os.walk pass (see
+        # ``GraphBuilder._discover_files``); we just hand that to the
+        # caller. The SHA256 stays unset and is filled lazily on the next
+        # sweep, and only for files whose stat actually changed.
+        new_hashes: dict[str, dict] = dict(builder._file_stats)
         
         # Compute diff
         diff = compute_diff(graph_in, new_graph)

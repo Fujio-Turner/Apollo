@@ -493,6 +493,95 @@ The most powerful mode — vector search to find candidates, then graph traversa
 > search "email" --top 5 --expand callers
 ```
 
+### 4.6 ML Pipeline (PLAN_ML_LIBS)
+
+After the parser builds the graph and the embedder attaches 384-d vectors,
+Apollo runs a **post-index ML pipeline** ([`ml/passes.py`](../ml/passes.py))
+that decorates each node with structural and semantic signals the chat agent
+and the human UI can read in O(1):
+
+| Pass            | Library                 | Output (per node, unless noted)                          | Optional |
+|-----------------|-------------------------|----------------------------------------------------------|----------|
+| `centrality`    | NetworkX (always on)    | `pagerank`, `betweenness`                                | no       |
+| `layout`        | `umap-learn`, `hdbscan` | `umap_xy` (2-D coord), `cluster_id` (-1 = noise)         | yes      |
+| `keyphrases`    | `keybert`               | `keyphrases: [{text, score}]`                            | yes      |
+| `communities`   | `python-louvain` → fallback `nx.greedy_modularity_communities` | `community_id` | yes (fallback always works) |
+| `outliers`      | `scikit-learn` (`IsolationForest`) | `outlier_score`, `outlier_reason`             | yes      |
+| `topics`        | `bertopic`              | `topic_id`; graph-level `ml_topics` sidecar              | yes      |
+| `dead_code`     | `vulture`               | graph-level `ml_dead_code` sidecar (cross-validated with zero in-degree) | yes |
+
+**Graceful degradation contract.** Every pass is wrapped in `try/except` on
+the lib import. A missing optional dependency produces
+`{ml_available: false, reason: "<lib> not installed"}` in the orchestrator
+summary instead of an exception — so a fresh checkout with only the base
+`requirements.txt` installed still indexes successfully, and the chat tools
+return the same shape with a "re-install ML extras" hint instead of 500-ing.
+See [`requirements.txt`](../requirements.txt) for the optional install
+commands (UMAP / HDBSCAN / KeyBERT / Louvain / vulture / BERTopic — ~115 MB
+total when all are added).
+
+**Two consumers, one source of truth.**
+
+1. **Chat tools** ([`ml/tools.py`](../ml/tools.py)) — 8 helpers
+   (`list_clusters`, `get_cluster_members`, `get_node_importance`,
+   `search_graph_by_keyphrase`, `get_community`, `find_outliers`,
+   `find_dead_code`, `get_topics`). Wired into the LLM tool catalog at
+   [`ai/chat_request.json`](../ai/chat_request.json) and dispatched from
+   [`chat/service.py`](../chat/service.py).
+2. **HTTP twins** — `GET /api/ml/*` endpoints in
+   [`web/server.py`](../web/server.py) (8 routes under the `ML` OpenAPI tag).
+   Same return shape as the chat tools so the frontend (`MLLens` global in
+   [`web/static/app.js`](../web/static/app.js), plus UMAP-seeded ECharts
+   layout + cluster-coloured nodes) can call them directly without going
+   through the agent.
+
+#### 4.6.1 Where the pipeline runs (and where it doesn't)
+
+The ML pipeline must run on **every code path that produces a per-project
+graph store** — otherwise the consumer side returns
+`{ml_available: false, reason: "<pass> never ran"}` for every query and the
+human/agent has no way to recover except a manual re-index.
+
+| Code path                                    | Calls `run_all_passes()`? |
+|----------------------------------------------|---------------------------|
+| `python main.py index <dir>`                 | ✅ — wired in [main.py](../main.py) after embeddings, behind `--no-ml` |
+| `POST /api/index` (web UI re-index)          | ✅ — wired in `_do_index()` in [web/server.py](../web/server.py), mirrors the CLI block |
+| `ReindexService.run_sweep()` (background)    | ❌ — *carries over* existing ML attrs only (whitelist in [apollo/reindex_service.py](../apollo/reindex_service.py)). Re-running the passes on every 30-min sweep would dominate sweep cost without changing answers between full re-indexes. |
+
+**Failure mode this design prevents.** Before the web indexer was wired up,
+opening a project through the GUI produced an `_apollo/graph.json` with no
+`pagerank` / `cluster_id` / `umap_xy`, so every `/api/ml/*` endpoint and
+every chat ML tool returned `ml_available: false`. The CLI worked, the web
+UI silently didn't. Both code paths now go through the same
+`spatial → run_all_passes` block right before `store.save(graph)`.
+
+**Recovery flow when the chat reports `ml_available: false`:**
+
+1. `GET /api/active-store` to confirm which on-disk file the server is reading.
+2. Either click "Re-index" in the GUI or `python main.py index <dir>
+   --index <dir>/_apollo/graph.json` (the `--index` flag is critical — without
+   it the CLI writes to `data/index.json` instead of the per-project store).
+3. Re-ask the chat — `list_clusters` / `get_topics` / `get_node_importance`
+   now return populated data.
+
+#### 4.6.2 Round-budget impact
+
+The point of the ML pipeline isn't "more features" — it's **fewer chat
+rounds per question**. Index-time precomputation collapses the multi-round
+discovery loop the agent used to need:
+
+| Question                                        | Before (rounds) | After (rounds) |
+|-------------------------------------------------|----------------:|---------------:|
+| "What modules exist in this codebase?"          | 4–5 (`project_search` × N) | **1** (`list_clusters`) |
+| "Which functions matter most?"                  | 2–3 (degree heuristic) | **1** (`get_node_importance`) |
+| "Find rate-limiting / throttling / retry code"  | 3–4 (regex sweeps) | **1** (`search_graph_by_keyphrase`) |
+| "What's weird in this repo?"                    | n/a (no tool)   | **1** (`find_outliers`) |
+| "Is X dead code?"                               | 2 (grep + guess) | **1** (`find_dead_code`) |
+
+See [`docs/work/PLAN_ML_LIBS.md`](work/PLAN_ML_LIBS.md) for the original
+plan and [`docs/work/PLAN_ML_LIBS_IMPLEMENTATION_REPORT.md`](work/PLAN_ML_LIBS_IMPLEMENTATION_REPORT.md)
+for the full implementation post-mortem.
+
 ---
 
 ## 5. Couchbase Lite Deep Dive — Pros & Cons
@@ -1154,6 +1243,22 @@ in **one round** instead of N grep-and-disambiguate rounds.
 | `list_declarations` | `GET /api/files/declarations` | `listDeclarations` | 8 |
 | `find_symbol_usages` | `GET /api/files/usages` | `findSymbolUsages` | 8 |
 | `outline_file` | `GET /api/files/outline` | `outlineFile` | 8 |
+| `list_clusters` | `GET /api/ml/clusters` | `mlListClusters` | ML |
+| `get_cluster_members` | `GET /api/ml/clusters/{cluster_id}` | `mlClusterMembers` | ML |
+| `get_node_importance` | `GET /api/ml/importance` | `mlNodeImportance` | ML |
+| `search_graph_by_keyphrase` | `GET /api/ml/keyphrase` | `mlSearchKeyphrase` | ML |
+| `get_community` | `GET /api/ml/community` | `mlCommunity` | ML |
+| `find_outliers` | `GET /api/ml/outliers` | `mlFindOutliers` | ML |
+| `find_dead_code` | `GET /api/ml/dead-code` | `mlFindDeadCode` | ML |
+| `get_topics` | `GET /api/ml/topics` | `mlTopics` | ML |
+
+The 8 **ML** tools are described in detail in [§4.6 ML Pipeline](#46-ml-pipeline-plan_ml_libs).
+Unlike the structural tools above they all return
+`{ml_available: false, reason: "<lib> not installed"}` cleanly when their
+underlying optional dependency (`umap-learn` / `hdbscan` / `keybert` /
+`python-louvain` / `scikit-learn` / `bertopic` / `vulture`) wasn't installed
+at index time, so the agent and frontend can branch on a single field
+instead of catching exceptions.
 
 **One-line semantics (full reference: `chat/local_tools.py`, `docs/openapi.yaml`):**
 

@@ -41,6 +41,15 @@ tags:
       Read-only git introspection (blame + recent commits). Mirrors the
       AI agent's `get_git_context` tool. Returns `{git_available: false}`
       cleanly on non-git roots and on missing `git` binaries.
+  - name: ML
+    description: >
+      Index-time ML signals (UMAP layout + HDBSCAN clusters, PageRank /
+      betweenness, KeyBERT keyphrases, Louvain communities,
+      IsolationForest outliers, BERTopic topics, vulture dead-code).
+      Mirrors the chat-agent ML tools. Every endpoint is a plain read
+      off the precomputed payload — see `docs/work/PLAN_ML_LIBS.md`.
+      Returns `{ml_available: false, reason: "<lib> not installed"}`
+      cleanly when the underlying ML pass never ran.
   - name: Realtime
     description: WebSocket channel for live graph updates from the file watcher.
 
@@ -81,6 +90,44 @@ paths:
                 properties:
                   version:
                     type: string
+
+  /api/active-store:
+    get:
+      operationId: getActiveStore
+      tags: [System]
+      summary: Diagnostic — report the currently-active store location and backend
+      description: >
+        Returns the file path of the currently-loaded graph store along with
+        its backend type (`json` or `cblite`) and the active project root.
+        Useful when debugging "the chat is answering against the wrong
+        project" or "the ML tools say `ml_available: false`" issues — confirms
+        which on-disk file is actually being read by the running server.
+      responses:
+        "200":
+          description: Active store info
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [backend]
+                properties:
+                  backend:
+                    type: string
+                    enum: [json, cblite]
+                    description: Active storage backend.
+                  location:
+                    type: string
+                    nullable: true
+                    description: >
+                      Absolute path to the active store file (e.g.
+                      `/path/to/project/_apollo/graph.json` or `.../graph.cblite2`).
+                      Null if the server has no project open yet.
+                  root_dir:
+                    type: string
+                    nullable: true
+                    description: >
+                      Absolute path of the currently-active project root
+                      (parent of `_apollo/`). Null when no project is open.
 
   # ── Filesystem ──────────────────────────────────────────────────────
   /api/browse-folder:
@@ -2505,6 +2552,184 @@ paths:
               schema:
                 $ref: "#/components/schemas/GitContextResult"
 
+  # ── ML (PLAN_ML_LIBS.md) ─────────────────────────────────────────────
+  /api/ml/clusters:
+    get:
+      operationId: mlListClusters
+      tags: [ML]
+      summary: Auto-discovered semantic code clusters (HDBSCAN over UMAP)
+      description: >
+        List the semantic clusters precomputed at index time. Each
+        cluster is a density-based grouping of nodes with similar
+        embeddings — answers "what modules does this codebase actually
+        have?" without depending on folder names.
+      parameters:
+        - name: top
+          in: query
+          required: false
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: Cluster summary list
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLClustersResult" }
+
+  /api/ml/clusters/{cluster_id}:
+    get:
+      operationId: mlClusterMembers
+      tags: [ML]
+      summary: Members of a single semantic cluster (PageRank-sorted)
+      parameters:
+        - name: cluster_id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: top
+          in: query
+          required: false
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: Cluster members
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLClusterMembersResult" }
+
+  /api/ml/importance:
+    get:
+      operationId: mlNodeImportance
+      tags: [ML]
+      summary: PageRank + betweenness + percentile for a node
+      description: >
+        Strictly better than naive degree-based "strength". Returns a
+        1-line interpretation ("top 1% — central hub" / "rarely
+        referenced") so the answer can be quoted directly.
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Importance metrics
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLImportanceResult" }
+
+  /api/ml/keyphrase:
+    get:
+      operationId: mlSearchKeyphrase
+      tags: [ML]
+      summary: Search nodes by precomputed KeyBERT keyphrases
+      description: >
+        Finds nodes whose KeyBERT-extracted keyphrases match the query.
+        Catches synonyms (rate-limit / throttle / quota / cooldown) that
+        plain name search misses.
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema: { type: string }
+        - name: top
+          in: query
+          required: false
+          schema: { type: integer, default: 10, minimum: 1, maximum: 50 }
+      responses:
+        "200":
+          description: Matching nodes with their keyphrases and a score
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLKeyphraseResult" }
+
+  /api/ml/community:
+    get:
+      operationId: mlCommunity
+      tags: [ML]
+      summary: Louvain community + (semantic) cluster + smell flag
+      description: >
+        Returns the connectivity community (who-calls-who) and the
+        semantic cluster (what-they-mean). When they agree the module
+        is cohesive; when they disagree the node is flagged as a likely
+        architectural smell.
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Community + cluster info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLCommunityResult" }
+
+  /api/ml/outliers:
+    get:
+      operationId: mlFindOutliers
+      tags: [ML]
+      summary: Top-N anomalous nodes by IsolationForest score
+      parameters:
+        - name: top
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [function, method, class, any]
+            default: function
+      responses:
+        "200":
+          description: Anomaly-ranked nodes with reasons
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLOutliersResult" }
+
+  /api/ml/dead-code:
+    get:
+      operationId: mlFindDeadCode
+      tags: [ML]
+      summary: vulture-flagged AND graph-zero-in-degree dead code
+      description: >
+        Cross-validated dead code: a node is reported only if vulture
+        flags it AND the graph has zero incoming edges. This cuts
+        vulture's classic false-positive rate (decorator-registered
+        handlers, plugin entry points have graph edges).
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [function, class, variable, any]
+            default: function
+      responses:
+        "200":
+          description: Dead-code candidates
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLDeadCodeResult" }
+
+  /api/ml/topics:
+    get:
+      operationId: mlTopics
+      tags: [ML]
+      summary: BERTopic auto-labelled topics over node embeddings
+      parameters:
+        - name: top
+          in: query
+          required: false
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+      responses:
+        "200":
+          description: Topic summaries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MLTopicsResult" }
+
 # ════════════════════════════════════════════════════════════════════════
 components:
   schemas:
@@ -3833,6 +4058,152 @@ components:
                 type: integer
               depth:
                 type: integer
+
+    # ── ML (PLAN_ML_LIBS.md) ─────────────────────────────────────────
+    MLClustersResult:
+      type: object
+      required: [ml_available, clusters]
+      properties:
+        ml_available: { type: boolean }
+        reason:       { type: string, description: "Set when ml_available=false (lib missing or pass never ran)." }
+        total:        { type: integer }
+        clusters:
+          type: array
+          description: Uniform-shape array — TOON-friendly.
+          items:
+            type: object
+            required: [id, label, size, representatives]
+            properties:
+              id:              { type: integer }
+              label:           { type: string }
+              size:            { type: integer }
+              representatives: { type: array, items: { type: string } }
+
+    MLClusterMembersResult:
+      type: object
+      required: [ml_available, members]
+      properties:
+        ml_available: { type: boolean }
+        cluster_id:   { type: integer }
+        count:        { type: integer }
+        note:         { type: string }
+        members:
+          type: array
+          items:
+            type: object
+            properties:
+              id:         { type: string }
+              name:       { type: string }
+              type:       { type: string }
+              path:       { type: string }
+              line_start: { type: integer }
+              pagerank:   { type: number }
+
+    MLImportanceResult:
+      type: object
+      required: [ml_available]
+      properties:
+        ml_available:        { type: boolean }
+        reason:              { type: string }
+        node_id:             { type: string }
+        name:                { type: string }
+        type:                { type: string }
+        pagerank:            { type: number }
+        betweenness:         { type: number }
+        in_degree:           { type: integer }
+        out_degree:          { type: integer }
+        pagerank_percentile: { type: number }
+        verdict:             { type: string }
+
+    MLKeyphraseResult:
+      type: object
+      required: [ml_available, results]
+      properties:
+        ml_available: { type: boolean }
+        reason:       { type: string }
+        query:        { type: string }
+        total:        { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              id:                 { type: string }
+              name:               { type: string }
+              type:               { type: string }
+              path:               { type: string }
+              line_start:         { type: integer }
+              matched_keyphrases: { type: array, items: { type: string } }
+              score:              { type: number }
+
+    MLCommunityResult:
+      type: object
+      required: [ml_available]
+      properties:
+        ml_available:    { type: boolean }
+        reason:          { type: string }
+        node_id:         { type: string }
+        community_id:    { type: integer, nullable: true }
+        cluster_id:      { type: integer, nullable: true }
+        community_size:  { type: integer }
+        members_sample:  { type: array, items: { type: string } }
+        notes:           { type: array, items: { type: string } }
+
+    MLOutliersResult:
+      type: object
+      required: [ml_available, outliers]
+      properties:
+        ml_available:  { type: boolean }
+        reason:        { type: string }
+        total_scored:  { type: integer }
+        outliers:
+          type: array
+          items:
+            type: object
+            properties:
+              id:            { type: string }
+              name:          { type: string }
+              type:          { type: string }
+              path:          { type: string }
+              line_start:    { type: integer }
+              outlier_score: { type: number }
+              reason:        { type: string }
+
+    MLDeadCodeResult:
+      type: object
+      required: [ml_available, dead]
+      properties:
+        ml_available: { type: boolean }
+        reason:       { type: string }
+        count:        { type: integer }
+        dead:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              line: { type: integer }
+              name: { type: string }
+              kind: { type: string }
+              why:  { type: string }
+
+    MLTopicsResult:
+      type: object
+      required: [ml_available, topics]
+      properties:
+        ml_available: { type: boolean }
+        reason:       { type: string }
+        total:        { type: integer }
+        topics:
+          type: array
+          items:
+            type: object
+            properties:
+              id:              { type: integer }
+              label:           { type: string }
+              keywords:        { type: array, items: { type: string } }
+              size:            { type: integer }
+              representatives: { type: array, items: { type: string } }
 
   responses:
     BadRequest:

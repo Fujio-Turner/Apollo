@@ -206,6 +206,14 @@ class GraphBuilder:
         self._symbol_table: dict[str, str] = {}  # qualified_name -> node_id
         self._file_imports: dict[str, list[dict]] = {}  # file -> imports
         self._root: Path | None = None
+        # Lightweight stat cache populated during ``_discover_files`` so the
+        # full-build / sweep paths can populate their hash cache without a
+        # second os.walk + per-file ``read()`` + SHA256. Only mtime_ns and
+        # size are recorded here — the SHA256 is computed lazily on the
+        # next incremental sweep, and *only* for files whose stat actually
+        # changed (matching the existing incremental fast-path semantics).
+        # See ``FullBuildStrategy.run`` for the consumer.
+        self._file_stats: dict[str, dict] = {}
         # User-defined filters from ProjectManifest.filters (apollo.json).
         # When None or mode=="all", only built-in core + plugin ignores apply.
         self._filters = self._normalize_filters(filters)
@@ -355,13 +363,19 @@ class GraphBuilder:
         # Build directory nodes lazily
         self._build_dir_nodes_lazy(root, dir_set)
 
-        # Filter to changed files using stat-based prefilter
+        # Filter to changed files using stat-based prefilter.
+        # ``_discover_files`` already captured (mtime_ns, size) per file
+        # during its single os.walk pass, so we read from
+        # ``self._file_stats`` instead of stat()'ing each file again.
         files_to_parse: list[tuple[BaseParser, Path, str, str | None, str | None]] = []
+        discovered_stats = self._file_stats
         for parser, src_file, rel_path, _src_text, _md5 in files_to_parse_all:
-            try:
-                st = src_file.stat()
-            except OSError:
+            cached_st = discovered_stats.get(rel_path)
+            if cached_st is None:
+                # File vanished between discovery and now — skip silently.
                 continue
+            cur_mtime = cached_st["mtime_ns"]
+            cur_size = cached_st["size"]
 
             prev = prev_hashes.get(rel_path)
             # Support both legacy (plain hash string) and new (dict) formats
@@ -376,8 +390,8 @@ class GraphBuilder:
 
             # Fast path: if mtime and size unchanged, skip read entirely
             if (prev_mtime is not None
-                    and prev_mtime == st.st_mtime_ns
-                    and prev_size == st.st_size):
+                    and prev_mtime == cur_mtime
+                    and prev_size == cur_size):
                 new_hashes[rel_path] = prev
                 continue
 
@@ -397,8 +411,8 @@ class GraphBuilder:
 
             new_hashes[rel_path] = {
                 "sha256": file_hash,
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
+                "mtime_ns": cur_mtime,
+                "size": cur_size,
             }
 
             if file_hash == prev_sha:
@@ -442,6 +456,9 @@ class GraphBuilder:
         files: list[tuple[BaseParser, Path, str, None, None]] = []
         dir_set: set[str] = set()
         dir_set.add("")  # root directory
+        # Reset the stat cache for this discovery pass — re-using the same
+        # builder for a second project would otherwise leak entries.
+        self._file_stats = {}
 
         root_str = str(root)
         root_prefix_len = len(root_str) + 1  # +1 for the path separator
@@ -450,6 +467,7 @@ class GraphBuilder:
         has_venv_markers = bool(venv_markers)
         ignore_file_re = self._ignore_file_re
         has_filters = self._filters is not None
+        file_stats = self._file_stats  # local alias — hot loop
 
         for dirpath, dirnames, filenames in os.walk(root):
             # Compute this directory's path relative to root once via a
@@ -498,6 +516,25 @@ class GraphBuilder:
                     continue
 
                 src_file = Path(dirpath) / fname
+
+                # Capture stat once during discovery so callers (the full
+                # build path, the resolve-full sweep) don't have to re-walk
+                # the tree just to fill their hash cache. We *only* record
+                # mtime_ns + size here — the SHA256 stays unset and is
+                # computed lazily on the next incremental sweep, and only
+                # for files whose stat actually changed. This is the
+                # "Do less" win: avoids reading every file a second time
+                # and SHA256-ing it on first index of a large project.
+                try:
+                    st = src_file.stat()
+                    file_stats[rel_path] = {
+                        "mtime_ns": st.st_mtime_ns,
+                        "size": st.st_size,
+                    }
+                except OSError:
+                    # Vanished mid-walk / permission error — skip silently;
+                    # the parse step will see the same OSError and drop it.
+                    pass
 
                 # Every file becomes a node. A parser is optional — files
                 # without one are still indexed as plain `file` nodes so

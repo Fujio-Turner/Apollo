@@ -76,9 +76,22 @@ class CouchbaseLiteStore:
         self._create_indexes(cbl, nodes_col, edges_col, embedding_dim)
 
     def load(self, *, include_embeddings: bool = True) -> nx.DiGraph:
-        """Load the graph from CBL into a NetworkX DiGraph."""
+        """Load the graph from CBL into a NetworkX DiGraph.
+
+        Returns an empty DiGraph when the database is fresh (no
+        ``nodes`` / ``edges`` collections yet) — this is the expected
+        state immediately after ``apollo wipe`` before the first index.
+        """
         cbl = self._open()
         graph = nx.DiGraph()
+
+        # Ensure the collections exist before querying them. On a
+        # freshly-created database (e.g. right after ``apollo wipe`` when
+        # the user opens the project but hasn't indexed yet) the
+        # collections do not exist and ``SELECT … FROM nodes`` fails
+        # with ``no such collection "nodes"``.
+        cbl.get_or_create_collection("nodes")
+        cbl.get_or_create_collection("edges")
 
         # Load nodes
         rows = cbl.execute_query("SELECT META().id AS _id, * FROM nodes")
@@ -162,11 +175,21 @@ class CouchbaseLiteStore:
             self._cbl = None
 
     def delete(self) -> None:
-        """Close the database and remove the database directory."""
+        """Close the DB, remove the database directory, and wipe per-index
+        sidecars (``file_hashes.json``, ``reindex_history.json``) so a
+        "Delete index" leaves the same clean slate the JSON backend does.
+        Project manifest and chat history are preserved.
+        """
         self.close()
         db_dir = Path(self._db_path)
         if db_dir.exists():
             shutil.rmtree(db_dir)
+        # Defer to the shared helper so both backends scrub the same
+        # set of stale-after-delete files. The cblite db lives at
+        # ``<root>/_apollo/cblite/<file>.cblite2`` so the project's
+        # ``_apollo/`` directory is two levels up from ``self._db_path``.
+        from apollo.storage.json_store import _purge_index_sidecars
+        _purge_index_sidecars(db_dir.parent.parent)
 
     # -- Internal helpers ---
 

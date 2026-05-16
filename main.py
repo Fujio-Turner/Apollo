@@ -15,7 +15,7 @@ Usage:
     python main.py status
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import json
@@ -78,7 +78,7 @@ def _default_index_path(backend: str) -> str:
 
 
 def _open_store(args):
-    backend = getattr(args, "backend", "json")
+    backend = _resolve_backend(args)
     location = args.index or _default_index_path(backend)
     return open_store(backend, location), location
 
@@ -195,6 +195,31 @@ def cmd_index(args):
         mapper = SpatialMapper()
         coords = mapper.compute_all(graph)
         print(f"  Spatial coordinates assigned to {len(coords)} nodes.")
+
+    # Run ML passes (UMAP layout, HDBSCAN clusters, PageRank, KeyBERT,
+    # Louvain communities, IsolationForest outliers, BERTopic topics,
+    # vulture dead-code). All passes are graceful — missing libs just
+    # skip. See PLAN_ML_LIBS.md and ml/passes.py.
+    if not getattr(args, "no_ml", False):
+        try:
+            from apollo.ml import run_all_passes
+            print("Running ML passes...")
+            ml_embedder = None
+            try:
+                from apollo.embeddings import get_shared_embedder
+                ml_embedder = get_shared_embedder()
+            except Exception:
+                ml_embedder = None
+            ml_summary = run_all_passes(graph, root_dir=target_dir,
+                                          embedder=ml_embedder)
+            for k, v in ml_summary.items():
+                tag = "ok" if v.get("ml_available") else "skip"
+                detail = (f"computed={v.get('computed')}"
+                          if v.get("ml_available")
+                          else v.get("reason", "unavailable"))
+                print(f"  ML[{k}] {tag} — {detail}")
+        except Exception as e:
+            print(f"  ML passes skipped: {e}")
 
     store, out_path = _open_store(args)
     store.save(graph)
@@ -361,8 +386,66 @@ def cmd_serve(args):
     import uvicorn
     from apollo.web.server import create_app
 
+    backend = _resolve_backend(args)
+
+    # Always promote the persisted ``storage.cblite_lib_path`` into the
+    # process env *before* anything imports CBL, even when the active
+    # backend is JSON. Otherwise the Settings → Storage report (and the
+    # Hub "Couchbase Lite" badge) loads whatever libcblite ctypes.util
+    # happens to find first (typically Homebrew's CE build) instead of
+    # the EE/CE edition the user just activated. ``ensure_default_install``
+    # only runs for the cblite backend — we don't want to surprise json
+    # users with a 30 MB download. The matching UI lives in
+    # Settings → Storage.
+    from apollo.storage.cblite_installer import (
+        apply_env_from_settings, ensure_default_install, INSTALL_ROOT,
+    )
+    apply_env_from_settings()
+    if backend == "cblite":
+        ensure_default_install()
+        apply_env_from_settings()  # in case ensure_default_install just wrote it
+
+    # Print a storage banner so the operator can see at-a-glance which
+    # backend + libcblite (version, edition, absolute lib path) this
+    # process will use. Helpful when juggling CE ↔ EE builds or diagnosing
+    # "why is it still using CE?" issues. ``CBLITE_LIB_PATH`` was set by
+    # ``apply_env_from_settings`` above when one is configured.
+    print("─" * 70)
+    print(f"Storage backend        : {backend}")
+    print(f"storage_binary/ root   : {os.path.abspath(str(INSTALL_ROOT))}")
+    _active_lib = os.environ.get("CBLITE_LIB_PATH")
+    if _active_lib:
+        # Resolve to make symlinks obvious and confirm the file really exists.
+        try:
+            _resolved = os.path.realpath(_active_lib)
+        except OSError:
+            _resolved = _active_lib
+        print(f"libcblite library path : {_resolved}")
+        # Pull the *configured* version/edition from cblite_config.json
+        # (single source of truth, written by /api/storage/activate).
+        try:
+            import json as _json
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cblite_config.json")) as _f:
+                _cfg = _json.load(_f) or {}
+            print(f"libcblite version      : {_cfg.get('version', '?')}")
+            print(f"libcblite edition      : {_cfg.get('edition', '?')}")
+        except (OSError, ValueError):
+            pass
+        # Probe the dylib for the EE-only vector-index symbol so the user
+        # can spot a mismatch between configured edition and what's
+        # actually loadable from disk.
+        try:
+            import ctypes as _ct
+            _lib = _ct.cdll.LoadLibrary(_active_lib)
+            _has_vec = hasattr(_lib, "CBLCollection_CreateVectorIndex")
+            print(f"libcblite loaded as    : {'enterprise (EE — vector indexes available)' if _has_vec else 'community (CE — no vector indexes)'}")
+        except OSError as _exc:
+            print(f"libcblite load probe   : FAILED — {_exc}")
+    else:
+        print("libcblite library path : <none — JSON backend, libcblite not used>")
+    print("─" * 70)
+
     store, index_path = _open_store(args)
-    backend = getattr(args, "backend", "json")
     parser_name = getattr(args, "parser", "auto")
 
     # Auto-index the bundled demo/ folder on first run so the UI has
@@ -583,15 +666,101 @@ def cmd_inspect(args):
     store.close()
 
 
+def cmd_wipe(args):
+    """Wipe a project's Apollo state (cblite db, cache, chats, notes, bookmarks).
+
+    Removes ``<directory>/_apollo/`` (manifest, Couchbase Lite database,
+    annotations, per-project chat history) and ``<directory>/_apollo_web/``
+    (UI cache). Optionally also removes the global
+    ``.apollo/chat_history.json`` (used as the chat-history fallback when
+    no project is open).
+
+    The folder itself is left intact — re-run ``index`` (or open it in the
+    Web UI) to start fresh with the current ``cblite_config.json`` settings.
+    """
+    import shutil
+    from pathlib import Path
+
+    target = Path(args.directory).resolve()
+    if not target.exists():
+        print(f"Error: Directory not found: {target}", file=sys.stderr)
+        sys.exit(1)
+    if not target.is_dir():
+        print(f"Error: Not a directory: {target}", file=sys.stderr)
+        sys.exit(1)
+
+    apollo_dir = target / "_apollo"
+    apollo_web_dir = target / "_apollo_web"
+    candidates: list[Path] = []
+    if apollo_dir.exists():
+        candidates.append(apollo_dir)
+    if apollo_web_dir.exists():
+        candidates.append(apollo_web_dir)
+    if args.global_chat:
+        global_chat = Path(".apollo/chat_history.json")
+        if global_chat.exists():
+            candidates.append(global_chat)
+
+    if not candidates:
+        print(f"Nothing to wipe — no Apollo state found under {target}")
+        return
+
+    print("Will delete:")
+    for c in candidates:
+        print(f"  {c}")
+
+    if not args.confirm:
+        print("\nRefusing to delete without --confirm. Re-run with --confirm to proceed.")
+        sys.exit(2)
+
+    for c in candidates:
+        try:
+            if c.is_dir():
+                shutil.rmtree(c)
+            else:
+                c.unlink()
+            print(f"  ✓ removed {c}")
+        except OSError as e:
+            print(f"  ✗ failed to remove {c}: {e}", file=sys.stderr)
+
+    print("\nDone. Re-index this folder (or re-open it in the Web UI) to rebuild from scratch.")
+
+
 def _add_common_args(parser):
     """Add --index and --backend to a subparser."""
     parser.add_argument("--index", help="Index/database path")
     parser.add_argument(
         "--backend",
         choices=["json", "cblite"],
-        default="json",
-        help="Storage backend (default: json)",
+        # default=None so the resolver can tell "user didn't pass anything"
+        # apart from "user explicitly chose json", and fall back to the
+        # value saved in data/settings.json by the Settings → Storage UI.
+        default=None,
+        help="Storage backend (overrides data/settings.json; default: json)",
     )
+
+
+def _resolve_backend(args) -> str:
+    """Pick the backend to use for this command.
+
+    Priority: explicit ``--backend`` CLI flag > ``storage.default_backend``
+    saved by the Settings → Storage UI in ``data/settings.json`` > ``json``.
+    The CLI flag still wins so power users can override the persisted UI
+    choice on a single invocation.
+    """
+    explicit = getattr(args, "backend", None)
+    if explicit:
+        return explicit
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        with open(_P("data") / "settings.json") as f:
+            saved = ((_json.load(f) or {}).get("storage") or {}).get("default_backend")
+        if saved in ("json", "cblite"):
+            return saved
+    except (OSError, ValueError):
+        pass
+    return "json"
 
 
 def main():
@@ -609,6 +778,7 @@ def main():
     p_index.add_argument("-o", "--output", dest="index", help="Output path")
     p_index.add_argument("--no-embeddings", action="store_true", help="Skip embedding generation")
     p_index.add_argument("--no-spatial", action="store_true", help="Skip spatial coordinate computation")
+    p_index.add_argument("--no-ml", action="store_true", help="Skip ML passes (UMAP, HDBSCAN, PageRank, KeyBERT, ...). See PLAN_ML_LIBS.md.")
     p_index.add_argument(
         "--parser",
         choices=["auto", "ast", "tree-sitter"],
@@ -690,6 +860,20 @@ def main():
     p_inspect.add_argument("node_id", help="Full node ID (e.g., func::src/main.py::my_func)")
     _add_common_args(p_inspect)
 
+    # wipe
+    p_wipe = subparsers.add_parser(
+        "wipe",
+        help="Wipe a project's Apollo state (cblite db, UI cache, chats, notes, bookmarks)",
+    )
+    p_wipe.add_argument("directory", help="Project root directory whose _apollo/ and _apollo_web/ should be deleted")
+    p_wipe.add_argument("--confirm", action="store_true", help="Required: actually perform the deletion")
+    p_wipe.add_argument(
+        "--global-chat",
+        dest="global_chat",
+        action="store_true",
+        help="Also delete the global .apollo/chat_history.json fallback",
+    )
+
     args = parser.parse_args()
 
     commands = {
@@ -702,6 +886,7 @@ def main():
         "spatial": cmd_spatial,
         "spatial-walk": cmd_spatial_walk,
         "inspect": cmd_inspect,
+        "wipe": cmd_wipe,
     }
     logger.info("CLI: %s", args.command)
     commands[args.command](args)

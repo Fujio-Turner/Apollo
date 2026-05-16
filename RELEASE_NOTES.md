@@ -1,5 +1,37 @@
 # Release Notes
 
+## v1.3.0 — 2026-05-16
+
+### New Features
+
+- **Python ML Libraries Integration (#8)** — New top-level `ml/` package (`ml/__init__.py`, `ml/passes.py`, `ml/tools.py`) introducing a full ML-pass pipeline for indexing, query, and UI. Adds ML-powered search/ranking tools surfaced through the chat agent. See `docs/work/PLAN_ML_LIBS_IMPLEMENTATION_REPORT.md` for the implementation report and `docs/openapi.yaml` for the new endpoints.
+- **Couchbase Lite Enterprise Edition Support** — `storage/cblite_installer.py` provides an automated installer for the Couchbase Lite EE binary; `storage/cblite/ctypes_api.py` and `storage/cblite/store.py` gained EE-only hooks. New `cblite_config.json` keys and `Dockerfile.cblite` updates wire it all together.
+- **Couchbase Lite Storage Tab** — New browser tab in `web/static/index.html` / `web/static/app.js` surfacing live Couchbase Lite storage state, with backing routes in `web/server.py` and `main.py`.
+- **Trace Visualizer (#10)** — New chat trace visualization in `web/static/app.js` / `app.css` showing tool-call flow per chat turn. Backend support in `chat/service.py`; design doc at `docs/work/TRACE_VISUALIZER.md`.
+- **Faster Incremental Indexing (#9)** — `graph/builder.py` and `graph/incremental.py` reworked for materially faster reindex passes on changed files.
+- **Optimized Chat Request Schema (#12)** — `ai/chat_request.json` heavily restructured to reduce tokens / tool rounds. Versioned snapshots committed at `ai/chat_request_v5.json` through `ai/chat_request_v9.json` for reproducibility; `ai/CHANGELOG.md` documents the evolution.
+- **README Refresh** — Expanded `README.md` (+130 lines) with new feature walkthroughs, Couchbase Lite + ML sections, and updated screenshots/badges.
+
+### Bug Fixes
+
+- **Random Graph Movement (#7)** — Fixed graph layout jitter in `web/static/app.js` so nodes no longer randomly reposition between renders.
+- **File Tree Showing `/root` (#11)** — `graph/incremental.py` no longer leaks `/root`-style placeholder paths into the right-side file folder; real indexed file paths are surfaced instead.
+- **Recent Files Panel** — Fixes in `web/static/app.js` / `app.css` so the "recent" file panel renders correctly after the storage-tab refactor.
+- **Couchbase Lite Fixes** — `main.py`, `web/server.py`, and `web/static/app.js` patched to handle missing/partial EE installs gracefully; `.gitignore` updated to exclude per-machine `storage_binary/` artifacts (with a `.gitkeep` placeholder).
+- **ML Search & CBL EE** — Fixes in `chat/service.py` and `ai/chat_request.json` so the ML search tools and Couchbase Lite EE backend interoperate correctly under chat-tool calls.
+
+### Changes
+
+- **`main.py`** — Significant expansion (+193 lines) for CBL EE bootstrap, storage-tab routes, and ML pipeline wiring.
+- **`web/server.py`** — +335 lines: new endpoints for the storage tab, CBL installer status, ML tools, and trace export.
+- **`web/static/app.js`** — +1247 lines covering the storage tab, trace visualizer, graph-stability fix, and ML-result rendering.
+- **`apollo/`** — `apollo/__init__.py`, `apollo/projects/manifest.py`, and `apollo/reindex_service.py` updated for the new reindex lifecycle and manifest fields used by ML passes.
+- **`storage/json_store.py`** — Reworked (+96 lines) to support ML-pass state and CBL EE coexistence.
+- **`docs/`** — New / expanded docs: `docs/DESIGN.md`, `docs/openapi.yaml`, `docs/work/PLAN_ML_LIBS_IMPLEMENTATION_REPORT.md`, `docs/work/TRACE_VISUALIZER.md`.
+- **`requirements.txt`** — Added dependencies required by the new ML pipeline.
+- **Ignore Rules** — `.gitignore` now excludes `storage_binary/` contents and additional per-machine CBL artifacts.
+- **Version bump** — All version references updated from v1.2.0 to v1.3.0 (`main.py`, `README.md` badge, `web/static/index.html` sidebar).
+
 ## v1.2.0 — 2026-05-13
 
 ### New Features

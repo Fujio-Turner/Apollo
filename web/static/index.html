@@ -36,7 +36,7 @@ tailwind.config = {
 <nav class="nav-sidebar bg-base-200 border-r border-base-300 flex flex-col" id="nav-sidebar">
   <div class="nav-header">
     <div class="nav-logo-icon bg-primary text-primary-content cursor-pointer" onclick="toggleNav()">AP</div>
-    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer · <span id="app-version">v1.2.0</span></div></div>
+    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer · <span id="app-version">v1.3.0</span></div></div>
     <button type="button" class="btn btn-ghost btn-square btn-sm nav-collapse-btn" onclick="toggleNav()" aria-label="Collapse sidebar">
       <svg id="nav-collapse-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" /></svg>
     </button>
@@ -224,6 +224,7 @@ tailwind.config = {
         <button type="button" role="tab" class="tab" data-tab="captures">Captures</button>
         <button type="button" role="tab" class="tab" data-tab="logging">Logging</button>
         <button type="button" role="tab" class="tab" data-tab="plugins">Plugins</button>
+        <button type="button" role="tab" class="tab" data-tab="storage">Storage</button>
       </div>
 
       <!-- ── AI Providers Tab ─────────────────────────────────── -->
@@ -471,6 +472,22 @@ tailwind.config = {
           <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Installed Plugins</h3>
           <p class="text-xs opacity-50 mb-3">Plugins detected on disk under <code class="font-mono">plugins/</code>. Use the toggle on each card to enable / disable a plugin live, or expand <em>Settings</em> to edit its <code class="font-mono">config.json</code> knobs without restarting the server. New plugins are picked up by dropping a new folder/file under <code class="font-mono">plugins/</code> and reloading. See <code class="font-mono">guides/making_plugins.md</code>.</p>
           <div id="plugins-list" class="text-xs">
+            <span class="opacity-50">Loading…</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Storage Tab ─────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="storage">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Couchbase Lite Binary</h3>
+          <p class="text-xs opacity-50 mb-3">
+            Download and activate the <code class="font-mono">libcblite</code> shared library used by the
+            <strong>cblite</strong> backend. Binaries are fetched from <code class="font-mono">packages.couchbase.com</code>
+            and extracted into <code class="font-mono">storage_binary/</code> in the repo. Switching the active
+            library takes effect on the next server restart.
+          </p>
+          <div id="storage-panel" class="text-xs">
             <span class="opacity-50">Loading…</span>
           </div>
         </div>

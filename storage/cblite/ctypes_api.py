@@ -339,6 +339,7 @@ class CBL:
     """
 
     _cached_lib: ctypes.CDLL | None = None
+    _edition_check_done: bool = False
 
     # -- Library management --------------------------------------------------
 
@@ -346,7 +347,58 @@ class CBL:
     def _get_lib(cls) -> ctypes.CDLL:
         if cls._cached_lib is None:
             cls._cached_lib = _bind(_load_library())
+            cls._verify_edition_matches_config(cls._cached_lib)
         return cls._cached_lib
+
+    @classmethod
+    def _verify_edition_matches_config(cls, lib: ctypes.CDLL) -> None:
+        """Warn if the loaded libcblite edition disagrees with cblite_config.json.
+
+        ``cblite_config.json`` (repo root) declares the targeted edition
+        ('community' or 'enterprise'). We probe the loaded shared library
+        for the EE-only ``CBLCollection_CreateVectorIndex`` symbol; if the
+        configured edition is 'enterprise' but the symbol is missing
+        (i.e. CE was loaded), or vice versa, emit a single warning so
+        the operator notices the mismatch before vector-index code paths
+        silently fall back.
+        """
+        if cls._edition_check_done:
+            return
+        cls._edition_check_done = True
+
+        # Read configured edition. Repo root is three levels up from this file
+        # (storage/cblite/ctypes_api.py -> repo root).
+        cfg_path = Path(__file__).parent.parent.parent / "cblite_config.json"
+        try:
+            with open(cfg_path) as f:
+                configured_edition = (json.load(f).get("edition") or "").lower().strip()
+        except (OSError, json.JSONDecodeError):
+            return  # No config -> nothing to verify against.
+
+        if configured_edition not in ("community", "enterprise"):
+            return
+
+        loaded_is_enterprise = hasattr(lib, "CBLCollection_CreateVectorIndex")
+        loaded_edition = "enterprise" if loaded_is_enterprise else "community"
+
+        if loaded_edition != configured_edition:
+            import warnings
+            warnings.warn(
+                f"libcblite edition mismatch: cblite_config.json requests "
+                f"'{configured_edition}' but the loaded shared library is "
+                f"'{loaded_edition}'. "
+                + (
+                    "Vector-index code paths will fall back to the non-CBL "
+                    "vector store. Install the Enterprise build of libcblite "
+                    "(and point CBLITE_LIB_PATH at it) to enable them."
+                    if configured_edition == "enterprise"
+                    else "An Enterprise libcblite is loaded but config says "
+                    "'community'. Either update cblite_config.json to "
+                    "'enterprise' or load the CE binary."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     @property
     def _lib(self) -> ctypes.CDLL:

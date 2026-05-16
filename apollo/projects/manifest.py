@@ -11,6 +11,30 @@ from typing import Optional, Any, Union
 import jsonschema
 
 
+# Repo-root cblite_config.json is the single source of truth for the
+# libcblite version/edition Apollo targets. Read once at import time;
+# falls back to a sensible default if the file is missing or unreadable.
+_CBLITE_CONFIG_PATH = Path(__file__).parent.parent.parent / "cblite_config.json"
+
+
+def _load_cblite_config() -> dict:
+    try:
+        with open(_CBLITE_CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def get_target_cblite_version() -> str:
+    """Return the libcblite version Apollo is configured to target."""
+    return _load_cblite_config().get("version", "4.0.3")
+
+
+def get_target_cblite_edition() -> str:
+    """Return the libcblite edition ('community' or 'enterprise')."""
+    return _load_cblite_config().get("edition", "community")
+
+
 @dataclass
 class ProjectStats:
     """Summary statistics from last completed index."""
@@ -170,7 +194,7 @@ class ProjectManifest:
             storage.db_name = f"apollo_{db_hash}.cblite2"
             storage.db_relpath = f"cblite/apollo_{db_hash}.cblite2"
             storage.origin_abspath = abspath_str
-            storage.cblite_version = "3.2.0"  # Default; will be updated if libcblite is available
+            storage.cblite_version = get_target_cblite_version()  # From cblite_config.json; updated if libcblite is loaded
         
         return cls(
             project_id=project_id,

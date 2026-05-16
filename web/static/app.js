@@ -1148,20 +1148,40 @@ function renderGraph(data) {
   const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
   const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
   const large = (data.nodes||[]).length > 500;
-  // Dev mode: seed every node with a deterministic (x,y) derived from a
-  // hash of its id, so the same node always starts in the same spot
-  // across renders/releases. Combined with force.layoutAnimation:false
-  // the force layout converges to a stable picture instead of reshuffling
-  // every time the graph reloads. Drag still works (draggable:true).
-  const stable = IS_DEV_MODE;
-  const seedR = stable ? Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length))) : 0;
+  // Seed every node with a deterministic (x,y) derived from a hash of its
+  // id, so the same node always starts in the same spot across renders /
+  // releases / reloads. Combined with force.layoutAnimation:false the
+  // force layout converges to a stable picture instead of reshuffling
+  // every time the graph re-renders (e.g. when the user clicks empty
+  // space and clearFocus() runs). Drag still works (draggable:true).
+  const stable = true;
+  const seedR = Math.max(300, 40 * Math.sqrt(Math.max(1, (data.nodes||[]).length)));
+  // ML lens: when index-time UMAP coords are present we use them as
+  // initial seed positions (auth code visibly clusters with auth, etc.).
+  // When HDBSCAN cluster_id is present we override the per-node colour
+  // with a cluster palette so visually-grouped code is also
+  // colour-grouped. Both fall back gracefully when ML never ran.
+  // See PLAN_ML_LIBS.md §1.1 / §1.2.
+  const umapBounds = _umapBounds(data.nodes || []);
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8,Math.min(40,n.symbolSize||12));
+    const cid = n.attributes?.cluster_id;
+    const baseColor = (cid != null && cid >= 0)
+      ? _clusterColor(cid)
+      : (NODE_COLORS[t] || '#888');
     const node = { id:n.id, name:n.name||n.id, symbolSize:sz, category:catIdx[t]??0,
-      itemStyle:{color:NODE_COLORS[t]||'#888', ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
-      _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line };
-    if (stable) {
+      itemStyle:{color:baseColor, ...(NODE_BORDERS[t]||{})}, label:{show:!large&&sz>18,fontSize:10,color:tc},
+      _type:t, _path:n.attributes?.path||n.path, _line:n.attributes?.line_start||n.line,
+      _cluster: cid, _pagerank: n.attributes?.pagerank };
+    const xy = n.attributes?.umap_xy;
+    if (umapBounds && Array.isArray(xy) && xy.length === 2) {
+      // Scale UMAP's tight float range out to the layout canvas so the
+      // force layout doesn't immediately collapse them into a blob.
+      const [nx, ny] = _umapScale(xy, umapBounds, seedR);
+      node.x = nx;
+      node.y = ny;
+    } else if (stable) {
       const h = _g2HashStr(n.id);
       const ang = ((h % 3600) / 3600) * Math.PI * 2;
       const rad = (((h >>> 8) % 1000) / 1000) * seedR;
@@ -1172,7 +1192,7 @@ function renderGraph(data) {
   });
   const edges = (data.edges||[]).map(e => ({ source:e.source, target:e.target, lineStyle:{color:ec,opacity:0.5}, _rel:e.type||e.rel }));
   graphChart.setOption({
-    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+    tooltip: { trigger:'item', formatter: p => _mlTooltip(p),
       backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
@@ -1205,6 +1225,112 @@ function renderGraph(data) {
    - Within a cluster, node offset = deterministic hash of id → angle/
      radius. So clusters look organic but are stable.
    - lineStyle.color:'source' + curveness:0.3 mirrors Les Miserables. */
+/* ─── ML lens helpers (PLAN_ML_LIBS.md) ──────────────────────────────
+   Pure helpers for using index-time ML signals (UMAP coords + HDBSCAN
+   cluster_id) in the graph render. All are no-ops when the ML pass
+   never ran — the existing deterministic-hash layout / per-type colour
+   path is the fallback.
+*/
+
+// Stable cluster colour palette. 16 hues evenly spread around the
+// wheel, picked from the d3 categorical-style families. Index by
+// `cluster_id mod palette.length`.
+const _CLUSTER_PALETTE = [
+  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+  '#9467bd', '#8c564b', '#e377c2', '#17becf',
+  '#bcbd22', '#7f7f7f', '#aec7e8', '#ffbb78',
+  '#98df8a', '#ff9896', '#c5b0d5', '#c49c94',
+];
+function _clusterColor(cid) {
+  if (cid == null || cid < 0) return '#888';
+  return _CLUSTER_PALETTE[cid % _CLUSTER_PALETTE.length];
+}
+
+// Inspect the node list for `attributes.umap_xy`. Returns
+// `{minX,maxX,minY,maxY}` when at least one node has UMAP coords,
+// else null (caller falls back to hash layout).
+function _umapBounds(nodes) {
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let count = 0;
+  for (const n of nodes) {
+    const xy = n && n.attributes && n.attributes.umap_xy;
+    if (!Array.isArray(xy) || xy.length !== 2) continue;
+    const [x, y] = xy;
+    if (typeof x !== 'number' || typeof y !== 'number') continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    count++;
+  }
+  return count > 0 ? { minX, maxX, minY, maxY } : null;
+}
+
+// Map a (raw UMAP x, y) into the layout canvas range (-seedR, +seedR).
+function _umapScale(xy, b, seedR) {
+  const dx = (b.maxX - b.minX) || 1;
+  const dy = (b.maxY - b.minY) || 1;
+  const nx = ((xy[0] - b.minX) / dx) * 2 * seedR - seedR;
+  const ny = ((xy[1] - b.minY) / dy) * 2 * seedR - seedR;
+  return [nx, ny];
+}
+
+// Shared graph tooltip — surfaces ML signals (cluster_id + pagerank)
+// when present, falls back to the original Type / path:line format.
+function _mlTooltip(p) {
+  if (p.dataType !== 'node') return '';
+  const d = p.data || {};
+  let t = `<b>${d.name}</b><br/>Type: ${d._type || ''}`;
+  if (d._path) t += `<br/>${d._path}${d._line != null ? ':' + d._line : ''}`;
+  if (d._cluster != null && d._cluster >= 0) {
+    t += `<br/>Cluster: <b>${d._cluster}</b>`;
+  }
+  if (typeof d._pagerank === 'number') {
+    t += `<br/>PageRank: ${d._pagerank.toFixed(5)}`;
+  }
+  return t;
+}
+
+/* Public ML Lens API — invokable from the dev toolbar / chat trace
+   when the user wants to see the precomputed ML signals directly
+   instead of asking the AI. Each function fetches the matching
+   `/api/ml/*` endpoint and returns a JSON-friendly object. The chat
+   UI's existing JSON pretty-printer renders the result. */
+const MLLens = {
+  async listClusters(top = 50) {
+    return await apiFetch(`/api/ml/clusters?top=${top}`);
+  },
+  async getClusterMembers(cid, top = 50) {
+    return await apiFetch(`/api/ml/clusters/${cid}?top=${top}`);
+  },
+  async nodeImportance(nodeId) {
+    return await apiFetch(
+      `/api/ml/importance?node_id=${encodeURIComponent(nodeId)}`);
+  },
+  async searchKeyphrase(query, top = 10) {
+    return await apiFetch(
+      `/api/ml/keyphrase?query=${encodeURIComponent(query)}&top=${top}`);
+  },
+  async community(nodeId) {
+    return await apiFetch(
+      `/api/ml/community?node_id=${encodeURIComponent(nodeId)}`);
+  },
+  async findOutliers(top = 20, kind = 'function') {
+    return await apiFetch(
+      `/api/ml/outliers?top=${top}&kind=${encodeURIComponent(kind)}`);
+  },
+  async findDeadCode(kind = 'function') {
+    return await apiFetch(
+      `/api/ml/dead-code?kind=${encodeURIComponent(kind)}`);
+  },
+  async getTopics(top = 20) {
+    return await apiFetch(`/api/ml/topics?top=${top}`);
+  },
+};
+// Expose for ad-hoc use from DevTools console.
+if (typeof window !== 'undefined') window.MLLens = MLLens;
+
 function _g2HashStr(s) {
   // Simple 32-bit string hash (djb2-ish). Deterministic, no deps.
   let h = 5381;
@@ -1244,24 +1370,39 @@ function renderGraph2(data) {
     catSize[t] = (catSize[t]||0) + 1;
   });
 
+  // ML lens (PLAN_ML_LIBS.md): same UMAP-coords + cluster_id pattern
+  // as renderGraph(). Falls back cleanly when ML never ran.
+  const umapBounds = _umapBounds(data.nodes || []);
+  const seedR = ringR;
   const nodes = (data.nodes||[]).map(n => {
     const t = n.value||n.type||'unknown';
     const sz = Math.max(8, Math.min(40, n.symbolSize||12));
     const ci = catIdx[t] ?? 0;
-    const center = catCenters[ci] || { x: 0, y: 0 };
-    const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
-    // Deterministic offset within the cluster from the node id hash.
-    const h = _g2HashStr(n.id);
-    const ang = ((h % 3600) / 3600) * Math.PI * 2;
-    const rad = ((h >>> 8) % 1000) / 1000 * inner;
-    const x = center.x + Math.cos(ang) * rad;
-    const y = center.y + Math.sin(ang) * rad;
+    const cid = n.attributes?.cluster_id;
+    const baseColor = (cid != null && cid >= 0)
+      ? _clusterColor(cid)
+      : (NODE_COLORS[t] || '#888');
+    let x, y;
+    const xy = n.attributes?.umap_xy;
+    if (umapBounds && Array.isArray(xy) && xy.length === 2) {
+      [x, y] = _umapScale(xy, umapBounds, seedR);
+    } else {
+      const center = catCenters[ci] || { x: 0, y: 0 };
+      const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
+      // Deterministic offset within the cluster from the node id hash.
+      const h = _g2HashStr(n.id);
+      const ang = ((h % 3600) / 3600) * Math.PI * 2;
+      const rad = ((h >>> 8) % 1000) / 1000 * inner;
+      x = center.x + Math.cos(ang) * rad;
+      y = center.y + Math.sin(ang) * rad;
+    }
     return {
       id: n.id, name: n.name||n.id, symbolSize: sz, category: ci, x, y,
-      itemStyle: { color: NODE_COLORS[t] || '#888', ...(NODE_BORDERS[t]||{}) },
+      itemStyle: { color: baseColor, ...(NODE_BORDERS[t]||{}) },
       // Match Les Mis: only label larger nodes to keep the picture readable.
       label: { show: sz > 22, position: 'right', fontSize: 10, color: tc, formatter: '{b}' },
       _type: t, _path: n.attributes?.path || n.path, _line: n.attributes?.line_start || n.line,
+      _cluster: cid, _pagerank: n.attributes?.pagerank,
     };
   });
   const edges = (data.edges||[]).map(e => ({
@@ -1270,7 +1411,7 @@ function renderGraph2(data) {
     _rel: e.type || e.rel,
   }));
   graphChart2.setOption({
-    tooltip: { trigger:'item', formatter: p => { if(p.dataType==='node'){const d=p.data;let t=`<b>${d.name}</b><br/>Type: ${d._type}`;if(d._path)t+=`<br/>${d._path}${d._line!=null?':'+d._line:''}`;return t;}return'';},
+    tooltip: { trigger:'item', formatter: p => _mlTooltip(p),
       backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
     legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
       icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
@@ -1666,7 +1807,53 @@ function applyPersistentFocus(id) {
 function clearFocus() {
   if (!graphChart || !currentGraph) return;
   selectedNode = null;
-  renderGraph(currentGraph);
+  // Reset the highlight/dim styles in-place WITHOUT calling renderGraph().
+  // Re-rendering would rebuild the ECharts series from scratch, which in
+  // force-layout mode causes every node to settle at a new position — the
+  // graph would visibly reshuffle every time the user clicks empty space,
+  // making it impossible to keep track of where a given node lives.
+  const chart = currentGraphVariant === '2' ? graphChart2 : graphChart;
+  if (chart) {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const tc = isDark ? '#dcddde' : '#333';
+    const ec = isDark ? '#3a3a3a' : '#ccc';
+    const opt = chart.getOption();
+    if (opt && opt.series && opt.series[0]) {
+      const seriesNodes = opt.series[0].data || [];
+      const seriesEdges = opt.series[0].links || opt.series[0].edges || [];
+      const large = seriesNodes.length > 500;
+      seriesNodes.forEach(n => {
+        n.itemStyle = n.itemStyle || {};
+        n.itemStyle.opacity = 1;
+        n.label = n.label || {};
+        const sz = n.symbolSize || 12;
+        // Match the default label-show rule used in renderGraph / renderGraph2.
+        if (currentGraphVariant === '2') {
+          n.label.show = sz > 22;
+          n.label.position = 'right';
+        } else {
+          n.label.show = !large && sz > 18;
+        }
+        n.label.fontSize = 10;
+        n.label.fontWeight = 'normal';
+        n.label.color = tc;
+      });
+      seriesEdges.forEach(e => {
+        e.lineStyle = e.lineStyle || {};
+        if (currentGraphVariant === '2') {
+          e.lineStyle.opacity = 0.7;
+          e.lineStyle.width = 0.8;
+          e.lineStyle.color = 'source';
+        } else {
+          e.lineStyle.opacity = 0.5;
+          e.lineStyle.width = undefined;
+          e.lineStyle.color = ec;
+        }
+      });
+      chart.dispatchAction({ type: 'unselect', seriesIndex: 0 });
+      chart.setOption({ series: [{ data: seriesNodes, links: seriesEdges }] });
+    }
+  }
   showWelcomePanel();
 }
 
@@ -2347,6 +2534,37 @@ async function showWelcomePanel() {
       <div class="stat py-2 px-3"><div class="stat-title text-[10px]">Edges</div><div class="stat-value text-base text-secondary">${(stats.total_edges||0).toLocaleString()}</div></div>
     </div>`;
 
+    // Couchbase Lite edition/version badge — only shown when CBL info
+    // is available (configured edition present in cblite_config.json).
+    const cbl = stats.cblite_info;
+    if (cbl && cbl.configured_edition) {
+      const loaded = cbl.loaded_edition;          // 'enterprise' | 'community' | null
+      const configured = cbl.configured_edition;  // 'enterprise' | 'community'
+      const isEE = loaded === 'enterprise';
+      const editionLabel = isEE ? 'Enterprise (EE)' : (loaded === 'community' ? 'Community (CE)' : 'Not loaded');
+      const editionClass = isEE ? 'badge-success' : (loaded === 'community' ? 'badge-info' : 'badge-ghost');
+      const mismatch = loaded && loaded !== configured;
+      const vecAvail = cbl.vector_index_available;
+      const vecBadge = vecAvail
+        ? '<span class="badge badge-success badge-sm">✓ Vector Index</span>'
+        : '<span class="badge badge-ghost badge-sm" title="EE-only feature; falls back to NumPy vector store">✗ Vector Index</span>';
+      const mismatchBadge = mismatch
+        ? `<span class="badge badge-warning badge-sm" title="cblite_config.json requests '${configured}' but the loaded library is '${loaded}'">⚠ Mismatch</span>`
+        : '';
+      const versionLabel = cbl.configured_version ? ` v${cbl.configured_version}` : '';
+      statsHtml += `<div class="stats stats-horizontal shadow bg-base-200 w-full mb-3">
+        <div class="stat py-2 px-3">
+          <div class="stat-title text-[10px]">Couchbase Lite${versionLabel}</div>
+          <div class="stat-value text-sm flex items-center gap-2 flex-wrap">
+            <span class="badge ${editionClass} badge-sm">${editionLabel}</span>
+            ${vecBadge}
+            ${mismatchBadge}
+          </div>
+          <div class="stat-desc text-[10px] mt-1">Backend: ${cbl.active_backend} · Configured: ${configured}</div>
+        </div>
+      </div>`;
+    }
+
     const hasNodeTypes = stats.node_types && Object.keys(stats.node_types).length;
     const hasEdgeTypes = stats.edge_types && Object.keys(stats.edge_types).length;
 
@@ -2418,6 +2636,16 @@ async function showWelcomePanel() {
       </div>
       ${stats ? '<div class="md-content mt-4"><h3><b><i>My Files</i></b> Index Analytics</h3></div>' : ''}
       ${statsHtml}
+      ${stats ? `
+      <div class="mt-4 p-3 rounded-lg border border-error/30 bg-error/5">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <div class="text-xs">
+            <div class="font-semibold text-error">Danger zone</div>
+            <div class="opacity-70 mt-0.5">Wipes the Apollo data for this folder: <code class="font-mono">_apollo/</code> (graph, Couchbase Lite db, embeddings, annotations) and <code class="font-mono">_apollo_web/</code> (web cache). Useful when switching CE ↔ EE or recovering from a corrupt index. The browser will refresh.</div>
+          </div>
+          <button id="hub-delete-project-btn" type="button" class="btn btn-sm btn-error" onclick="wipeCurrentProject()">🗑️ Delete</button>
+        </div>
+      </div>` : ''}
     </div>
 
     <div id="hub-pane-annotations" data-hub-pane="annotations" class="hidden">
@@ -2510,15 +2738,16 @@ function formatTimeAgo(iso) {
   return `${diffYr} ${diffYr === 1 ? 'year' : 'years'} ago`;
 }
 
-/* Fetch recent chats + notes, merge sorted by timestamp, render last 10. */
+/* Fetch recent chats + notes + bookmarks, merge sorted by timestamp, render last 10. */
 async function loadHubRecent() {
   const host = document.getElementById('hub-recent');
   if (!host) return;
   host.innerHTML = '<div class="opacity-60 italic p-3">Loading recent activity…</div>';
 
-  const [threads, notes] = await Promise.all([
+  const [threads, notes, bookmarks] = await Promise.all([
     apiFetch('/api/chat/threads').catch(() => []),
     apiFetch('/api/annotations?type=note').then(d => d.annotations || []).catch(() => []),
+    apiFetch('/api/annotations?type=bookmark').then(d => d.annotations || []).catch(() => []),
   ]);
 
   const items = [];
@@ -2549,14 +2778,31 @@ async function loadHubRecent() {
       subtitle: tgtLabel,
     });
   });
+  (bookmarks || []).forEach(a => {
+    const ts = a.last_modified_at || a.created_at || '';
+    const tgt = a.target || {};
+    const tgtLabel = tgt.type === 'node' ? (tgt.node_id || '') : (tgt.file_path || '');
+    const title = (a.content || '').trim() || tgtLabel || 'Bookmark';
+    items.push({
+      kind: 'bookmark',
+      ts,
+      id: a.id,
+      nodeId: tgt.type === 'node' ? tgt.node_id : '',
+      filePath: tgt.type === 'file' ? tgt.file_path : '',
+      title: title.split('\n')[0].slice(0, 80),
+      subtitle: tgtLabel,
+    });
+  });
 
   items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
   const top = items.slice(0, 10);
 
   if (!top.length) {
-    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats or notes yet.</div>';
+    host.innerHTML = '<div class="opacity-60 italic p-3">No recent chats, notes, or bookmarks yet.</div>';
     return;
   }
+
+  const deleteBtn = `<button type="button" class="recent-delete" title="Delete" aria-label="Delete">✕</button>`;
 
   host.innerHTML = top.map(it => {
     const when = escapeHtml(formatTimeAgo(it.ts));
@@ -2566,8 +2812,20 @@ async function loadHubRecent() {
             <span class="recent-tag">CHAT</span>
             <span class="recent-title">${escapeHtml(it.title)}</span>
             <span class="recent-time">${when}</span>
+            ${deleteBtn}
           </div>
           <div class="recent-sub">${escapeHtml(it.subtitle)}</div>
+        </div>`;
+    }
+    if (it.kind === 'bookmark') {
+      return `<div class="recent-item recent-bookmark" data-recent-kind="bookmark" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open bookmark">
+          <div class="recent-row">
+            <span class="recent-tag">★ BOOKMARK</span>
+            <span class="recent-title">${escapeHtml(it.title)}</span>
+            <span class="recent-time">${when}</span>
+            ${deleteBtn}
+          </div>
+          ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
         </div>`;
     }
     return `<div class="recent-item recent-note" data-recent-kind="note" data-recent-id="${escapeHtml(it.id)}" data-recent-node="${escapeHtml(it.nodeId || '')}" data-recent-file="${escapeHtml(it.filePath || '')}" title="Open note">
@@ -2575,16 +2833,41 @@ async function loadHubRecent() {
           <span class="recent-tag">NOTE</span>
           <span class="recent-title">${escapeHtml(it.title)}</span>
           <span class="recent-time">${when}</span>
+          ${deleteBtn}
         </div>
         ${it.subtitle ? `<div class="recent-sub">${escapeHtml(it.subtitle)}</div>` : ''}
       </div>`;
   }).join('');
 
   host.querySelectorAll('.recent-item').forEach(el => {
-    el.addEventListener('click', () => {
-      if (el.dataset.recentKind === 'chat') openRecentChat(el.dataset.recentId);
+    el.addEventListener('click', (ev) => {
+      // Skip when the delete button (or anything inside it) was clicked.
+      if (ev.target.closest('.recent-delete')) return;
+      const kind = el.dataset.recentKind;
+      if (kind === 'chat') openRecentChat(el.dataset.recentId);
       else openRecentNote(el.dataset.recentId, el.dataset.recentNode, el.dataset.recentFile);
     });
+    const del = el.querySelector('.recent-delete');
+    if (del) {
+      del.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const kind = el.dataset.recentKind;
+        const id = el.dataset.recentId;
+        const label = kind === 'chat' ? 'chat' : kind === 'bookmark' ? 'bookmark' : 'note';
+        if (!confirm(`Delete this ${label}? This cannot be undone.`)) return;
+        try {
+          if (kind === 'chat') {
+            await apiFetch(`/api/chat/threads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          } else {
+            await apiFetch(`/api/annotations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          }
+          showToast(`${label.charAt(0).toUpperCase() + label.slice(1)} deleted`, 'success');
+          loadHubRecent();
+        } catch (e) {
+          showToast(`Failed to delete ${label}: ${e.message || e}`, 'error');
+        }
+      });
+    }
   });
 }
 
@@ -2592,7 +2875,26 @@ async function loadHubRecent() {
 function openRecentChat(threadId) {
   if (!threadId) return;
   switchView('graph');
-  setTimeout(() => loadChatThread(threadId), 60);
+  // Make sure the bottom chat pane is generously visible — if the user
+  // had dragged the vertical splitter so the chat panel is tiny (or
+  // pushed the detail pane to 85%), restoring a chat into a 1‑line
+  // window makes it look like nothing happened. Force a 50/50 split.
+  const top = document.getElementById('left-vsplit-top');
+  if (top) {
+    top.style.flex = 'none';
+    top.style.height = '50%';
+  }
+  setTimeout(() => {
+    loadChatThread(threadId);
+    // Scroll the chat panel into view and briefly highlight so the
+    // user notices the messages were restored.
+    const pane = document.getElementById('left-vsplit-bottom');
+    if (pane) {
+      pane.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      pane.classList.add('chat-flash');
+      setTimeout(() => pane.classList.remove('chat-flash'), 900);
+    }
+  }, 60);
 }
 
 /* Open the file/node a note was taken on, without deleting the note. */
@@ -2822,10 +3124,16 @@ function _ensureTracePanel(bubble) {
         '<span class="chat-trace-caret">▸</span>' +
         '<span class="chat-trace-summary">Trace</span>' +
       '</button>' +
-      '<button type="button" class="chat-trace-copy btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 hidden" title="Copy trace to clipboard" aria-label="Copy trace to clipboard">' +
-        '<span class="chat-trace-copy-icon">📋</span>' +
-        '<span class="chat-trace-copy-label">Copy</span>' +
-      '</button>' +
+      '<div class="flex items-center gap-1">' +
+        '<button type="button" class="chat-trace-visualize btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 hidden" title="Visualize trace as a timeline diagram" aria-label="Visualize trace">' +
+          '<span class="chat-trace-visualize-icon">📊</span>' +
+          '<span class="chat-trace-visualize-label">Visualize</span>' +
+        '</button>' +
+        '<button type="button" class="chat-trace-copy btn btn-ghost btn-xs h-5 min-h-0 px-1 gap-1 hidden" title="Copy trace to clipboard" aria-label="Copy trace to clipboard">' +
+          '<span class="chat-trace-copy-icon">📋</span>' +
+          '<span class="chat-trace-copy-label">Copy</span>' +
+        '</button>' +
+      '</div>' +
     '</div>' +
     '<div class="chat-trace-body hidden"></div>';
   parent.insertBefore(panel, wrapper.nextSibling);
@@ -2835,10 +3143,18 @@ function _ensureTracePanel(bubble) {
     panel.querySelector('.chat-trace-toggle').setAttribute('aria-expanded', expanded ? 'false' : 'true');
     panel.querySelector('.chat-trace-caret').textContent = expanded ? '▸' : '▾';
     panel.querySelector('.chat-trace-body').classList.toggle('hidden', expanded);
-    // Show Copy only while the trace is open AND we actually have steps.
+    // Show Copy / Visualize only while the trace is open AND we actually have steps.
     const copyBtn = panel.querySelector('.chat-trace-copy');
+    const vizBtn = panel.querySelector('.chat-trace-visualize');
     const hasSteps = !!panel.dataset.steps;
     copyBtn.classList.toggle('hidden', expanded || !hasSteps);
+    if (vizBtn) vizBtn.classList.toggle('hidden', expanded || !hasSteps);
+  });
+  panel.querySelector('.chat-trace-visualize').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    let steps = [];
+    try { steps = JSON.parse(panel.dataset.steps || '[]'); } catch { steps = []; }
+    _openTraceVisualizer(steps);
   });
   panel.querySelector('.chat-trace-copy').addEventListener('click', async (ev) => {
     ev.stopPropagation();
@@ -2961,10 +3277,550 @@ function _renderTracePanel(panel, steps) {
   // steps stream in.
   panel.dataset.steps = JSON.stringify(steps);
   const copyBtn = panel.querySelector('.chat-trace-copy');
-  if (copyBtn) {
-    const expanded = panel.dataset.expanded === '1';
-    copyBtn.classList.toggle('hidden', !expanded || steps.length === 0);
+  const vizBtn = panel.querySelector('.chat-trace-visualize');
+  const expanded = panel.dataset.expanded === '1';
+  if (copyBtn) copyBtn.classList.toggle('hidden', !expanded || steps.length === 0);
+  if (vizBtn) vizBtn.classList.toggle('hidden', !expanded || steps.length === 0);
+}
+
+/* ── Trace Visualizer Overlay ──────────────────────────────────────
+   Renders the structured trace `steps` as a Gantt-style timeline so
+   the user can quickly see which round each tool call belonged to,
+   how long each one took, and what flowed IN (args) vs OUT (bytes /
+   preview). Brightness/opacity of each bar scales with how much of
+   the *total* time the step consumed — the slowest step glows the
+   brightest, mirroring the look of Couchbase's join-order-hint
+   plan diagrams.
+
+   Layout:
+     ┌ Request ┐
+     ├ Round 0 ─────────────────────────────────────┐
+     │   ├─ tool_call A  IN…    ████████░░  OUT…    │
+     │   ├─ tool_call B  IN…    ███░░░░░░░  OUT…    │
+     │   └─ tool_call C  IN…    █░░░░░░░░░  OUT…    │
+     ├ Round 1 ──┐
+     ├ Stream begin
+     └ Done                                          */
+let _activeTraceOverlay = null;
+
+function _openTraceVisualizer(steps) {
+  if (_activeTraceOverlay) _closeTraceVisualizer();
+  if (!Array.isArray(steps) || steps.length === 0) return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'pane-overlay trace-viz-overlay';
+  overlay.innerHTML = `
+    <div class="pane-overlay-card trace-viz-card">
+      <div class="trace-viz-header">
+        <div class="trace-viz-title">AI Trace Timeline</div>
+        <div class="trace-viz-legend">
+          <span class="trace-viz-legend-item" title="Apollo tool brightness scales with how slow it ran"><span class="trace-viz-swatch" style="background:hsl(210 80% 55% / 1)"></span>slow</span>
+          <span class="trace-viz-legend-item"><span class="trace-viz-swatch" style="background:hsl(210 80% 55% / 0.35)"></span>fast</span>
+          <span class="trace-viz-legend-item">size ∝ time · X = elapsed s · Y = round lane</span>
+        </div>
+      </div>
+      <div class="trace-viz-summary-bar"></div>
+      <div class="pane-overlay-content trace-viz-content">
+        <div class="trace-viz-chart"></div>
+      </div>
+      <button type="button" class="pane-overlay-close" title="Close">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+      </button>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  _activeTraceOverlay = overlay;
+
+  // Render summary above the chart, then mount the ECharts graph.
+  const built = _buildTraceVizGraph(steps);
+  overlay.querySelector('.trace-viz-summary-bar').innerHTML = built.summaryHtml;
+  const chartEl = overlay.querySelector('.trace-viz-chart');
+  if (window.echarts) {
+    const chart = echarts.init(chartEl);
+    chart.setOption(built.option);
+    _activeTraceOverlay._chart = chart;
+    // Resize on window changes while the overlay is open.
+    _activeTraceOverlay._onResize = () => chart.resize();
+    window.addEventListener('resize', _activeTraceOverlay._onResize);
+  } else {
+    chartEl.textContent = 'ECharts not available.';
   }
+
+  const closeBtn = overlay.querySelector('.pane-overlay-close');
+  closeBtn.addEventListener('click', _closeTraceVisualizer);
+  overlay.addEventListener('click', e => { if (e.target === overlay) _closeTraceVisualizer(); });
+  document.addEventListener('keydown', _traceVizKeyHandler);
+}
+
+function _closeTraceVisualizer() {
+  if (!_activeTraceOverlay) return;
+  if (_activeTraceOverlay._chart) {
+    try { _activeTraceOverlay._chart.dispose(); } catch {}
+  }
+  if (_activeTraceOverlay._onResize) {
+    window.removeEventListener('resize', _activeTraceOverlay._onResize);
+  }
+  _activeTraceOverlay.remove();
+  _activeTraceOverlay = null;
+  document.removeEventListener('keydown', _traceVizKeyHandler);
+}
+
+function _traceVizKeyHandler(ev) {
+  if (ev.key === 'Escape') _closeTraceVisualizer();
+}
+
+/* Build an ECharts graph-on-cartesian (graph-grid example style)
+   option representing the trace as a directed graph laid out on a
+   time × round grid. Each step is a node positioned at:
+     X = elapsed seconds since the request started
+     Y = lane (Setup / Round 0 / Round 1 / … / Finish)
+   Symbol size and color brightness scale with the step's duration so
+   the slowest steps "glow" — same idea as the Couchbase plan diagram.
+   Edges connect each step to the next in execution order. */
+function _buildTraceVizGraph(steps) {
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // ── 1. Walk the steps once, assigning each one an absolute start
+  // time (cumulative dt) and a lane index. The backend doesn't emit
+  // wall-clock timestamps for tool_call (only its tool_return has
+  // dt), so we reconstruct: a tool_call node is placed at the
+  // current clock, and the clock advances by its return's dt.
+  const lanes = []; // [{ kind, label, finish? }] ordered top-to-bottom
+  const laneIndex = (key, info) => {
+    let i = lanes.findIndex(l => l.key === key);
+    if (i < 0) { lanes.push({ key, ...info }); i = lanes.length - 1; }
+    return i;
+  };
+
+  const nodes = [];     // ECharts node objects
+  const links = [];     // sequential execution edges
+  let clock = 0;        // wall-clock cursor (seconds since request start)
+  let prevId = null;
+  let currentRoundKey = null;
+  let totalDt = null;
+
+  // Pair tool_call → tool_return so we know each call's duration up
+  // front. Match by name in arrival order (same as the HTML version).
+  const pendingCalls = []; // [{ id, name }]
+
+  let nodeId = 0;
+  const addNode = (cfg) => {
+    const id = String(nodeId++);
+    nodes.push({ id, ...cfg });
+    if (prevId != null) {
+      links.push({ source: prevId, target: id });
+    }
+    prevId = id;
+    return id;
+  };
+
+  // Prefer the backend-emitted absolute timestamp `t_elapsed` (seconds
+  // since the request started). It captures all wall-clock time —
+  // including AI thinking time, network latency, and any gaps between
+  // events — that we'd otherwise have to reconstruct from per-step dt
+  // values and lose. Falls back to the running `clock` when missing
+  // (older traces / tests).
+  const xOf = (s) => (s && s.t_elapsed != null) ? +s.t_elapsed : clock;
+
+  for (const s of steps) {
+    const ph = s.phase || '';
+    if (ph === 'request') {
+      const y = laneIndex('setup', { kind: 'setup', label: 'Setup' });
+      const x = xOf(s);
+      clock = Math.max(clock, x);
+      addNode({ _step: s, _kind: 'request', _x: x, _y: y, _dt: 0 });
+    } else if (ph === 'round') {
+      // The `round` event fires AFTER the AI has finished thinking, so
+      // its t_elapsed is the time at the END of the LLM call. Place
+      // the node there and treat round.dt as the thinking duration so
+      // the round symbol's size reflects how long the model spent.
+      currentRoundKey = `round-${s.round}`;
+      const y = laneIndex(currentRoundKey, {
+        kind: 'round', label: `Round ${s.round}`, finish: s.finish,
+      });
+      const x = xOf(s);
+      clock = Math.max(clock, x);
+      addNode({ _step: s, _kind: 'round', _x: x, _y: y, _dt: +s.dt || 0 });
+    } else if (ph === 'tool_call') {
+      const y = currentRoundKey
+        ? laneIndex(currentRoundKey, { kind: 'round', label: currentRoundKey })
+        : laneIndex('setup', { kind: 'setup', label: 'Setup' });
+      const x = xOf(s);
+      clock = Math.max(clock, x);
+      const id = addNode({
+        _step: s, _kind: 'tool_call', _x: x, _y: y, _dt: 0,
+        _name: s.name, _args: s.args_preview,
+      });
+      pendingCalls.push({ id, name: s.name });
+    } else if (ph === 'tool_return') {
+      // Find pending tool_call with same name → annotate it with dt
+      // and advance the clock to this event's absolute timestamp.
+      const pi = pendingCalls.findIndex(p => p.name === s.name);
+      const dt = +s.dt || 0;
+      if (pi >= 0) {
+        const pid = pendingCalls[pi].id;
+        const node = nodes.find(n => n.id === pid);
+        if (node) {
+          node._dt = dt;
+          node._return = s;
+        }
+        pendingCalls.splice(pi, 1);
+      } else {
+        const y = currentRoundKey
+          ? laneIndex(currentRoundKey, { kind: 'round', label: currentRoundKey })
+          : laneIndex('setup', { kind: 'setup', label: 'Setup' });
+        addNode({
+          _step: s, _kind: 'tool_return', _x: xOf(s), _y: y, _dt: dt,
+          _name: s.name, _return: s,
+        });
+      }
+      const x = xOf(s);
+      clock = Math.max(clock, x);
+    } else if (ph === 'stream_begin') {
+      const y = laneIndex('finish', { kind: 'finish', label: 'Finish' });
+      // Backend already exposes `elapsed` here; t_elapsed agrees.
+      const x = (s.t_elapsed != null) ? +s.t_elapsed
+              : (s.elapsed != null ? +s.elapsed : clock);
+      clock = Math.max(clock, x);
+      addNode({ _step: s, _kind: 'stream_begin', _x: x, _y: y, _dt: 0 });
+    } else if (ph === 'done' || ph === 'return_result') {
+      const y = laneIndex('finish', { kind: 'finish', label: 'Finish' });
+      if (s.total_dt != null) totalDt = +s.total_dt;
+      const x = (s.t_elapsed != null) ? +s.t_elapsed
+              : (s.total_dt != null ? +s.total_dt : clock);
+      clock = Math.max(clock, x);
+      // For `done` after a stream, attribute its duration so the
+      // node can carry the streaming time in its own _dt — useful
+      // for the per-node tooltip and as a visual cue.
+      const dt = (ph === 'done' && s.stream_dt != null) ? +s.stream_dt : 0;
+      addNode({ _step: s, _kind: ph, _x: x, _y: y, _dt: dt });
+    } else if (ph === 'rounds_exhausted' || ph === 'error') {
+      const y = laneIndex('finish', { kind: 'finish', label: 'Finish' });
+      const x = xOf(s);
+      clock = Math.max(clock, x);
+      addNode({ _step: s, _kind: ph, _x: x, _y: y, _dt: 0 });
+    }
+  }
+
+  // ── 2. Compute scaling info for symbol size + color brightness.
+  let maxDt = 0;
+  for (const n of nodes) { if (n._dt > maxDt) maxDt = n._dt; }
+  if (maxDt <= 0) maxDt = 1;
+
+  // Group every step into one of four high-level categories so the
+  // legend reads as: who did the work? The user couldn't tell which
+  // nodes were AI calls vs Apollo's local tools, so we make that the
+  // primary axis of differentiation (color family + shape + legend
+  // entry). Brightness within the "Apollo tool" family then encodes
+  // how slow each tool call was.
+  //
+  //   AI request   → outbound call to the LLM (request, round, stream)
+  //   Apollo tool  → local tool execution (tool_call/tool_return)
+  //   Result       → terminal success step (done, return_result)
+  //   Issue        → terminal warning / error
+  const CATEGORIES = [
+    { name: 'AI request',  color: 'hsl(265 65% 60%)', symbol: 'rect' },
+    { name: 'Apollo tool', color: 'hsl(210 80% 55%)', symbol: 'circle' },
+    { name: 'Result',      color: 'hsl(140 55% 50%)', symbol: 'pin' },
+    { name: 'Issue',       color: 'hsl(0 80% 55%)',   symbol: 'triangle' },
+  ];
+  const categoryFor = (kind) => {
+    if (kind === 'request' || kind === 'round' || kind === 'stream_begin') return 0;
+    if (kind === 'tool_call' || kind === 'tool_return') return 1;
+    if (kind === 'done' || kind === 'return_result') return 2;
+    if (kind === 'error' || kind === 'rounds_exhausted') return 3;
+    return 1;
+  };
+
+  // Sum the wall-clock time charged to each category so the legend
+  // can answer "where did the time go?" at a glance. Backend gives us
+  // per-round LLM time (`round.dt`), per-tool execution time
+  // (`tool_return.dt`), and the final stream duration on the `done`
+  // step (`stream_dt`). Errors/results are terminal markers (no dt).
+  const catTotals = [0, 0, 0, 0];
+  for (const s of steps) {
+    if (s.phase === 'round')         catTotals[0] += +s.dt || 0;
+    else if (s.phase === 'tool_return') catTotals[1] += +s.dt || 0;
+    else if (s.phase === 'done' && s.stream_dt != null) catTotals[0] += +s.stream_dt || 0;
+  }
+  // Format `S.sss` seconds as `H:MM:SS.mmm` so the user sees the
+  // whole hh:mm:ss.ms breakdown they asked for, padded consistently.
+  const fmtDur = (secs) => {
+    if (!isFinite(secs) || secs < 0) secs = 0;
+    const ms = Math.round((secs - Math.floor(secs)) * 1000);
+    const total = Math.floor(secs);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+  };
+
+  const colorFor = (kind, ratio) => {
+    const cat = categoryFor(kind);
+    if (cat === 1) {
+      // Apollo tool — brightness scales with duration so the slowest
+      // tool calls "glow", matching the Couchbase plan diagram look.
+      const a = (0.35 + 0.65 * ratio).toFixed(2);
+      return `hsl(210 80% 55% / ${a})`;
+    }
+    return CATEGORIES[cat].color;
+  };
+
+  // Sub-shape per kind within a category, so users can still tell a
+  // `request` from a `round` from a `stream_begin` even though they
+  // share the AI-request color.
+  const symbolFor = (kind) => {
+    if (kind === 'request') return 'triangle';   // "send"
+    if (kind === 'round') return 'rect';         // "decision"
+    if (kind === 'stream_begin') return 'diamond';
+    if (kind === 'tool_call' || kind === 'tool_return') return 'circle';
+    if (kind === 'done' || kind === 'return_result') return 'pin';
+    if (kind === 'error') return 'triangle';
+    if (kind === 'rounds_exhausted') return 'arrow';
+    return 'circle';
+  };
+
+  // ── 2b. Spread overlapping nodes within the same lane. Several
+  // steps are emitted with no measurable time between them (the
+  // `round` marker, for example, fires at the same instant as the
+  // first `tool_call` in that round). Without this, those nodes
+  // stack on top of each other and the user sees one big blob.
+  // We bump each subsequent node in a lane by a small epsilon so
+  // they read as a clean left-to-right sequence on that row.
+  const xMaxRaw = Math.max(0.01, ...nodes.map(n => n._x));
+  const epsilon = Math.max(0.05, xMaxRaw * 0.012); // ~1.2% of total span
+  const lastXByLane = new Map();
+  for (const n of nodes) {
+    const last = lastXByLane.get(n._y);
+    if (last != null && n._x <= last + epsilon * 0.5) {
+      n._x = last + epsilon;
+    }
+    lastXByLane.set(n._y, n._x);
+  }
+
+  // ── 3. Build ECharts node descriptors. Y is inverted in our lanes
+  // (lane 0 at top), so we map y → (lanes.length - 1 - y).
+  const yMax = Math.max(0, lanes.length - 1);
+  const echartsNodes = nodes.map(n => {
+    const ratio = Math.min(1, n._dt / maxDt);
+    const size = 14 + Math.round(36 * ratio); // 14 → 50 px
+    const fill = colorFor(n._kind, ratio);
+    const labelText = n._kind === 'tool_call' || n._kind === 'tool_return'
+      ? n._name
+      : (n._kind === 'round'
+          ? `R${n._step.round}`
+          : (n._kind === 'request'
+              ? 'req'
+              : (n._kind === 'done' || n._kind === 'return_result'
+                  ? 'done'
+                  : (n._kind === 'stream_begin' ? 'stream' : n._kind))));
+    return {
+      id: n.id,
+      name: labelText + ' #' + n.id,
+      category: categoryFor(n._kind),
+      value: [n._x, yMax - n._y, n._dt, n._kind, n._step],
+      symbol: symbolFor(n._kind),
+      symbolSize: size,
+      itemStyle: {
+        color: fill,
+        borderColor: 'rgba(255,255,255,0.5)',
+        borderWidth: 1,
+        shadowBlur: 6 + Math.round(20 * ratio),
+        shadowColor: fill,
+      },
+      label: {
+        show: true,
+        position: 'top',
+        formatter: () => labelText,
+        fontSize: 10,
+        color: 'inherit',
+      },
+      _step: n._step,
+      _kind: n._kind,
+      _dt: n._dt,
+      // The raw walker stashes the paired tool_return on the
+      // tool_call node — copy it across so the tooltip can show OUT.
+      // Without this every tool node showed "(pending)" because the
+      // mapped ECharts object dropped the field.
+      _return: n._return || null,
+      _name: n._name || null,
+      _args: n._args || null,
+    };
+  });
+
+  const echartsLinks = links.map(l => ({
+    source: l.source,
+    target: l.target,
+    lineStyle: {
+      color: 'rgba(150,150,170,0.45)',
+      width: 1.2,
+      curveness: 0.05,
+    },
+    symbol: ['none', 'arrow'],
+    symbolSize: [0, 6],
+  }));
+
+  // Y axis category labels (bottom → top because we inverted).
+  const yCats = [...lanes].reverse().map(l => l.label);
+
+  // Tooltip formatter: rich card with IN/OUT / metadata for the
+  // node's underlying step. Shown on hover.
+  const tooltipFormatter = (params) => {
+    if (params.dataType !== 'node') return '';
+    const n = params.data;
+    const s = n._step || {};
+    const k = n._kind;
+    const head = (title, sub) =>
+      `<div style="font-weight:700;margin-bottom:4px;">${esc(title)}` +
+      (sub ? ` <span style="opacity:.6;font-weight:400;">${esc(sub)}</span>` : '') +
+      `</div>`;
+    const row = (k, v) =>
+      `<div style="display:flex;gap:8px;font-size:11px;line-height:1.5;">` +
+      `<span style="opacity:.6;min-width:50px;">${esc(k)}</span>` +
+      `<span style="word-break:break-word;max-width:320px;">${esc(v)}</span></div>`;
+    const lines = [];
+    if (k === 'request') {
+      lines.push(head('Request', `${s.provider}/${s.model}`));
+      if (s.context_node) lines.push(row('ctx', s.context_node));
+      if (s.history_len) lines.push(row('history', s.history_len + ' msg'));
+      if (s.tools_count != null) lines.push(row('tools', s.tools_count));
+    } else if (k === 'round') {
+      lines.push(head(`Round ${s.round}`, `finish=${s.finish}`));
+      lines.push(row('duration', s.dt + ' s'));
+      lines.push(row('tool calls', s.tool_calls));
+    } else if (k === 'tool_call' || k === 'tool_return') {
+      lines.push(head(`🔧 ${n._name || s.name}`, n._dt.toFixed(2) + ' s'));
+      lines.push(row('IN', s.args_preview || (n._step && n._step.args_preview) || '∅'));
+      const ret = n._return || (s.phase === 'tool_return' ? s : null);
+      if (ret) {
+        lines.push(row('OUT', ret.preview || `${ret.bytes} B`));
+        if (ret.bytes != null) lines.push(row('bytes', ret.bytes));
+        if (ret.toon_bytes != null) lines.push(row('toon', `${ret.toon_bytes} B (-${ret.toon_saved_pct}%)`));
+      } else {
+        lines.push(row('OUT', '(pending)'));
+      }
+    } else if (k === 'stream_begin') {
+      lines.push(head('Stream begin', `@ ${s.elapsed}s`));
+    } else if (k === 'done') {
+      lines.push(head('Done', s.reason));
+      if (s.tokens != null) lines.push(row('tokens', s.tokens));
+      if (s.bytes != null) lines.push(row('bytes', s.bytes));
+      if (s.total_dt != null) lines.push(row('total', s.total_dt + ' s'));
+    } else if (k === 'return_result') {
+      lines.push(head('return_result', s.confidence || ''));
+      lines.push(row('files', (s.files || []).length));
+      lines.push(row('refs', (s.node_refs || []).length));
+      if (s.total_dt != null) lines.push(row('total', s.total_dt + ' s'));
+    } else if (k === 'rounds_exhausted') {
+      lines.push(head('Rounds exhausted', `last=${s.last_finish}`));
+    } else if (k === 'error') {
+      lines.push(head('Error', s.where));
+      lines.push(row('message', s.message));
+    }
+    lines.push(`<div style="opacity:.5;font-size:10px;margin-top:4px;">@ ${(+params.value[0]).toFixed(2)}s</div>`);
+    return lines.join('');
+  };
+
+  // X axis max: round up to nearest 0.5 above the latest event.
+  let xMax = 0;
+  for (const n of nodes) { if (n._x > xMax) xMax = n._x; }
+  if (totalDt != null && totalDt > xMax) xMax = totalDt;
+  xMax = Math.max(0.5, Math.ceil(xMax * 2) / 2);
+
+  const option = {
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'item',
+      formatter: tooltipFormatter,
+      borderColor: 'rgba(0,0,0,0.15)',
+      backgroundColor: 'rgba(255,255,255,0.96)',
+      textStyle: { color: '#1a1a1a' },
+      extraCssText: 'box-shadow:0 8px 24px rgba(0,0,0,0.25); max-width:380px;',
+    },
+    legend: [{
+      // Top-level "who did the work" legend. Clicking an entry hides
+      // every node in that category, which is the fastest way to see
+      // (e.g.) just the Apollo tool calls without the AI bookkeeping.
+      // The formatter appends the cumulative wall-clock time spent in
+      // each category as H:MM:SS.mmm so the legend doubles as a
+      // breakdown of where time went.
+      data: CATEGORIES.map(c => ({
+        name: c.name,
+        icon: c.symbol,
+        itemStyle: { color: c.color },
+      })),
+      formatter: (name) => {
+        const idx = CATEGORIES.findIndex(c => c.name === name);
+        if (idx < 0) return name;
+        return `${name}  (${fmtDur(catTotals[idx])})`;
+      },
+      top: 6,
+      left: 'center',
+      textStyle: { fontSize: 11, fontFamily: "'JetBrains Mono','Fira Code','Consolas',monospace" },
+      itemGap: 18,
+    }],
+    grid: { left: 90, right: 30, top: 50, bottom: 50, containLabel: false },
+    xAxis: {
+      type: 'value',
+      name: 'elapsed (s)',
+      nameLocation: 'middle',
+      nameGap: 26,
+      min: 0,
+      max: xMax,
+      splitLine: { lineStyle: { color: 'rgba(150,150,170,0.15)' } },
+      axisLabel: { fontSize: 10 },
+    },
+    yAxis: {
+      type: 'category',
+      data: yCats,
+      axisTick: { show: false },
+      axisLabel: { fontSize: 11, fontWeight: 600 },
+      splitLine: { show: true, lineStyle: { color: 'rgba(150,150,170,0.10)' } },
+    },
+    series: [{
+      type: 'graph',
+      coordinateSystem: 'cartesian2d',
+      animation: false,
+      // Wire categories so the legend on top can toggle visibility per
+      // category. Each category supplies its own legend swatch color
+      // and symbol.
+      categories: CATEGORIES.map(c => ({
+        name: c.name,
+        symbol: c.symbol,
+        itemStyle: { color: c.color },
+      })),
+      data: echartsNodes,
+      links: echartsLinks,
+      edgeSymbol: ['none', 'arrow'],
+      edgeSymbolSize: [0, 6],
+      lineStyle: { color: 'source', curveness: 0.05, opacity: 0.6 },
+      emphasis: {
+        focus: 'adjacency',
+        lineStyle: { width: 2 },
+      },
+      z: 3,
+    }],
+  };
+
+  // ── 4. Compact summary cards above the chart.
+  const totalCalls = nodes.filter(n => n._kind === 'tool_call' || n._kind === 'tool_return').length;
+  const roundCount = lanes.filter(l => l.kind === 'round').length;
+  let slowest = null;
+  for (const n of nodes) {
+    if ((n._kind === 'tool_call' || n._kind === 'tool_return') && n._dt > 0) {
+      if (!slowest || n._dt > slowest._dt) slowest = n;
+    }
+  }
+  const summaryHtml = `
+    <div class="tv-summary">
+      <div class="tv-summary-item"><span class="tv-summary-k">Total</span><span class="tv-summary-v">${totalDt != null ? totalDt.toFixed(2) + 's' : '—'}</span></div>
+      <div class="tv-summary-item"><span class="tv-summary-k">Rounds</span><span class="tv-summary-v">${roundCount}</span></div>
+      <div class="tv-summary-item"><span class="tv-summary-k">Tool calls</span><span class="tv-summary-v">${totalCalls}</span></div>
+      <div class="tv-summary-item"><span class="tv-summary-k">Slowest</span><span class="tv-summary-v">${slowest ? esc(slowest._name || slowest._step.name) + ' (' + slowest._dt.toFixed(2) + 's)' : '—'}</span></div>
+    </div>`;
+
+  return { option, summaryHtml };
 }
 
 function _traceRowHtml(s) {
@@ -3913,6 +4769,287 @@ function switchSettingsTab(tabId) {
   document.querySelectorAll('.settings-tab-panel').forEach(p => {
     p.classList.toggle('hidden', p.dataset.panel !== tabId);
   });
+  // The Storage tab is loaded lazily — the /api/storage/info call hits
+  // the filesystem and probes the loaded libcblite, so we don't want it
+  // on every page load.
+  if (tabId === 'storage') loadStorageInfo();
+}
+
+// ── Settings → Storage tab ────────────────────────────────────────────
+// Drives the libcblite installer UI. Lets the user:
+//   - see detected OS / arch and currently-loaded edition,
+//   - download a (version, edition) zip from packages.couchbase.com into
+//     <repo>/storage_binary/,
+//   - flip the active library (persisted to settings.json so it sticks
+//     across restarts — ctypes can't unload a loaded shared library, so
+//     activation is "next-restart" semantics).
+
+async function loadStorageInfo() {
+  const root = document.getElementById('storage-panel');
+  if (!root) return;
+  root.innerHTML = `<div class="flex items-center gap-2 opacity-60">
+    <span class="loading loading-spinner loading-xs"></span> Loading storage info…</div>`;
+  let info;
+  try {
+    info = await apiFetch('/api/storage/info');
+  } catch (e) {
+    root.innerHTML = `<div class="alert alert-error text-xs">Failed to load: ${e.message || e}</div>`;
+    return;
+  }
+  renderStoragePanel(info);
+}
+
+function renderStoragePanel(info) {
+  const root = document.getElementById('storage-panel');
+  if (!root) return;
+  const plat = info.platform || {};
+  const cbl = info.cblite_info || {};
+  const installed = info.installed || [];
+  const active = info.active_lib_path || '';
+  const versions = info.known_versions || ['4.0.3'];
+  const editions = info.editions || ['community', 'enterprise'];
+  const defaultVersion = info.default_version || versions[0];
+
+  const loadedBadge = cbl.loaded_edition
+    ? `<span class="badge ${cbl.loaded_edition === 'enterprise' ? 'badge-success' : 'badge-info'} badge-sm">
+         ${cbl.loaded_edition === 'enterprise' ? 'Enterprise (EE)' : 'Community (CE)'}
+       </span>`
+    : '<span class="badge badge-ghost badge-sm">Not loaded</span>';
+
+  const platRow = plat.supported
+    ? `<span class="badge badge-ghost badge-sm">${plat.os_label} · ${plat.machine}</span>`
+    : `<span class="badge badge-warning badge-sm" title="No auto-install builds for this OS/arch">
+         ${plat.os_label || '?'} · ${plat.machine || '?'} (unsupported)
+       </span>`;
+
+  const versionOpts = versions.map(v =>
+    `<option value="${v}" ${v === defaultVersion ? 'selected' : ''}>${v}</option>`).join('');
+  const editionOpts = editions.map(e =>
+    `<option value="${e}" ${e === 'community' ? 'selected' : ''}>${e === 'enterprise' ? 'Enterprise (EE)' : 'Community (CE)'}</option>`).join('');
+
+  const installRows = installed.length
+    ? installed.map(i => {
+        const isActive = active && active === i.lib_path;
+        const okBadge = i.exists
+          ? '<span class="badge badge-success badge-xs">files OK</span>'
+          : '<span class="badge badge-error badge-xs" title="Library file not found inside install dir">broken</span>';
+        const activeBadge = isActive
+          ? '<span class="badge badge-primary badge-xs">active</span>'
+          : '';
+        return `<tr>
+          <td class="font-mono">${i.version}</td>
+          <td>${i.edition === 'enterprise' ? 'EE' : 'CE'}</td>
+          <td class="font-mono opacity-70">${i.platform_tag}</td>
+          <td class="font-mono opacity-60 truncate max-w-[280px]" title="${i.lib_path}">${i.lib_path}</td>
+          <td>${okBadge} ${activeBadge}</td>
+          <td>
+            <div class="flex gap-1">
+              <button class="btn btn-xs btn-primary" ${isActive || !i.exists ? 'disabled' : ''}
+                onclick="storageActivate('${i.lib_path.replace(/'/g, "\\'")}', '${i.edition}', '${i.version}')">
+                Activate
+              </button>
+              <button class="btn btn-xs btn-ghost text-error"
+                onclick="storageUninstall('${i.install_dir.replace(/'/g, "\\'")}')">
+                Delete
+              </button>
+            </div>
+          </td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="6" class="text-center opacity-50 py-3">No installs yet — pick a version and edition above to download one.</td></tr>`;
+
+  const restartHint = active && cbl.loaded_edition && active !== `${cbl.loaded_edition_path || ''}`
+    ? ''
+    : '';
+
+  // Backend selector: persisted in data/settings.json via
+  // POST /api/storage/backend. The CLI flag still wins on the next start,
+  // so this is the default for `python main.py serve` without --backend.
+  // `active_backend` = what the running server actually booted with;
+  // `saved_default_backend` = what will be used on next restart.
+  const activeBackend = info.active_backend || cbl.active_backend || 'json';
+  const savedBackend = info.saved_default_backend || activeBackend;
+  const backendOpts = ['json', 'cblite'].map(b =>
+    `<option value="${b}" ${b === savedBackend ? 'selected' : ''}>${b === 'cblite' ? 'cblite (Couchbase Lite — supports vector indexes when EE is loaded)' : 'json (file-based — no libcblite required)'}</option>`
+  ).join('');
+  const backendMismatch = savedBackend !== activeBackend;
+
+  root.innerHTML = `
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+      <div class="bg-base-200 rounded p-3">
+        <div class="text-[10px] uppercase opacity-50 mb-1">Detected platform</div>
+        <div class="flex flex-wrap items-center gap-2">${platRow}</div>
+        ${plat.platform_tag ? `<div class="text-[10px] opacity-50 mt-2">URL tag: <code class="font-mono">${plat.platform_tag}</code></div>` : ''}
+      </div>
+      <div class="bg-base-200 rounded p-3">
+        <div class="text-[10px] uppercase opacity-50 mb-1">Currently loaded</div>
+        <div class="flex flex-wrap items-center gap-2">
+          ${loadedBadge}
+          ${cbl.vector_index_available ? '<span class="badge badge-success badge-sm">✓ Vector Index</span>' : '<span class="badge badge-ghost badge-sm">✗ Vector Index</span>'}
+        </div>
+        <div class="text-[10px] opacity-50 mt-2">Backend: <code class="font-mono">${activeBackend}</code></div>
+      </div>
+    </div>
+
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Storage backend (for new server starts)</div>
+      <div class="flex flex-wrap items-end gap-2">
+        <select id="storage-backend-select" class="select select-xs select-bordered min-w-[300px]">${backendOpts}</select>
+        <button id="storage-backend-save-btn" class="btn btn-xs btn-primary" onclick="storageSaveBackend()">Save</button>
+        <span id="storage-backend-status" class="text-[11px] opacity-70"></span>
+      </div>
+      <div class="text-[10px] opacity-60 mt-2">
+        Running: <code class="font-mono">${activeBackend}</code> · Saved: <code class="font-mono">${savedBackend}</code>
+        ${backendMismatch ? '<span class="badge badge-warning badge-xs ml-2">restart required</span>' : ''}
+      </div>
+      <div class="text-[10px] opacity-50 mt-1">
+        <strong>json</strong> — graph stored in <code class="font-mono">_apollo/graph.json</code>, no libcblite needed.
+        <strong>cblite</strong> — graph + embeddings stored in a Couchbase Lite database; required for native vector indexes (EE only).
+      </div>
+    </div>
+
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Active library path (CBLITE_LIB_PATH)</div>
+      <div class="font-mono text-[11px] break-all opacity-80">${active || '<span class="opacity-50">— none set —</span>'}</div>
+    </div>
+
+    ${plat.supported ? `
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Install a build</div>
+      <div class="flex flex-wrap items-end gap-2">
+        <div>
+          <label class="block text-[10px] opacity-60 mb-1">Version</label>
+          <select id="storage-install-version" class="select select-xs select-bordered">${versionOpts}</select>
+        </div>
+        <div>
+          <label class="block text-[10px] opacity-60 mb-1">Edition</label>
+          <select id="storage-install-edition" class="select select-xs select-bordered">${editionOpts}</select>
+        </div>
+        <button id="storage-install-btn" class="btn btn-xs btn-primary" onclick="storageInstall()">Download &amp; Install</button>
+        <span id="storage-install-status" class="text-[11px] opacity-70"></span>
+      </div>
+      <div class="text-[10px] opacity-50 mt-2">
+        Source: <code class="font-mono">packages.couchbase.com/releases/couchbase-lite-c/</code>.
+        Saved under <code class="font-mono">${info.install_root || 'storage_binary/'}</code>.
+      </div>
+    </div>` : `
+    <div class="alert alert-warning text-xs mb-4">
+      Auto-install isn't supported on this platform. Download libcblite from
+      <a class="link" href="https://www.couchbase.com/downloads/?family=couchbase-lite" target="_blank">couchbase.com/downloads</a>
+      and set <code class="font-mono">CBLITE_LIB_PATH</code> manually.
+    </div>`}
+
+    <div class="bg-base-200 rounded p-3">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Installed builds</div>
+      <div class="overflow-x-auto">
+        <table class="table table-xs">
+          <thead><tr><th>Version</th><th>Edition</th><th>Platform</th><th>Library path</th><th></th><th></th></tr></thead>
+          <tbody>${installRows}</tbody>
+        </table>
+      </div>
+      <div class="text-[10px] opacity-50 mt-2">
+        Switching the active library only takes effect on the next server restart — Python's <code class="font-mono">ctypes</code> can't unload a shared library mid-process.
+      </div>
+    </div>
+  `;
+}
+
+async function storageInstall() {
+  const versionEl = document.getElementById('storage-install-version');
+  const editionEl = document.getElementById('storage-install-edition');
+  const btn = document.getElementById('storage-install-btn');
+  const status = document.getElementById('storage-install-status');
+  if (!versionEl || !editionEl || !btn) return;
+  const version = versionEl.value;
+  const edition = editionEl.value;
+  btn.disabled = true;
+  status.innerHTML = `<span class="loading loading-spinner loading-xs"></span> Downloading ${edition} ${version}…`;
+  try {
+    const r = await fetch('/api/storage/install', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({version, edition}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    status.innerHTML = `<span class="text-success">✓ Installed${data.activated ? ' &amp; activated' : ''}.</span>`;
+  } catch (e) {
+    status.innerHTML = `<span class="text-error">✗ ${e.message || e}</span>`;
+  } finally {
+    btn.disabled = false;
+    setTimeout(loadStorageInfo, 400);
+  }
+}
+
+async function storageActivate(libPath, edition, version) {
+  try {
+    const r = await fetch('/api/storage/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lib_path: libPath, edition, version}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    if (window.showToast) window.showToast(`Activated. Restart the server to load ${edition} ${version}.`, 'success');
+    else alert(`Activated. Restart the server to load ${edition} ${version}.`);
+  } catch (e) {
+    alert(`Activate failed: ${e.message || e}`);
+  } finally {
+    loadStorageInfo();
+  }
+}
+
+/* Persist the user's choice of default storage backend (json | cblite).
+   Saved under storage.default_backend in data/settings.json. The currently
+   running server process keeps the backend it booted with — switching
+   only takes effect on the next `python main.py serve` (without an
+   explicit --backend flag). */
+async function storageSaveBackend() {
+  const sel = document.getElementById('storage-backend-select');
+  const btn = document.getElementById('storage-backend-save-btn');
+  const status = document.getElementById('storage-backend-status');
+  if (!sel || !btn) return;
+  const choice = sel.value;
+  btn.disabled = true;
+  if (status) status.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/storage/backend', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({backend: choice}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    const msg = data.restart_required
+      ? `Saved. Restart the server (Ctrl+C, then re-run) to switch from "${data.active_backend}" to "${choice}".`
+      : `Saved. Backend "${choice}" already active.`;
+    if (window.showToast) window.showToast(msg, 'success');
+    else alert(msg);
+  } catch (e) {
+    if (window.showToast) window.showToast(`Save failed: ${e.message || e}`, 'error');
+    else alert(`Save failed: ${e.message || e}`);
+  } finally {
+    btn.disabled = false;
+    if (status) status.textContent = '';
+    loadStorageInfo();
+  }
+}
+
+async function storageUninstall(installDir) {
+  if (!confirm(`Delete this install?\n${installDir}`)) return;
+  try {
+    const r = await fetch('/api/storage/install', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({install_dir: installDir}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+  } catch (e) {
+    alert(`Delete failed: ${e.message || e}`);
+  } finally {
+    loadStorageInfo();
+  }
 }
 
 function initSettingsTabs() {
@@ -4314,6 +5451,44 @@ async function fetchIndexCount() {
     const ev = document.getElementById('edge-count-value');
     if (ev) ev.textContent = '0';
     return 0;
+  }
+}
+
+/* Wipe ALL Apollo data for the current project folder:
+   - _apollo/        graph, Couchbase Lite db, embeddings, annotations
+   - _apollo_web/    per-folder web cache
+   Then full-page reload so all in-memory caches (notes, bookmarks,
+   chat thread, hub recents, graph chart …) are dropped and the user
+   lands back on the empty My Hub. Useful for switching CE ↔ EE
+   builds of libcblite or recovering from a corrupt index. */
+async function wipeCurrentProject() {
+  let label = 'this folder';
+  try {
+    const cur = await apiFetch('/api/projects/current');
+    if (cur && cur.root_dir) label = cur.root_dir;
+  } catch (_) { /* not fatal — just fall back to generic label */ }
+
+  if (!confirm(
+    `Delete ALL Apollo data for:\n  ${label}\n\n` +
+    `This removes _apollo/ (graph, Couchbase Lite db, embeddings, ` +
+    `annotations) and _apollo_web/ (cache). The browser will then ` +
+    `refresh.\n\nThis cannot be undone.`
+  )) return;
+
+  const btn = document.getElementById('hub-delete-project-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span> Deleting…'; }
+  try {
+    await apiFetch('/api/projects/leave', {
+      method: 'POST',
+      body: { confirm: true },
+    });
+    // Hard reload (not just location.reload()) to make sure no stale
+    // module state from the wiped project survives.
+    window.location.replace(window.location.pathname);
+  } catch (e) {
+    if (window.showToast) showToast('Delete failed: ' + (e.message || e), 'error');
+    else alert('Delete failed: ' + (e.message || e));
+    if (btn) { btn.disabled = false; btn.innerHTML = '🗑️ Delete'; }
   }
 }
 
