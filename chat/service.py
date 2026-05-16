@@ -183,11 +183,16 @@ def _select_tools(message: str) -> list[dict]:
 
 
 # Max tool-call rounds before we strip `tools=` and force the model to
-# write a final text answer. Bumped from 5 → 8 because Grok tends to
-# explore aggressively (esp. for "which X is most used" style questions
-# that fan out across search_graph / get_neighbors / get_node) and 5
-# rounds was tipping requests into `rounds_exhausted` with no answer.
-_MAX_TOOL_ROUNDS = 8
+# write a final text answer. History:
+#   5  → too tight; Grok explores aggressively for "which X is most used" /
+#        fan-out questions across search_graph / get_neighbors / get_node and
+#        was tipping into `rounds_exhausted` with no answer.
+#   8  → previous setting.
+#   10 → matches the "hard ceiling 10" in the system prompt (see
+#        `## Round budget` in ai/chat_request.json). The prompt frames 10 as
+#        a stuck-detection backstop, not a target — the soft target is still
+#        3 (targeted) or 4–5 (exploratory).
+_MAX_TOOL_ROUNDS = 10
 
 
 class ChatService:

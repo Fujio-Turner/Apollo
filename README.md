@@ -190,6 +190,21 @@ nm -gU $CBLITE_LIB_PATH | grep CBLCollection_CreateVectorIndex   # should print 
 env | grep CBLITE_LIB_PATH                                       # should show the path
 ```
 
+> **Heads-up — "Community (CE) ⚠ Mismatch" even though `cblite_config.json` says enterprise?**
+>
+> `CBLITE_LIB_PATH` must be set in the **same shell** that launches `python main.py serve` — exporting it in another tab/window has no effect on a server that's already running. If the env var isn't visible to the server process, Apollo falls back to its candidate paths (`/opt/homebrew/lib/libcblite.dylib`, `/usr/local/lib/libcblite.dylib`, …) and silently loads the brew **Community** dylib instead, which is what triggers the ⚠ Mismatch badge.
+>
+> Do both in one shell:
+> ```bash
+> export CBLITE_LIB_PATH=/Users/you/cb-l/libcblite-4.0.3/lib/libcblite.4.0.3.dylib
+> python main.py serve --backend cblite
+> ```
+> Or one-shot (no `export` needed):
+> ```bash
+> CBLITE_LIB_PATH=/Users/you/cb-l/libcblite-4.0.3/lib/libcblite.4.0.3.dylib python main.py serve --backend cblite
+> ```
+> Optional: replace `/opt/homebrew/lib/libcblite.dylib` with the EE binary (or `brew uninstall --cask libcblite-community`) so the fallback path also resolves to EE and you can't accidentally load CE.
+
 ### Windows
 
 **Community Edition:**
