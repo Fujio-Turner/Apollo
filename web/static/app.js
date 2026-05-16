@@ -4685,6 +4685,222 @@ function switchSettingsTab(tabId) {
   document.querySelectorAll('.settings-tab-panel').forEach(p => {
     p.classList.toggle('hidden', p.dataset.panel !== tabId);
   });
+  // The Storage tab is loaded lazily — the /api/storage/info call hits
+  // the filesystem and probes the loaded libcblite, so we don't want it
+  // on every page load.
+  if (tabId === 'storage') loadStorageInfo();
+}
+
+// ── Settings → Storage tab ────────────────────────────────────────────
+// Drives the libcblite installer UI. Lets the user:
+//   - see detected OS / arch and currently-loaded edition,
+//   - download a (version, edition) zip from packages.couchbase.com into
+//     <repo>/storage_binary/,
+//   - flip the active library (persisted to settings.json so it sticks
+//     across restarts — ctypes can't unload a loaded shared library, so
+//     activation is "next-restart" semantics).
+
+async function loadStorageInfo() {
+  const root = document.getElementById('storage-panel');
+  if (!root) return;
+  root.innerHTML = `<div class="flex items-center gap-2 opacity-60">
+    <span class="loading loading-spinner loading-xs"></span> Loading storage info…</div>`;
+  let info;
+  try {
+    info = await apiFetch('/api/storage/info');
+  } catch (e) {
+    root.innerHTML = `<div class="alert alert-error text-xs">Failed to load: ${e.message || e}</div>`;
+    return;
+  }
+  renderStoragePanel(info);
+}
+
+function renderStoragePanel(info) {
+  const root = document.getElementById('storage-panel');
+  if (!root) return;
+  const plat = info.platform || {};
+  const cbl = info.cblite_info || {};
+  const installed = info.installed || [];
+  const active = info.active_lib_path || '';
+  const versions = info.known_versions || ['4.0.3'];
+  const editions = info.editions || ['community', 'enterprise'];
+  const defaultVersion = info.default_version || versions[0];
+
+  const loadedBadge = cbl.loaded_edition
+    ? `<span class="badge ${cbl.loaded_edition === 'enterprise' ? 'badge-success' : 'badge-info'} badge-sm">
+         ${cbl.loaded_edition === 'enterprise' ? 'Enterprise (EE)' : 'Community (CE)'}
+       </span>`
+    : '<span class="badge badge-ghost badge-sm">Not loaded</span>';
+
+  const platRow = plat.supported
+    ? `<span class="badge badge-ghost badge-sm">${plat.os_label} · ${plat.machine}</span>`
+    : `<span class="badge badge-warning badge-sm" title="No auto-install builds for this OS/arch">
+         ${plat.os_label || '?'} · ${plat.machine || '?'} (unsupported)
+       </span>`;
+
+  const versionOpts = versions.map(v =>
+    `<option value="${v}" ${v === defaultVersion ? 'selected' : ''}>${v}</option>`).join('');
+  const editionOpts = editions.map(e =>
+    `<option value="${e}" ${e === 'community' ? 'selected' : ''}>${e === 'enterprise' ? 'Enterprise (EE)' : 'Community (CE)'}</option>`).join('');
+
+  const installRows = installed.length
+    ? installed.map(i => {
+        const isActive = active && active === i.lib_path;
+        const okBadge = i.exists
+          ? '<span class="badge badge-success badge-xs">files OK</span>'
+          : '<span class="badge badge-error badge-xs" title="Library file not found inside install dir">broken</span>';
+        const activeBadge = isActive
+          ? '<span class="badge badge-primary badge-xs">active</span>'
+          : '';
+        return `<tr>
+          <td class="font-mono">${i.version}</td>
+          <td>${i.edition === 'enterprise' ? 'EE' : 'CE'}</td>
+          <td class="font-mono opacity-70">${i.platform_tag}</td>
+          <td class="font-mono opacity-60 truncate max-w-[280px]" title="${i.lib_path}">${i.lib_path}</td>
+          <td>${okBadge} ${activeBadge}</td>
+          <td>
+            <div class="flex gap-1">
+              <button class="btn btn-xs btn-primary" ${isActive || !i.exists ? 'disabled' : ''}
+                onclick="storageActivate('${i.lib_path.replace(/'/g, "\\'")}', '${i.edition}', '${i.version}')">
+                Activate
+              </button>
+              <button class="btn btn-xs btn-ghost text-error"
+                onclick="storageUninstall('${i.install_dir.replace(/'/g, "\\'")}')">
+                Delete
+              </button>
+            </div>
+          </td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="6" class="text-center opacity-50 py-3">No installs yet — pick a version and edition above to download one.</td></tr>`;
+
+  const restartHint = active && cbl.loaded_edition && active !== `${cbl.loaded_edition_path || ''}`
+    ? ''
+    : '';
+
+  root.innerHTML = `
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+      <div class="bg-base-200 rounded p-3">
+        <div class="text-[10px] uppercase opacity-50 mb-1">Detected platform</div>
+        <div class="flex flex-wrap items-center gap-2">${platRow}</div>
+        ${plat.platform_tag ? `<div class="text-[10px] opacity-50 mt-2">URL tag: <code class="font-mono">${plat.platform_tag}</code></div>` : ''}
+      </div>
+      <div class="bg-base-200 rounded p-3">
+        <div class="text-[10px] uppercase opacity-50 mb-1">Currently loaded</div>
+        <div class="flex flex-wrap items-center gap-2">
+          ${loadedBadge}
+          ${cbl.vector_index_available ? '<span class="badge badge-success badge-sm">✓ Vector Index</span>' : '<span class="badge badge-ghost badge-sm">✗ Vector Index</span>'}
+        </div>
+        <div class="text-[10px] opacity-50 mt-2">Backend: <code class="font-mono">${cbl.active_backend || '?'}</code></div>
+      </div>
+    </div>
+
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Active library path (CBLITE_LIB_PATH)</div>
+      <div class="font-mono text-[11px] break-all opacity-80">${active || '<span class="opacity-50">— none set —</span>'}</div>
+    </div>
+
+    ${plat.supported ? `
+    <div class="bg-base-200 rounded p-3 mb-4">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Install a build</div>
+      <div class="flex flex-wrap items-end gap-2">
+        <div>
+          <label class="block text-[10px] opacity-60 mb-1">Version</label>
+          <select id="storage-install-version" class="select select-xs select-bordered">${versionOpts}</select>
+        </div>
+        <div>
+          <label class="block text-[10px] opacity-60 mb-1">Edition</label>
+          <select id="storage-install-edition" class="select select-xs select-bordered">${editionOpts}</select>
+        </div>
+        <button id="storage-install-btn" class="btn btn-xs btn-primary" onclick="storageInstall()">Download &amp; Install</button>
+        <span id="storage-install-status" class="text-[11px] opacity-70"></span>
+      </div>
+      <div class="text-[10px] opacity-50 mt-2">
+        Source: <code class="font-mono">packages.couchbase.com/releases/couchbase-lite-c/</code>.
+        Saved under <code class="font-mono">${info.install_root || 'storage_binary/'}</code>.
+      </div>
+    </div>` : `
+    <div class="alert alert-warning text-xs mb-4">
+      Auto-install isn't supported on this platform. Download libcblite from
+      <a class="link" href="https://www.couchbase.com/downloads/?family=couchbase-lite" target="_blank">couchbase.com/downloads</a>
+      and set <code class="font-mono">CBLITE_LIB_PATH</code> manually.
+    </div>`}
+
+    <div class="bg-base-200 rounded p-3">
+      <div class="text-[10px] uppercase opacity-50 mb-2">Installed builds</div>
+      <div class="overflow-x-auto">
+        <table class="table table-xs">
+          <thead><tr><th>Version</th><th>Edition</th><th>Platform</th><th>Library path</th><th></th><th></th></tr></thead>
+          <tbody>${installRows}</tbody>
+        </table>
+      </div>
+      <div class="text-[10px] opacity-50 mt-2">
+        Switching the active library only takes effect on the next server restart — Python's <code class="font-mono">ctypes</code> can't unload a shared library mid-process.
+      </div>
+    </div>
+  `;
+}
+
+async function storageInstall() {
+  const versionEl = document.getElementById('storage-install-version');
+  const editionEl = document.getElementById('storage-install-edition');
+  const btn = document.getElementById('storage-install-btn');
+  const status = document.getElementById('storage-install-status');
+  if (!versionEl || !editionEl || !btn) return;
+  const version = versionEl.value;
+  const edition = editionEl.value;
+  btn.disabled = true;
+  status.innerHTML = `<span class="loading loading-spinner loading-xs"></span> Downloading ${edition} ${version}…`;
+  try {
+    const r = await fetch('/api/storage/install', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({version, edition}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    status.innerHTML = `<span class="text-success">✓ Installed${data.activated ? ' &amp; activated' : ''}.</span>`;
+  } catch (e) {
+    status.innerHTML = `<span class="text-error">✗ ${e.message || e}</span>`;
+  } finally {
+    btn.disabled = false;
+    setTimeout(loadStorageInfo, 400);
+  }
+}
+
+async function storageActivate(libPath, edition, version) {
+  try {
+    const r = await fetch('/api/storage/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lib_path: libPath, edition, version}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    if (window.showToast) window.showToast(`Activated. Restart the server to load ${edition} ${version}.`, 'success');
+    else alert(`Activated. Restart the server to load ${edition} ${version}.`);
+  } catch (e) {
+    alert(`Activate failed: ${e.message || e}`);
+  } finally {
+    loadStorageInfo();
+  }
+}
+
+async function storageUninstall(installDir) {
+  if (!confirm(`Delete this install?\n${installDir}`)) return;
+  try {
+    const r = await fetch('/api/storage/install', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({install_dir: installDir}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+  } catch (e) {
+    alert(`Delete failed: ${e.message || e}`);
+  } finally {
+    loadStorageInfo();
+  }
 }
 
 function initSettingsTabs() {

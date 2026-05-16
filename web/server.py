@@ -2405,6 +2405,116 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "active_parsers": n,
         }
 
+    # ----------------------------------------------------------- Storage --
+    # libcblite installer endpoints — back the Settings → Storage tab.
+    # Lets the user pick a Couchbase Lite C edition/version, download it
+    # into <repo>/storage_binary/, and activate it (persists the lib path
+    # to settings.json so the next server start picks it up).
+
+    @app.get("/api/storage/info")
+    def storage_info():
+        from apollo.storage import cblite_installer as cbi
+        plat = cbi.detect_platform()
+        installed = cbi.list_installed()
+        active = cbi.get_active_lib_path()
+        # Pair with the existing CBL probe so the UI can show loaded
+        # edition + vector-index availability in one card.
+        cbl_info = _cblite_info(backend)
+        return {
+            "platform": plat,
+            "known_versions": cbi.KNOWN_VERSIONS,
+            "editions": list(cbi.EDITIONS),
+            "default_version": cbi.DEFAULT_VERSION,
+            "install_root": str(cbi.INSTALL_ROOT),
+            "installed": installed,
+            "active_lib_path": active,
+            "cblite_info": cbl_info,
+        }
+
+    @app.post("/api/storage/install")
+    async def storage_install(request: Request):
+        """Download + extract one (version, edition) for the host OS.
+
+        Body: ``{"version": "4.0.3", "edition": "community"}``.
+        Synchronous — returns when the archive is extracted. Auto-activates
+        the install if nothing else is currently active.
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        version = (body or {}).get("version") or cbi.DEFAULT_VERSION
+        edition = (body or {}).get("edition") or "community"
+        if edition not in cbi.EDITIONS:
+            raise HTTPException(status_code=400, detail=f"edition must be one of {cbi.EDITIONS}")
+
+        try:
+            info = cbi.install(version, edition)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # First install wins activation automatically.
+        if not cbi.get_active_lib_path():
+            cbi.set_active_lib_path(info["lib_path"], edition=edition, version=version)
+            info["activated"] = True
+        else:
+            info["activated"] = False
+        return info
+
+    @app.post("/api/storage/activate")
+    async def storage_activate(request: Request):
+        """Persist ``lib_path`` as the active CBLITE_LIB_PATH.
+
+        Takes effect on the next server start (ctypes can't reload a
+        shared library mid-process).
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        lib_path = ((body or {}).get("lib_path") or "").strip()
+        if not lib_path or not Path(lib_path).exists():
+            raise HTTPException(status_code=400, detail=f"lib_path not found: {lib_path!r}")
+        edition = (body or {}).get("edition")
+        version = (body or {}).get("version")
+        cbi.set_active_lib_path(lib_path, edition=edition, version=version)
+        return {
+            "status": "saved",
+            "active_lib_path": lib_path,
+            "restart_required": True,
+        }
+
+    @app.delete("/api/storage/install")
+    async def storage_uninstall(request: Request):
+        """Delete an extracted install directory.
+
+        Body: ``{"install_dir": "/abs/path"}``. The path must live under
+        ``storage_binary/`` — anything else is rejected.
+        """
+        from apollo.storage import cblite_installer as cbi
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON")
+        target = ((body or {}).get("install_dir") or "").strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="install_dir required")
+        try:
+            cbi.uninstall(target)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Uninstall failed: {exc}")
+        # If we just deleted the active install, clear the saved pointer.
+        active = cbi.get_active_lib_path()
+        if active and target in active:
+            cbi.set_active_lib_path("", edition=None, version=None)
+        return {"status": "removed", "install_dir": target}
+
     # ---------------------------------------------------------------- Chat --
 
     @app.get("/api/chat/status")

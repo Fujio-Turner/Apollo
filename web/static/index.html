@@ -224,6 +224,7 @@ tailwind.config = {
         <button type="button" role="tab" class="tab" data-tab="captures">Captures</button>
         <button type="button" role="tab" class="tab" data-tab="logging">Logging</button>
         <button type="button" role="tab" class="tab" data-tab="plugins">Plugins</button>
+        <button type="button" role="tab" class="tab" data-tab="storage">Storage</button>
       </div>
 
       <!-- ── AI Providers Tab ─────────────────────────────────── -->
@@ -471,6 +472,22 @@ tailwind.config = {
           <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Installed Plugins</h3>
           <p class="text-xs opacity-50 mb-3">Plugins detected on disk under <code class="font-mono">plugins/</code>. Use the toggle on each card to enable / disable a plugin live, or expand <em>Settings</em> to edit its <code class="font-mono">config.json</code> knobs without restarting the server. New plugins are picked up by dropping a new folder/file under <code class="font-mono">plugins/</code> and reloading. See <code class="font-mono">guides/making_plugins.md</code>.</p>
           <div id="plugins-list" class="text-xs">
+            <span class="opacity-50">Loading…</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Storage Tab ─────────────────────────────────────── -->
+      <section class="settings-tab-panel hidden" data-panel="storage">
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-primary mb-3 pb-2 border-b border-base-300">Couchbase Lite Binary</h3>
+          <p class="text-xs opacity-50 mb-3">
+            Download and activate the <code class="font-mono">libcblite</code> shared library used by the
+            <strong>cblite</strong> backend. Binaries are fetched from <code class="font-mono">packages.couchbase.com</code>
+            and extracted into <code class="font-mono">storage_binary/</code> in the repo. Switching the active
+            library takes effect on the next server restart.
+          </p>
+          <div id="storage-panel" class="text-xs">
             <span class="opacity-50">Loading…</span>
           </div>
         </div>

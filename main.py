@@ -386,8 +386,24 @@ def cmd_serve(args):
     import uvicorn
     from apollo.web.server import create_app
 
-    store, index_path = _open_store(args)
     backend = getattr(args, "backend", "json")
+
+    # When the user picks the cblite backend, make sure libcblite is
+    # available before we try to open the store. ``apply_env_from_settings``
+    # promotes any persisted ``storage.cblite_lib_path`` into the
+    # process env; ``ensure_default_install`` does a one-shot download of
+    # libcblite CE on first run so a fresh clone works without the user
+    # having to fetch the dylib/dll by hand. The matching UI lives in
+    # Settings → Storage.
+    if backend == "cblite":
+        from apollo.storage.cblite_installer import (
+            apply_env_from_settings, ensure_default_install,
+        )
+        apply_env_from_settings()
+        ensure_default_install()
+        apply_env_from_settings()  # in case ensure_default_install just wrote it
+
+    store, index_path = _open_store(args)
     parser_name = getattr(args, "parser", "auto")
 
     # Auto-index the bundled demo/ folder on first run so the UI has
