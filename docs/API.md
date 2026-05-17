@@ -499,18 +499,46 @@ Replaces `file_search` for "what's in this HTML?" — the [§8.13 benchmark trac
 
 ### `GET /api/search`
 
-Full-text search over indexed symbols.
+Semantic search over indexed symbols, optionally combined with a graph
+expansion in the same request.
 
-| Param  | Type   | Default | Description                    |
-|--------|--------|---------|--------------------------------|
-| `q`    | string | —       | Search query *(required)*      |
-| `top`  | int    | `10`    | Max results                    |
-| `type` | string | —       | Filter by node type (e.g. `function`) |
+| Param          | Type   | Default | Description                    |
+|----------------|--------|---------|--------------------------------|
+| `q`            | string | —       | Search query *(required)*      |
+| `top`          | int    | `10`    | Max results                    |
+| `type`         | string | —       | Filter by node type (e.g. `function`) |
+| `expand`       | string | `none`  | One of `none / callers / callees / neighbors / references`. When non-`none`, each hit is paired with its structural neighborhood. |
+| `depth`        | int    | `1`     | BFS depth (ignored when `expand=none`) |
+| `per_seed_cap` | int    | `10`    | Cap on neighbors per seed (`truncated` field reports overflow) |
 
-**Response**
+**Response (flat — `expand=none`, default)**
 ```json
 { "results": [{ "id": "abc", "name": "parse_file", "type": "function", "path": "src/parser.py", "line_start": 12, "score": 0.95 }] }
 ```
+
+**Response (expanded — `expand=callers`)**
+```json
+{
+  "results": [
+    {
+      "id": "func::mailer.py::send_email", "score": 0.81,
+      "name": "send_email", "type": "function",
+      "path": "mailer.py", "line_start": 42,
+      "neighbors": [
+        { "id": "func::user.py::notify", "name": "notify", "type": "function",
+          "path": "user.py", "line_start": 17,
+          "edge": "calls", "direction": "in", "depth": 1, "score": 0.405 }
+      ],
+      "truncated": 3
+    }
+  ]
+}
+```
+
+Neighbor `score` is `seed_score / (1 + depth)`. See
+[`docs/openapi.yaml`](./openapi.yaml) for the full schema and
+[`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md`](./work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md)
+for the design rationale.
 
 ### `POST /api/project/search` ⚠️ Deprecated for AI/LLM file-named queries
 

@@ -1234,14 +1234,53 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "edges_truncated": total_edges > len(edges_out),
         }
 
+    _EXPAND_KINDS = {"none", "callers", "callees", "neighbors", "references"}
+
     @app.get("/api/search")
     def search_nodes(
         q_text: str = Query(..., alias="q"),
         top: int = Query(10),
         type_filter: Optional[str] = Query(None, alias="type"),
+        expand: str = Query("none"),
+        depth: int = Query(1),
+        per_seed_cap: int = Query(10),
     ):
+        # Validate the enum here rather than via FastAPI's Literal type so
+        # we can return the standard 422 with a clear `detail`. Keeping
+        # the param a `str` also means a missing `expand=` defaults
+        # gracefully without breaking existing clients.
+        if expand not in _EXPAND_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"expand must be one of {sorted(_EXPAND_KINDS)}",
+            )
+        if expand != "none" and depth <= 0:
+            raise HTTPException(
+                status_code=422, detail="depth must be >= 1 when expand != 'none'",
+            )
+
         if search is not None and hasattr(search, "has_embeddings") and search.has_embeddings():
-            results = search.search(q_text, top_k=top, node_type=type_filter)
+            if expand == "none":
+                results = search.search(q_text, top_k=top, node_type=type_filter)
+                return {
+                    "results": [
+                        {
+                            "id": r.get("id"),
+                            "name": r.get("name"),
+                            "type": r.get("type"),
+                            "path": r.get("path"),
+                            "line_start": r.get("line_start"),
+                            "score": r.get("score"),
+                        }
+                        for r in results
+                    ]
+                }
+
+            # Combined: vector search + structural expansion.
+            results = search.search_expanded(
+                q_text, top_k=top, expand=expand, depth=depth,
+                per_seed_cap=per_seed_cap, node_type=type_filter,
+            )
             return {
                 "results": [
                     {
@@ -1251,13 +1290,29 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                         "path": r.get("path"),
                         "line_start": r.get("line_start"),
                         "score": r.get("score"),
+                        "neighbors": r.get("neighbors", []),
+                        **({"truncated": r["truncated"]} if "truncated" in r else {}),
                     }
                     for r in results
                 ]
             }
 
+        # Structural fallback: no embeddings indexed. Combined search is
+        # meaningless without vector scores; surface the warning in the
+        # response and return the flat shape callers expect.
+        warning = None
+        if expand != "none":
+            logger.warning(
+                "/api/search: expand=%s requested but no embeddings indexed; "
+                "returning flat text-match results.", expand,
+            )
+            warning = (
+                f"expand={expand!r} ignored: no embeddings indexed. "
+                "Re-run `apollo index` without --no-embeddings to enable."
+            )
+
         found = q.find(q_text, node_type=type_filter)
-        return {
+        payload = {
             "results": [
                 {
                     "id": r.get("id"),
@@ -1270,6 +1325,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 for r in found[:top]
             ]
         }
+        if warning is not None:
+            payload["warning"] = warning
+        return payload
 
     # ── Path resolution shared by /api/node and /api/node/.../connections ──
     # Resolve a graph-stored relative path against (in order):

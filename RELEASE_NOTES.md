@@ -1,5 +1,11 @@
 # Release Notes
 
+## Unreleased
+
+### New Features
+
+- **Combined Semantic + Graph-Expansion Search (#16)** — Vector top-k plus graph traversal in one round: the new [`search/expand.py`](search/expand.py) helper and `SemanticSearch.search_expanded` / `CouchbaseLiteSemanticSearch.search_expanded` methods return clustered `{seed, neighbors[]}` results ranked by `seed_score / (1 + depth)`. Surfaced via `python main.py search <text> --expand {callers|callees|neighbors|references} [--depth N] [--per-seed-cap N]`, the additive `GET /api/search?expand=…&depth=…&per_seed_cap=…` query params, and a new `search_graph_expanded` chat tool that replaces the `search_graph` + N parallel `get_neighbors` fan-out with a single round. Flat callers (`expand=none`, default) are byte-identical to v1.3.0. See [`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md`](docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md) for the design and [`docs/DESIGN.md §4.5`](docs/DESIGN.md#combined-queries) for the response shape.
+
 ## v1.3.0 — 2026-05-16
 
 ### New Features

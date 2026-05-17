@@ -4,6 +4,7 @@ import numpy as np
 import networkx as nx
 
 from graph.query import _normalize_node_types
+from search.expand import ExpandKind, expand_hits
 
 
 class SemanticSearch:
@@ -158,6 +159,26 @@ class SemanticSearch:
                 "line_end": row["line_end"],
             })
         return results
+
+    def search_expanded(
+        self,
+        query: str,
+        top_k: int = 10,
+        expand: ExpandKind = "none",
+        depth: int = 1,
+        per_seed_cap: int = 10,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Combined semantic + graph-expansion search.
+
+        Runs the existing top-k cosine search, then walks the graph
+        outward from each hit along the chosen edge kind. See
+        :mod:`search.expand` for the cluster shape and ranking rules.
+        """
+        seeds = self.search(query, top_k=top_k, node_type=node_type)
+        if expand == "none":
+            return [{**s, "neighbors": []} for s in seeds]
+        return expand_hits(self.graph, seeds, expand, depth, per_seed_cap)
 
     def has_embeddings(self) -> bool:
         # Use the cached matrix when available; fall back to a generator

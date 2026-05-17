@@ -312,10 +312,49 @@ def cmd_status(args):
     store.close()
 
 
+def _print_search_results(results, header):
+    """Render a flat list of semantic-search hits."""
+    print(header)
+    for r in results:
+        score = f"{r['score']:.4f}" if r.get('score') is not None else "?"
+        print(f"  [{score}]  {r.get('type', '?'):>10}  {r.get('name', '?')}")
+        print(f"           {r.get('path', '?')}:{r.get('line_start', '?')}")
+    if not results:
+        print("  No results found.")
+    print()
+
+
+def _print_expanded_results(results, header):
+    """Render the clustered ``{seed, neighbors[]}`` shape from
+    ``search_expanded``."""
+    print(header)
+    for seed in results:
+        score = f"{seed['score']:.4f}" if seed.get('score') is not None else "?"
+        print(f"  [{score}]  {seed.get('type', '?'):>10}  {seed.get('name', '?')}")
+        print(f"           {seed.get('path', '?')}:{seed.get('line_start', '?')}")
+        for n in seed.get("neighbors", []):
+            nscore = f"{n['score']:.4f}" if n.get('score') is not None else "?"
+            arrow = {"in": "←", "out": "→", "both": "↔"}.get(n.get("direction"), "·")
+            print(
+                f"      {arrow} [{nscore}] d{n.get('depth', 1)} "
+                f"{n.get('edge', '?')}  {n.get('type', '?')}  {n.get('name', '?')}"
+            )
+            print(f"               {n.get('path', '?')}:{n.get('line_start', '?')}")
+        truncated = seed.get("truncated")
+        if truncated:
+            print(f"      … +{truncated} more")
+    if not results:
+        print("  No results found.")
+    print()
+
+
 def cmd_search(args):
     """Semantic search across the graph."""
     store, index_path = _open_store(args)
     backend = getattr(args, "backend", "json")
+    expand = getattr(args, "expand", "none")
+    depth = getattr(args, "depth", 1)
+    per_seed_cap = getattr(args, "per_seed_cap", 10)
 
     if backend == "json" and not os.path.exists(index_path):
         print(f"Error: No index found at '{index_path}'. Run 'index' first.", file=sys.stderr)
@@ -329,15 +368,19 @@ def cmd_search(args):
             embedder = get_shared_embedder()
             cbl_search = CouchbaseLiteSemanticSearch(store, embedder)
             if cbl_search.has_embeddings():
-                results = cbl_search.search(args.text, top_k=args.top, node_type=args.type)
-                print(f"\nSemantic search (cblite): \"{args.text}\" (top {args.top})\n")
-                for r in results:
-                    score = f"{r['score']:.4f}" if r.get('score') is not None else "?"
-                    print(f"  [{score}]  {r.get('type', '?'):>10}  {r.get('name', '?')}")
-                    print(f"           {r.get('path', '?')}:{r.get('line_start', '?')}")
-                if not results:
-                    print("  No results found.")
-                print()
+                header = f"\nSemantic search (cblite): \"{args.text}\" (top {args.top})\n"
+                if expand == "none":
+                    results = cbl_search.search(args.text, top_k=args.top, node_type=args.type)
+                    _print_search_results(results, header)
+                else:
+                    results = cbl_search.search_expanded(
+                        args.text, top_k=args.top, expand=expand, depth=depth,
+                        per_seed_cap=per_seed_cap, node_type=args.type,
+                    )
+                    _print_expanded_results(
+                        results,
+                        f"{header.rstrip()}  --expand={expand} --depth={depth}\n",
+                    )
                 store.close()
                 return
         except (ImportError, Exception):
@@ -354,21 +397,31 @@ def cmd_search(args):
             from apollo.search import SemanticSearch
             embedder = get_shared_embedder()
             search = SemanticSearch(graph, embedder)
-            results = search.search(args.text, top_k=args.top, node_type=args.type)
-            print(f"\nSemantic search: \"{args.text}\" (top {args.top})\n")
-            for r in results:
-                score = f"{r['score']:.4f}" if r.get('score') is not None else "?"
-                print(f"  [{score}]  {r.get('type', '?'):>10}  {r.get('name', '?')}")
-                print(f"           {r.get('path', '?')}:{r.get('line_start', '?')}")
-            if not results:
-                print("  No results found.")
-            print()
+            header = f"\nSemantic search: \"{args.text}\" (top {args.top})\n"
+            if expand == "none":
+                results = search.search(args.text, top_k=args.top, node_type=args.type)
+                _print_search_results(results, header)
+            else:
+                results = search.search_expanded(
+                    args.text, top_k=args.top, expand=expand, depth=depth,
+                    per_seed_cap=per_seed_cap, node_type=args.type,
+                )
+                _print_expanded_results(
+                    results,
+                    f"{header.rstrip()}  --expand={expand} --depth={depth}\n",
+                )
             store.close()
             return
         except ImportError:
             pass
 
-    # Fall back to string matching
+    # Fall back to string matching. Combined search is meaningless without
+    # vector scores, so we ignore --expand here (and surface why).
+    if expand != "none":
+        logger.warning(
+            "search: --expand=%s requested but no embeddings are indexed; "
+            "falling back to flat text search.", expand,
+        )
     q = GraphQuery(graph)
     results = q.find(args.text, node_type=args.type)
     print(f"\nText search: \"{args.text}\" (top {args.top})\n")
@@ -806,6 +859,23 @@ def main():
     p_search.add_argument("text", help="Search query text")
     p_search.add_argument("--top", type=int, default=10, help="Number of results (default: 10)")
     p_search.add_argument("-t", "--type", help="Filter by node type")
+    p_search.add_argument(
+        "--expand",
+        choices=["none", "callers", "callees", "neighbors", "references"],
+        default="none",
+        help=(
+            "Combined search: after the vector search, walk the graph "
+            "from each hit. 'none' (default) preserves flat output."
+        ),
+    )
+    p_search.add_argument(
+        "--depth", type=int, default=1,
+        help="BFS depth for --expand (default: 1, ignored when --expand=none)",
+    )
+    p_search.add_argument(
+        "--per-seed-cap", dest="per_seed_cap", type=int, default=10,
+        help="Max neighbors per seed; extras are summarized (default: 10)",
+    )
     _add_common_args(p_search)
 
     # serve

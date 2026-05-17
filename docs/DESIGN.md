@@ -486,12 +486,58 @@ Implementation: Embed the query → ANN search in the vector index → return to
 
 #### Combined Queries
 
-The most powerful mode — vector search to find candidates, then graph traversal to expand context:
+The most powerful mode — vector search to find candidates, then graph
+traversal to expand context in one round. Implemented by
+[`search/expand.py`](../search/expand.py) on top of
+[`search/semantic.py`](../search/semantic.py)
+(`SemanticSearch.search_expanded`) and the matching CBL-backed sibling
+in [`search/cblite_semantic.py`](../search/cblite_semantic.py).
 
 ```
 # Find email-related code and show their callers
-> search "email" --top 5 --expand callers
+> search "email" --top 5 --expand callers --depth 1
 ```
+
+CLI flags (additive — flat `search "email"` is byte-identical to today):
+
+| Flag              | Default | Notes                                                    |
+|-------------------|---------|----------------------------------------------------------|
+| `--expand KIND`   | `none`  | One of `none / callers / callees / neighbors / references` |
+| `--depth N`       | `1`     | BFS depth; ignored when `--expand=none`                  |
+| `--per-seed-cap N`| `10`    | Cap on neighbors per seed (`… +N more` summary printed when truncated) |
+
+Response shape (`--expand≠none`) — each cluster is a seed hit plus its
+structural neighborhood, ranked together:
+
+```jsonc
+[
+  {
+    "id": "func::mailer.py::send_email",
+    "score": 0.81,                      // cosine
+    "name": "send_email",
+    "type": "function",
+    "path": "mailer.py",
+    "line_start": 42,
+    "neighbors": [
+      {
+        "id": "func::user.py::notify",
+        "name": "notify", "type": "function",
+        "path": "user.py", "line_start": 17,
+        "edge": "calls", "direction": "in", "depth": 1,
+        "score": 0.405                  // seed_score / (1 + depth)
+      }
+      // … up to per_seed_cap
+    ],
+    "truncated": 12                     // only when neighbors were capped
+  }
+]
+```
+
+Neighbor ranking uses `seed_score / (1 + depth)` — a deliberate
+language-agnostic decay that keeps the merged list sortable by a single
+numeric key without paying for re-embedding every neighbor. See
+[`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md §3.6`](work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md#36-ranking-notes)
+for the rationale and the Phase-2.5 path to per-neighbor re-scoring.
 
 ### 4.6 ML Pipeline (PLAN_ML_LIBS)
 
@@ -1500,7 +1546,7 @@ Semantic search (embeddings) and AI chat come after the structural index is soli
 - [x] Embed node source text with `sentence-transformers`
 - [x] Brute-force cosine similarity search (in-memory)
 - [x] CLI: `search <text> --top k`
-- [ ] Combined search: vector results + graph expansion
+- [x] Combined search: vector results + graph expansion ([`search/expand.py`](../search/expand.py), [`SemanticSearch.search_expanded`](../search/semantic.py), CLI `--expand`, HTTP `/api/search?expand=…`, chat `search_graph_expanded`; see [`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md`](work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md))
 
 ### Phase 3 — Browser UI
 - [x] FastAPI backend with REST API endpoints
