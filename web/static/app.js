@@ -31,11 +31,16 @@ function badgeTextColor(bg) {
   return (0.2126*r + 0.7152*g + 0.0722*b) / 255 < 0.5 ? '#fff' : '#000';
 }
 let graphChart = null, wordCloudChart = null, currentGraph = null, selectedNode = null, currentView = 'graph';
-/* Dev-mode (?dev=true) graph variant. '1' = current force-directed render,
-   '2' = stable circular-layout render with hideOverlap labels (mirrors the
-   ECharts "graph-label-overlap" example). Hidden in normal mode. */
+/* Graph variant selector. '1' = force-directed render (default),
+   '2' = 3D scatter render (issue #15, scatter3D via echarts-gl).
+   The tab strip is visible to all users; the chosen variant is
+   re-applied whenever new graph data lands. */
 let graphChart2 = null, currentGraphVariant = '1';
 let wordCloudMode = 'strong', wordCloudMeta = null;
+/* Latest word-cloud items, keyed by lowercase name → strength. Used to
+   scale 3D scatter point sizes in Graph 2 so the two panels stay in
+   sync — when the user toggles strong/relevant/all the dots resize. */
+let wordCloudStrengthByName = {};
 const WORDCLOUD_TIERS = {
   strong:   { next: 'relevant', label: 'Show More',                sizeRange: [18, 48] },
   relevant: { next: 'all',      label: 'Show All Relationships',   sizeRange: [12, 40] },
@@ -1127,9 +1132,9 @@ async function loadGraph() {
 }
 
 function renderGraph(data) {
-  // In dev mode the user can toggle between Graph 1 (force-directed) and
-  // Graph 2 (stable circular layout w/ hideOverlap labels — see ECharts
-  // "graph-label-overlap" example). In normal mode only Graph 1 renders.
+  // The variant tabs let the user switch between Graph 1 (force-directed)
+  // and Graph 2 (3D scatter — issue #15). Always re-route to the active
+  // variant so depth-slider / refresh re-renders the right view.
   if (currentGraphVariant === '2') {
     renderGraph2(data);
     return;
@@ -1210,21 +1215,6 @@ function renderGraph(data) {
   }, true);
 }
 
-/* Graph 2 — stable, clustered layout for dev mode (?dev=true).
-   Visual target: ECharts "graph" (Les Miserables) example —
-     https://echarts.apache.org/examples/en/editor.html?c=graph
-   That example loads pre-computed (x,y) positions and uses layout:'none'
-   so the picture is reproducible. We do the same here, but generate the
-   positions deterministically from each node's id and category so the
-   same node always lands in the same place across reloads/releases —
-   solving the "Graph 1 redistributes on every render, I have to hunt
-   for the node again" problem.
-
-   - Per-category cluster centers placed evenly around a large outer
-     ring (clustered, not a single ring of nodes).
-   - Within a cluster, node offset = deterministic hash of id → angle/
-     radius. So clusters look organic but are stable.
-   - lineStyle.color:'source' + curveness:0.3 mirrors Les Miserables. */
 /* ─── ML lens helpers (PLAN_ML_LIBS.md) ──────────────────────────────
    Pure helpers for using index-time ML signals (UMAP coords + HDBSCAN
    cluster_id) in the graph render. All are no-ops when the ML pass
@@ -1338,102 +1328,184 @@ function _g2HashStr(s) {
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return h >>> 0;
 }
+/* Compute BFS depth from "entry-point" nodes. Entry points are taken as
+   the union of (a) nodes whose type is "directory" and (b) nodes whose
+   in-degree is zero. The result is a {nodeId: depth} map; unreachable
+   nodes are assigned `maxDepth+1` so they still get a Y coord. */
+function _g2BfsDepth(nodes, edges) {
+  const adj = {};
+  const indeg = {};
+  nodes.forEach(n => { adj[n.id] = []; indeg[n.id] = 0; });
+  edges.forEach(e => {
+    if (adj[e.source] === undefined || indeg[e.target] === undefined) return;
+    adj[e.source].push(e.target);
+    indeg[e.target] = (indeg[e.target] || 0) + 1;
+  });
+  const entries = nodes
+    .filter(n => (n.value || n.type) === 'directory' || (indeg[n.id] || 0) === 0)
+    .map(n => n.id);
+  const depth = {};
+  const queue = [];
+  entries.forEach(id => { depth[id] = 0; queue.push(id); });
+  while (queue.length) {
+    const cur = queue.shift();
+    const d = depth[cur];
+    for (const nxt of adj[cur] || []) {
+      if (depth[nxt] === undefined) { depth[nxt] = d + 1; queue.push(nxt); }
+    }
+  }
+  let maxD = 0;
+  for (const k in depth) if (depth[k] > maxD) maxD = depth[k];
+  // Stragglers (cycles unreachable from entries) — park them beyond max.
+  nodes.forEach(n => { if (depth[n.id] === undefined) depth[n.id] = maxD + 1; });
+  return { depth, maxD: maxD + 1 };
+}
+
+/* Replace Graph 2 with a 3-D scatter plot that mirrors the spec from
+   GitHub issue #15:
+     X (0–360°): conceptual domain  → cluster_id (UMAP) or hashed name
+     Y (0–360°): structural depth   → BFS distance from entry points
+     Z (0–1.0):  importance         → PageRank centrality (normalized)
+   Modeled on the Apache ECharts scatter3D example
+   (https://echarts.apache.org/examples/en/editor.html?c=scatter3d&gl=1).
+   Point colour = node type (matches Graph 1 legend); point size is
+   boosted by the current word-cloud strength so the two views stay
+   visually in sync as the user cycles strong/relevant/all. */
 function renderGraph2(data) {
+  if (typeof echarts === 'undefined') return;
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const tc = isDark ? '#dcddde' : '#333';
+  const axisLine = isDark ? '#555' : '#bbb';
   if (!graphChart2) {
     graphChart2 = echarts.init(document.getElementById('graph-chart-2'));
-    graphChart2.on('click', onGraphClick);
-    graphChart2.getZr().on('click', function(e) {
-      if (!e.target) clearFocus();
+    graphChart2.on('click', p => {
+      if (p && p.data && p.data._id) selectNode(p.data._id);
     });
   }
-  const catNames = (data.categories||[]).map(c => typeof c === 'string' ? c : c.name);
-  if (!catNames.length) catNames.push(...Object.keys(NODE_COLORS));
-  const categories = catNames.map(n => ({ name: n, itemStyle: { color: NODE_COLORS[n]||'#888' } }));
-  const catIdx = {}; catNames.forEach((n,i) => catIdx[n] = i);
 
-  // Cluster geometry. Outer ring radius scales with node count so
-  // dense graphs don't collapse on top of each other. Each category
-  // gets one fixed cluster center on the outer ring.
-  const totalNodes = (data.nodes||[]).length;
-  const ringR = Math.max(380, 60 * Math.sqrt(Math.max(1, totalNodes)));
-  const catCount = Math.max(1, catNames.length);
-  const catCenters = catNames.map((_, i) => {
-    const a = (i / catCount) * Math.PI * 2 - Math.PI / 2;
-    return { x: Math.cos(a) * ringR, y: Math.sin(a) * ringR };
-  });
-  // Within-cluster radius scales with how many nodes share the cluster.
-  const catSize = {};
-  (data.nodes||[]).forEach(n => {
-    const t = n.value||n.type||'unknown';
-    catSize[t] = (catSize[t]||0) + 1;
-  });
+  const nodesIn = data.nodes || [];
+  const edgesIn = data.edges || [];
 
-  // ML lens (PLAN_ML_LIBS.md): same UMAP-coords + cluster_id pattern
-  // as renderGraph(). Falls back cleanly when ML never ran.
-  const umapBounds = _umapBounds(data.nodes || []);
-  const seedR = ringR;
-  const nodes = (data.nodes||[]).map(n => {
-    const t = n.value||n.type||'unknown';
-    const sz = Math.max(8, Math.min(40, n.symbolSize||12));
-    const ci = catIdx[t] ?? 0;
+  // Y axis: BFS depth from entry points → 0–360°.
+  const { depth, maxD } = _g2BfsDepth(nodesIn, edgesIn);
+
+  // Z axis: PageRank → 0–1. Fall back to symbolSize-derived ranking if
+  // PageRank was never computed (no ML pass).
+  let prMax = 0;
+  nodesIn.forEach(n => {
+    const pr = n.attributes?.pagerank;
+    if (typeof pr === 'number' && pr > prMax) prMax = pr;
+  });
+  const hasPR = prMax > 0;
+
+  // X axis: cluster_id (or umap_x) → 0–360°. When neither is available,
+  // hash the node id so points still spread deterministically.
+  let clusterMax = 0;
+  nodesIn.forEach(n => {
+    const c = n.attributes?.cluster_id;
+    if (typeof c === 'number' && c > clusterMax) clusterMax = c;
+  });
+  const clusterSpan = Math.max(1, clusterMax + 1);
+
+  // Group by node type so each shows up as its own legend entry — the
+  // user can hide/show types from the legend.
+  const typeBuckets = {};
+  nodesIn.forEach(n => {
+    const t = n.value || n.type || 'unknown';
+    if (!typeBuckets[t]) typeBuckets[t] = [];
     const cid = n.attributes?.cluster_id;
-    const baseColor = (cid != null && cid >= 0)
-      ? _clusterColor(cid)
-      : (NODE_COLORS[t] || '#888');
-    let x, y;
-    const xy = n.attributes?.umap_xy;
-    if (umapBounds && Array.isArray(xy) && xy.length === 2) {
-      [x, y] = _umapScale(xy, umapBounds, seedR);
-    } else {
-      const center = catCenters[ci] || { x: 0, y: 0 };
-      const inner = Math.max(80, 18 * Math.sqrt(catSize[t]||1));
-      // Deterministic offset within the cluster from the node id hash.
+    let x;
+    if (typeof cid === 'number' && cid >= 0) {
+      // Even spread around the ring per cluster, then a small per-node
+      // jitter so members of the same cluster don't perfectly overlap.
+      const base = (cid / clusterSpan) * 360;
       const h = _g2HashStr(n.id);
-      const ang = ((h % 3600) / 3600) * Math.PI * 2;
-      const rad = ((h >>> 8) % 1000) / 1000 * inner;
-      x = center.x + Math.cos(ang) * rad;
-      y = center.y + Math.sin(ang) * rad;
+      const jitter = ((h % 1000) / 1000) * (360 / clusterSpan);
+      x = (base + jitter) % 360;
+    } else {
+      const xy = n.attributes?.umap_xy;
+      if (Array.isArray(xy) && xy.length === 2) {
+        x = ((Number(xy[0]) % 360) + 360) % 360;
+      } else {
+        x = (_g2HashStr(n.id) % 3600) / 10;
+      }
     }
-    return {
-      id: n.id, name: n.name||n.id, symbolSize: sz, category: ci, x, y,
-      itemStyle: { color: baseColor, ...(NODE_BORDERS[t]||{}) },
-      // Match Les Mis: only label larger nodes to keep the picture readable.
-      label: { show: sz > 22, position: 'right', fontSize: 10, color: tc, formatter: '{b}' },
-      _type: t, _path: n.attributes?.path || n.path, _line: n.attributes?.line_start || n.line,
-      _cluster: cid, _pagerank: n.attributes?.pagerank,
-    };
+    const y = (depth[n.id] / Math.max(1, maxD)) * 360;
+    const pr = n.attributes?.pagerank;
+    const z = hasPR
+      ? (typeof pr === 'number' ? Math.max(0, Math.min(1, pr / prMax)) : 0)
+      : Math.max(0, Math.min(1, (n.symbolSize || 12) / 40));
+
+    // Word-cloud sync: bump symbol size when a node shares its name
+    // with one of the current cloud's top items.
+    const strength = wordCloudStrengthByName[(n.name || n.id || '').toLowerCase()] || 0;
+    const baseSize = 6 + z * 14;                    // 6–20 from PageRank
+    const cloudBoost = strength > 0 ? Math.min(10, Math.log2(strength + 1) * 1.5) : 0;
+    const size = baseSize + cloudBoost;
+
+    typeBuckets[t].push({
+      name: n.name || n.id,
+      value: [x, y, z],
+      symbolSize: size,
+      _id: n.id, _type: t, _cluster: cid, _pagerank: pr,
+      _path: n.attributes?.path || n.path,
+      _line: n.attributes?.line_start || n.line,
+      _strength: strength,
+    });
   });
-  const edges = (data.edges||[]).map(e => ({
-    source: e.source, target: e.target,
-    lineStyle: { opacity: 0.7, width: 0.8, curveness: 0.3 },
-    _rel: e.type || e.rel,
+
+  const series = Object.keys(typeBuckets).sort().map(t => ({
+    name: t,
+    type: 'scatter3D',
+    symbolSize: 8,            // overridden per-point above
+    data: typeBuckets[t],
+    itemStyle: { color: NODE_COLORS[t] || '#888', opacity: 0.85 },
+    emphasis: { itemStyle: { opacity: 1, borderColor: '#7c3aed', borderWidth: 2 } },
   }));
+
   graphChart2.setOption({
-    tooltip: { trigger:'item', formatter: p => _mlTooltip(p),
-      backgroundColor:isDark?'#2b2b2b':'#fff', borderColor:isDark?'#3a3a3a':'#ddd', textStyle:{color:tc,fontSize:11} },
-    legend: { data:categories.map(c=>c.name), bottom:8, textStyle:{color:tc,fontSize:11}, selectedMode:true,
-      icon:'circle', itemWidth:10, itemHeight:10, itemGap:12 },
-    animation: false,            // positions are fixed, no need to animate
-    series: [{
-      type: 'graph',
-      layout: 'none',            // use the (x,y) we computed per node
-      data: nodes, links: edges, categories,
-      roam: true, draggable: true,
-      labelLayout: { hideOverlap: true },
-      // Edge color inherits source node color, like the Les Mis example.
-      lineStyle: { color: 'source', curveness: 0.3 },
-      emphasis: { focus: 'adjacency', label: { show: true, fontSize: 11, fontWeight: 'bold' }, lineStyle: { width: 3, color: '#7c3aed' } },
-      select: { itemStyle: { borderColor: '#7c3aed', borderWidth: 3, shadowBlur: 10, shadowColor: '#7c3aed' }, label: { show: true, fontSize: 12, fontWeight: 'bold', color: tc } },
-      selectedMode: 'single',
-      edgeLabel: { show: false },
-    }],
+    tooltip: {
+      formatter: p => {
+        const d = p.data || {};
+        const v = d.value || [];
+        let s = `<b>${p.name}</b><br/>type: ${d._type || ''}`;
+        if (d._path) s += `<br/>${d._path}${d._line ? ':' + d._line : ''}`;
+        s += `<br/>X (cluster°): ${(+v[0] || 0).toFixed(1)}`;
+        s += `<br/>Y (depth°): ${(+v[1] || 0).toFixed(1)}`;
+        s += `<br/>Z (importance): ${(+v[2] || 0).toFixed(3)}`;
+        if (typeof d._pagerank === 'number') s += `<br/>PageRank: ${d._pagerank.toFixed(5)}`;
+        if (d._strength) s += `<br/>cloud strength: ${Math.round(d._strength)}`;
+        return s;
+      },
+      backgroundColor: isDark ? '#2b2b2b' : '#fff',
+      borderColor: isDark ? '#3a3a3a' : '#ddd',
+      textStyle: { color: tc, fontSize: 11 },
+    },
+    legend: {
+      data: series.map(s => s.name),
+      bottom: 8,
+      textStyle: { color: tc, fontSize: 11 },
+      icon: 'circle', itemWidth: 10, itemHeight: 10, itemGap: 12,
+    },
+    xAxis3D: { type: 'value', name: 'cluster°', min: 0, max: 360,
+      axisLine: { lineStyle: { color: axisLine } }, nameTextStyle: { color: tc } },
+    yAxis3D: { type: 'value', name: 'depth°', min: 0, max: 360,
+      axisLine: { lineStyle: { color: axisLine } }, nameTextStyle: { color: tc } },
+    zAxis3D: { type: 'value', name: 'importance', min: 0, max: 1,
+      axisLine: { lineStyle: { color: axisLine } }, nameTextStyle: { color: tc } },
+    grid3D: {
+      viewControl: { autoRotate: false, distance: 220 },
+      boxWidth: 180, boxDepth: 180, boxHeight: 100,
+      axisLine: { lineStyle: { color: axisLine } },
+      axisPointer: { lineStyle: { color: axisLine } },
+      light: { main: { intensity: 1.2 }, ambient: { intensity: 0.4 } },
+    },
+    series,
   }, true);
 }
 
-/* Dev-mode tab switcher: toggles which graph variant is visible and
-   re-renders the active one against the currently-loaded data. */
+/* Tab switcher: toggles which graph variant is visible and re-renders
+   the active one against the currently-loaded data. */
 function switchGraphVariant(variant) {
   if (variant !== '1' && variant !== '2') return;
   currentGraphVariant = variant;
@@ -2432,7 +2504,16 @@ async function loadWordCloud(mode) {
       ? { total: items.length, shown: items.length, mode: requested, min_strength: 0 }
       : { total: resp.total, shown: resp.shown, mode: resp.mode || requested, min_strength: resp.min_strength || 0 };
     wordCloudMode = wordCloudMeta.mode;
+    // Rebuild the {name → strength} map used by Graph 2 (3D scatter) so
+    // it can scale point sizes to match the current cloud tier.
+    wordCloudStrengthByName = {};
+    items.forEach(it => {
+      if (it && it.name) wordCloudStrengthByName[String(it.name).toLowerCase()] = it.value || 0;
+    });
     renderWordCloud(items, wordCloudMode);
+    // If Graph 2 is currently the active variant, re-render it so the
+    // dots resize in lockstep with the word-cloud tier change.
+    if (currentGraphVariant === '2' && currentGraph) renderGraph2(currentGraph);
   } catch (e) { console.error(e); }
 }
 
@@ -6361,9 +6442,6 @@ function noteIndicatorHtml(nodeId) {
 const IS_DEV_MODE = new URLSearchParams(location.search).get('dev') === 'true';
 if (IS_DEV_MODE) {
   document.getElementById('dev-toolbar')?.classList.remove('hidden');
-  // Reveal Graph 1 / Graph 2 variant tabs above the graph chart so we
-  // can A/B test stable-layout (Graph 2) vs. force-directed (Graph 1).
-  document.getElementById('graph-variant-tabs')?.classList.remove('hidden');
 }
 fetchIndexCount(); checkChatStatus(); loadFolderTree();
 // Load the graph on startup, but show the Welcome tab by default

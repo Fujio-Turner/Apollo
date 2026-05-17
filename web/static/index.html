@@ -16,6 +16,7 @@ tailwind.config = {
 };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts-gl@2/dist/echarts-gl.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts-wordcloud@2/dist/echarts-wordcloud.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <!-- highlight.js theme. Default to GitHub LIGHT to match the default
@@ -141,12 +142,12 @@ tailwind.config = {
       <div class="split-right flex-1" id="split-right">
         <div class="vsplit-pane flex-1">
           <div class="vsplit-top" id="vsplit-top">
-            <!-- Graph variant tabs — dev mode only (?dev=true). Lets us A/B
-                 test the current force-directed graph (Graph 1) against the
-                 stable-layout ECharts variant (Graph 2). -->
-            <div id="graph-variant-tabs" class="graph-variant-tabs hidden bg-base-200/85 border border-base-300" role="tablist">
+            <!-- Graph variant tabs. Lets the user toggle between the
+                 force-directed graph (Graph 1) and the 3D scatter view
+                 (Graph 2 — see issue #15). -->
+            <div id="graph-variant-tabs" class="graph-variant-tabs bg-base-200/85 border border-base-300" role="tablist">
               <button type="button" class="btn btn-ghost btn-xs graph-variant-tab active" data-graph-variant="1" onclick="switchGraphVariant('1')">Graph 1</button>
-              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab" data-graph-variant="2" onclick="switchGraphVariant('2')">Graph 2</button>
+              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab" data-graph-variant="2" onclick="switchGraphVariant('2')">Graph 2 (3D)</button>
             </div>
             <div id="graph-chart"></div>
             <div id="graph-chart-2" class="hidden"></div>
