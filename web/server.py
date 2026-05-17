@@ -24,6 +24,8 @@ import threading
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from apollo.graph.query import GraphQuery
+from apollo.git import branched_path, current_branch
+from apollo.git.watcher import BranchWatcher
 from apollo.logging_config import apply_settings as apply_logging_settings, configure_logging
 from apollo.projects import ProjectManager, register_project_routes
 from apollo.reindex_service import ReindexService, ReindexConfig
@@ -372,20 +374,68 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     from pathlib import Path as _Path
 
     def _resolve_project_store_location(project_path, project_backend: str) -> str:
-        """Return the per-project store path for the given project root."""
+        """Return the per-project store path for the given project root.
+
+        For projects inside a git checkout, the path is suffixed with
+        ``__<branch>`` (DESIGN §4.2.3 — branch-keyed stores) so each
+        branch maintains its own index. Non-git folders fall through
+        to the legacy single-store layout.
+        """
         apollo_dir = _Path(project_path) / "_apollo"
         if project_backend == "cblite":
             # Reuse ProjectManager's hashing convention so the path matches
             # what the manifest expects (and what reprocess()/leave() act on).
             db_hash = project_manager._compute_db_hash(project_path)
-            return str(apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2")
-        return str(apollo_dir / "graph.json")
+            base = apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2"
+        else:
+            base = apollo_dir / "graph.json"
+        return str(branched_path(base, project_path))
 
     @app.get("/api/active-store")
     def get_active_store():
         """Diagnostic: report the currently-active store location/backend."""
         loc = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
         return {"backend": backend, "location": loc, "root_dir": root_dir}
+
+    # ── Git branch awareness ──────────────────────────────────────────
+    # When the user runs ``git checkout <other-branch>``, the working
+    # tree changes under us. Per the branch-keyed store rule (DESIGN
+    # §4.2.3) each branch maintains its own _apollo/ store; a
+    # ``BranchWatcher`` watches ``.git/HEAD`` and swaps the active
+    # store to that branch's index as soon as a checkout happens.
+    # The watcher is per-project and is (re)bound by
+    # ``_swap_to_project_store`` whenever the user opens a different
+    # folder.
+    _branch_watcher: Optional[BranchWatcher] = None
+
+    def _on_branch_change(new_branch: str) -> None:
+        """Callback fired from the BranchWatcher thread on git checkout.
+
+        Re-runs the same per-project store swap with the new branch's
+        path. We rely on _swap_to_project_store's existing fast-path
+        (it no-ops when the resolved location hasn't changed) for any
+        spurious wake-ups.
+        """
+        current_root = root_dir
+        if not current_root:
+            return
+        try:
+            _swap_to_project_store(current_root)
+        except Exception:
+            logger.exception("failed to swap store after branch change to %s", new_branch)
+
+    @app.get("/api/git/branch")
+    def get_git_branch():
+        """Return the active project's branch (or null for non-git folders).
+
+        Surface for the UI to render a small "branch: <name>" badge so
+        it's obvious which branch's index is currently being queried.
+        """
+        return {
+            "root_dir": root_dir,
+            "branch": current_branch(root_dir) if root_dir else None,
+            "watcher_running": bool(_branch_watcher and _branch_watcher.running),
+        }
 
     def _swap_to_project_store(project_path) -> None:
         """Close the active store and reopen the per-project store for
@@ -394,8 +444,13 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         new project. Called from ``/api/projects/open`` and the startup
         auto-open path so opening an already-indexed project no longer
         leaves the chat answering against the previous project's data.
+
+        Also (re)binds the ``BranchWatcher`` to the new project so a
+        ``git checkout`` after the swap still triggers an automatic
+        store swap to the right branch's index.
         """
         nonlocal store, graph, q, search, chat_service, root_dir, backend, reindex_service
+        nonlocal _branch_watcher
 
         from apollo.storage import open_store as _open_store
         from apollo.graph.query import GraphQuery as _GraphQuery
@@ -499,9 +554,28 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             logger.exception("failed to rebind reindex service after project swap")
 
         logger.info(
-            "swapped active store: backend=%s location=%s nodes=%d",
+            "swapped active store: backend=%s location=%s nodes=%d branch=%s",
             backend, new_location, graph.number_of_nodes(),
+            current_branch(root_dir),
         )
+
+        # (Re)start the branch watcher. We tear down any existing
+        # watcher first so it isn't pointed at the previous project's
+        # .git directory. A non-git project simply gets a watcher that
+        # never starts an observer (BranchWatcher.start is a no-op
+        # when HEAD can't be located).
+        if _branch_watcher is not None:
+            try:
+                _branch_watcher.stop()
+            except Exception:
+                logger.exception("failed to stop previous BranchWatcher")
+            _branch_watcher = None
+        try:
+            _branch_watcher = BranchWatcher(root_dir, _on_branch_change)
+            _branch_watcher.start()
+        except Exception:
+            logger.exception("failed to start BranchWatcher for %s", root_dir)
+            _branch_watcher = None
 
     # Auto-open the project on startup so project-scoped features
     # (annotations, etc.) work without forcing the user to re-open the
@@ -718,6 +792,18 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             except Exception as e:
                 import logging
                 logging.warning(f"Failed to start reindex service: {e}")
+
+    @app.on_event("shutdown")
+    async def _stop_branch_watcher():
+        """Stop the BranchWatcher (if any) so its observer thread joins
+        cleanly on server shutdown — otherwise watchdog will keep the
+        process from exiting until its 5s timeout fires.
+        """
+        if _branch_watcher is not None:
+            try:
+                _branch_watcher.stop()
+            except Exception:
+                logger.exception("failed to stop BranchWatcher on shutdown")
 
     # If a project was successfully auto-opened on startup, swap to its
     # per-project store now (after graph/q/search/chat_service/reindex

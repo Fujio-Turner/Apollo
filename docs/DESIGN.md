@@ -214,7 +214,54 @@ plugin you expect? Is the file under a `_CORE_SKIP_DIRS` entry or a
 plugin's `ignore_dirs`? Almost every "indexing bug" report turns out to
 be one of those three.
 
-#### 4.2.2 Project-switch invariants
+#### 4.2.3 Branch-keyed stores (git checkouts)
+
+When the project root is a git checkout, the per-project store path is
+suffixed with the current branch so each branch maintains an
+independent index. Without this, switching branches (`git checkout
+other`) would silently leave the watcher and chat answering against
+the *previous* branch's tree — files that exist on one branch but not
+the other would either show as missing (false negatives) or as
+phantom orphans (false positives).
+
+The on-disk layout looks like:
+
+```
+_apollo/
+├── graph__main.json
+├── graph__issue__17.json
+├── cblite/
+│   ├── apollo_<md5>__main.cblite2
+│   └── apollo_<md5>__feature-x.cblite2
+```
+
+Rules:
+
+1. **`apollo.git.branched_path()` is the single source of truth.** All
+   store path resolution — `web.server._resolve_project_store_location`,
+   `ProjectManager._resolve_cbl_path`, and the JSON path in
+   `ProjectManager.reprocess` — funnels through it. Non-git folders
+   pass through unchanged so the legacy single-store layout still
+   works for non-versioned projects.
+2. **Branch name sanitisation must be reversible-enough for humans.**
+   `/` collapses to `__` (so `issue/17` becomes `issue__17`); other
+   unsafe filename characters collapse to `_`. Detached HEAD picks a
+   per-SHA suffix (`detached_<short>`) so each detached state gets a
+   distinct store.
+3. **`BranchWatcher` triggers swaps automatically.** Started/stopped
+   by `_swap_to_project_store`; on a `git checkout` it re-reads
+   `.git/HEAD` and calls back into the same swap helper. The fast
+   path inside `_swap_to_project_store` (same-location detection)
+   makes repeat / no-op events cheap. Worktrees are supported via
+   the `.git`-file gitdir indirection that `apollo.git.head_watch_path`
+   resolves.
+4. **`reprocess` is per-branch.** A "full" reprocess only deletes the
+   active branch's graph/cblite — other branches' indexes survive.
+   This matches the user's mental model ("I'm reindexing this
+   branch") and avoids destroying expensive work the first time
+   someone clicks "Reprocess" after switching branches.
+
+#### 4.2.4 Project-switch invariants
 
 The web server is long-lived: a single process serves multiple projects
 as the user clicks "Open Folder". `ChatService`, on the other hand, is
