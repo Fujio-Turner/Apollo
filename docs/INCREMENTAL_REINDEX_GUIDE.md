@@ -16,6 +16,35 @@ Apollo's incremental re-indexing system provides two high-performance strategies
 
 The system defaults to **Option 2 for foreground (interactive) updates** and **Option 1 for background sweeps**, providing sub-second responsiveness while maintaining eventual correctness.
 
+### In-place sweep mutation (Phase 8)
+
+Since Phase 8 of [`PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`](work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md),
+`ResolveFullStrategy.run` mutates the input graph in place:
+`result.graph_out is graph_in` is now a hard invariant
+(pinned by `tests/test_index_invariants_phase10.py`). The legacy
+`new_graph = nx.DiGraph(graph_in)` deep copy is gone, eliminating a
+~1 GB transient allocation on a 1 GB graph.
+
+Implications for callers:
+
+1. **Don't keep the pre-sweep graph reference around expecting it to
+   be untouched.** If you need the old shape for diff display, hold
+   onto frozensets of `(node_id)` and `(src, dst)` *before* invoking
+   the strategy.
+2. **Per-node ML attrs are preserved automatically.** The strategy
+   snapshots `embedding`, `embedding_hash`, `pagerank`, `cluster_id`,
+   `umap_xy`, `community_id`, `keyphrases`, `topic_id`,
+   `outlier_score`, `outlier_reason` etc. before removing each dirty
+   file's nodes, and merges them back via `setdefault` after the
+   re-parsed nodes are added (the rebuilt parser wins for any
+   field it explicitly emitted).
+3. **`GraphDiff.nodes_modified` is intentionally empty.** Detecting
+   modifications would require snapshotting every node's attrs —
+   exactly the cost Phase 8 set out to remove. Every caller in the
+   codebase only inspects `edges_added` / `edges_removed` /
+   `nodes_added` / `nodes_removed` for telemetry, so dropping
+   `nodes_modified` accuracy is acceptable.
+
 ---
 
 ## For Users

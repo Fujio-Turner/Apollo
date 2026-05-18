@@ -331,9 +331,20 @@ class ResolveFullStrategy:
         
         root = Path(root_dir).resolve()
         builder._root = root
-        
-        # Initialize new graph from previous (we'll modify it)
-        new_graph = nx.DiGraph(graph_in)
+
+        # Phase 8 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: previously this
+        # was ``new_graph = nx.DiGraph(graph_in)`` — a NetworkX
+        # deep-shallow copy that duplicated every node/edge attrs dict
+        # (including embeddings; ~3× peak RAM on the sweep). We now
+        # mutate ``graph_in`` in place. The diff is reconstructed from
+        # frozen-set snapshots taken before mutation rather than from
+        # a parallel copy of the graph.
+        new_graph = graph_in
+        nodes_before: frozenset = frozenset(graph_in.nodes())
+        edges_before: frozenset = frozenset(
+            (s, d, data.get("type"))
+            for s, d, data in graph_in.edges(data=True)
+        )
         
         # Discover all files
         files_to_parse_all, dir_set = builder._discover_files(root)
@@ -351,12 +362,21 @@ class ResolveFullStrategy:
         # ``(parser, src_file, rel_path, source_text, file_md5_hex)``.
         # The trailing two slots are placeholders here; we fill them
         # ourselves below for files that actually need re-parsing.
+        # Phase 9 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: gather the
+        # stat-mismatched files into a batch and fan the read+hash
+        # work out via ``_parallel_rehash`` instead of doing it
+        # inline on the main thread for every dirty file.
+        from graph.builder import _parallel_rehash
+
+        rehash_jobs: list[tuple] = []
+        rehash_parser_map: dict[str, any] = {}
+        rehash_src_map: dict[str, Path] = {}
         for parser, src_file, rel_path, _src, _md5 in files_to_parse_all:
             try:
                 st = src_file.stat()
             except OSError:
                 continue
-            
+
             prev = prev_hashes.get(rel_path)
             # Support both legacy (plain hash string) and new (dict) formats
             if isinstance(prev, dict):
@@ -367,7 +387,7 @@ class ResolveFullStrategy:
                 prev_mtime = None
                 prev_size = None
                 prev_sha = prev
-            
+
             # Fast path: if mtime and size unchanged, skip read entirely
             if (prev_mtime is not None
                     and prev_mtime == st.st_mtime_ns
@@ -375,57 +395,116 @@ class ResolveFullStrategy:
                 new_hashes[rel_path] = prev
                 files_skipped += 1
                 continue
-            
-            # Metadata changed — read and hash
-            try:
-                content = src_file.read_bytes()
-            except OSError:
-                continue
-            file_hash = hashlib.sha256(content).hexdigest()
-            file_md5_hex = hashlib.md5(content).hexdigest()
-            source_text = content.decode("utf-8", errors="replace")
-            
-            new_hashes[rel_path] = {
-                "sha256": file_hash,
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
-            }
-            
-            if file_hash == prev_sha:
-                files_skipped += 1
-                continue  # Content unchanged despite metadata change
-            
-            # Pass source_text + md5 so parser doesn't re-read from disk
-            files_to_parse.append(
-                (parser, src_file, rel_path, source_text, file_md5_hex)
+
+            rehash_jobs.append(
+                (src_file, rel_path, st.st_mtime_ns, st.st_size, prev_sha)
             )
+            rehash_parser_map[rel_path] = parser
+            rehash_src_map[rel_path] = src_file
+
+        for rec in _parallel_rehash(rehash_jobs):
+            rel_path = rec["rel_path"]
+            new_hashes[rel_path] = rec["new_hash"]
+            if not rec["changed"]:
+                files_skipped += 1
+                continue
+            files_to_parse.append((
+                rehash_parser_map[rel_path],
+                rehash_src_map[rel_path],
+                rel_path,
+                rec["source_text"],
+                rec["file_md5_hex"],
+            ))
         
         files_total = len(files_to_parse_all)
         files_parsed = len(files_to_parse)
         
-        # Step 1: Parse changed files in parallel
-        parsed_files = builder._parse_files_parallel(files_to_parse)
-        
-        # Step 2: Remove nodes/edges from changed files
-        changed_files = {p["rel_path"] for p in parsed_files}
+        # Step 1: Parse changed files. ``rel_paths_parsed`` is collected
+        # *first* (in a single non-streaming pass) so step 2 can remove
+        # the old nodes before we re-add the new ones — otherwise the
+        # streaming variant would add new nodes that step 2 would
+        # immediately delete.
+        #
+        # We can't simply stream into ``new_graph`` because step 2
+        # mutates the graph node-set based on the *full* set of changed
+        # files. So here we do a two-pass variant: first know which
+        # files changed (cheap — we already have ``files_to_parse``),
+        # then stream-build into the builder's fresh graph, then merge.
+        changed_files = {rel_path for _p, _s, rel_path, _t, _m in files_to_parse}
         nodes_to_remove = [
             node_id for node_id in new_graph.nodes()
             if new_graph.nodes[node_id].get("path") in changed_files
         ]
+
+        # Phase 8 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: snapshot the
+        # ML-attr subset of the nodes we're about to remove so we can
+        # re-attach them to the freshly-rebuilt nodes a few lines
+        # below. Pre-Phase-8 this was done in
+        # ``ReindexService.run_sweep`` via the ``_PRESERVED_NODE_ATTRS``
+        # carry-over loop, which only worked because the strategy used
+        # ``nx.DiGraph(graph_in)`` to keep the old attrs alive on the
+        # original ``graph_in``. With in-place mutation we lose that
+        # source, so the snapshot has to happen here.
+        preserved_keys = (
+            "embedding", "embedding_hash", "pagerank", "betweenness",
+            "in_degree", "out_degree",
+            "cluster_id", "umap_xy", "community_id",
+            "keyphrases", "topic_id",
+            "outlier_score", "outlier_reason",
+        )
+        preserved_attrs: dict[str, dict] = {}
+        for nid in nodes_to_remove:
+            data = new_graph.nodes[nid]
+            saved = {k: data[k] for k in preserved_keys if k in data}
+            if saved:
+                preserved_attrs[nid] = saved
+
         for node_id in nodes_to_remove:
             new_graph.remove_node(node_id)
-        
-        # Step 3: Build file nodes for changed files sequentially
-        for parsed in parsed_files:
-            builder._build_file_nodes(parsed, parsed["rel_path"])
-        
-        # Merge new nodes from parsed files into the graph
+
+        # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: prune file-text
+        # sidecar entries for files we're about to re-parse. The
+        # streaming build below will repopulate them with the fresh
+        # contents; without this, a file that changed size would still
+        # see its stale text returned by ``get_source`` until the
+        # builder overwrote it (a race only on partial-merge failures,
+        # but cheap to make deterministic).
+        old_ft = new_graph.graph.get("_file_text")
+        if isinstance(old_ft, dict):
+            for rel in changed_files:
+                old_ft.pop(rel, None)
+
+        # Step 2: Stream parse → build → resolve into ``builder.graph``
+        # (Phase 1 of PLAN_INDEX_MEMORY_AND_CONCURRENCY). The big
+        # per-file parsed dicts are dropped right after their nodes are
+        # added; only tiny resolve records (rel_path + imports + call
+        # lists) survive into the resolve step.
+        resolve_records = builder._parse_build_resolve_streaming(files_to_parse)
+
+        # Merge new nodes from the builder's graph into ``new_graph``,
+        # re-attaching any ML attrs we snapshotted before removal
+        # (Phase 8 — keeps the carry-over invariant alive even with
+        # in-place mutation).
         for node_id, attrs in builder.graph.nodes(data=True):
-            new_graph.add_node(node_id, **attrs)
+            merged = dict(attrs)
+            old_ml = preserved_attrs.get(node_id)
+            if old_ml:
+                for k, v in old_ml.items():
+                    merged.setdefault(k, v)
+            new_graph.add_node(node_id, **merged)
+
+        # Phase 4: merge the builder's freshly-populated file-text map
+        # into ``new_graph``'s sidecar (keyed by rel_path). Without
+        # this, every API/embedding read for a re-parsed file would
+        # see no ``source`` (the per-node attr is gone post-Phase-4).
+        builder_ft = builder.graph.graph.get("_file_text")
+        if isinstance(builder_ft, dict) and builder_ft:
+            sink_ft = new_graph.graph.setdefault("_file_text", {})
+            sink_ft.update(builder_ft)
         
-        # Step 4: Resolve calls for parsed files
-        for parsed in parsed_files:
-            builder._resolve_calls(parsed)
+        # Step 3: Resolve calls for parsed files
+        for rec in resolve_records:
+            builder._resolve_calls(rec)
         
         # Add resolved edges from the builder. We also merge "contains"
         # edges so re-parsed files stay connected to their parent
@@ -437,9 +516,28 @@ class ResolveFullStrategy:
             if data.get("type") in ("calls", "inherits", "tests", "contains"):
                 new_graph.add_edge(src, dst, **data)
         
-        # Compute diff
-        diff = compute_diff(graph_in, new_graph)
-        
+        # Phase 8: compute the diff against the pre-mutation snapshot
+        # rather than against ``graph_in`` (which is the *same* object
+        # as ``new_graph`` after in-place mutation, so the legacy
+        # ``compute_diff(graph_in, new_graph)`` would always return
+        # empty). ``nodes_modified`` is intentionally left empty —
+        # detecting modifications would require snapshotting every
+        # node's attrs, which is the exact memory cost Phase 8 set out
+        # to remove. Callers only inspect ``edges_added`` /
+        # ``edges_removed`` from this diff for telemetry, so dropping
+        # ``nodes_modified`` accuracy is acceptable.
+        nodes_after = set(new_graph.nodes())
+        edges_after = set(
+            (s, d, data.get("type"))
+            for s, d, data in new_graph.edges(data=True)
+        )
+        diff = GraphDiff(
+            nodes_added=sorted(nodes_after - nodes_before),
+            nodes_removed=sorted(nodes_before - nodes_after),
+            edges_added=sorted(edges_after - edges_before),
+            edges_removed=sorted(edges_before - edges_after),
+        )
+
         # Build new reverse-dependency index
         new_dep_index = self._build_dep_index(new_graph)
         
@@ -682,29 +780,43 @@ class ResolveLocalStrategy:
         # Compute affected files using dep index
         affected_files = self._compute_affected_files(dirty_files, prev_dep_index, max_hops=1)
         
-        # Parse changed files in parallel
-        parsed_files = builder._parse_files_parallel(files_to_parse)
-        
-        # Remove nodes/edges from changed files
-        changed_files = {p["rel_path"] for p in parsed_files}
+        # Compute the set of files we'll re-build *before* parsing —
+        # same rationale as ResolveFullStrategy.run above (Phase 1).
+        changed_files = {rel_path for _p, _s, rel_path, _t, _m in files_to_parse}
         nodes_to_remove = [
             node_id for node_id in new_graph.nodes()
             if new_graph.nodes[node_id].get("path") in changed_files
         ]
         for node_id in nodes_to_remove:
             new_graph.remove_node(node_id)
+
+        # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — prune
+        # file-text sidecar entries for files we'll re-parse below
+        # (mirrors ResolveFullStrategy.run).
+        old_ft = new_graph.graph.get("_file_text")
+        if isinstance(old_ft, dict):
+            for rel in changed_files:
+                old_ft.pop(rel, None)
+
+        # Stream parse → build → resolve (Phase 1 of
+        # PLAN_INDEX_MEMORY_AND_CONCURRENCY). See ``GraphBuilder.
+        # _parse_build_resolve_streaming`` for the memory rationale.
+        resolve_records = builder._parse_build_resolve_streaming(files_to_parse)
         
-        # Build file nodes for changed files
-        for parsed in parsed_files:
-            builder._build_file_nodes(parsed, parsed["rel_path"])
-        
-        # Merge new nodes from parsed files
+        # Merge new nodes from the builder's graph
         for node_id, attrs in builder.graph.nodes(data=True):
             new_graph.add_node(node_id, **attrs)
-        
+
+        # Phase 4: merge the builder's file-text map so
+        # ``get_source`` works on re-parsed files post-merge.
+        builder_ft = builder.graph.graph.get("_file_text")
+        if isinstance(builder_ft, dict) and builder_ft:
+            sink_ft = new_graph.graph.setdefault("_file_text", {})
+            sink_ft.update(builder_ft)
+
         # Resolve calls for parsed files
-        for parsed in parsed_files:
-            builder._resolve_calls(parsed)
+        for rec in resolve_records:
+            builder._resolve_calls(rec)
         
         # Add resolved edges from the builder. "contains" edges are
         # merged too so re-parsed files keep their dir→file link

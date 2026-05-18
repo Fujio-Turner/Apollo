@@ -173,6 +173,12 @@ Cross-file resolution is the hardest part. Strategy:
 - Build a global symbol table: `{qualified_name: node_id}`.
 - When a call like `mailer.emails()` is found, look up `mailer` in imports → resolve to `src/utils/mailer.py` → find `emails` in that file's symbols.
 
+The "for each file, run the parser…" step is no longer a sequential
+fold over a single materialised list — it is a streaming pipeline that
+overlaps parsing, graph construction, embedding, and resolve. See
+§4.2.5 below for the pipeline shape and §4.2.6 for the memory budget
+that shape was designed to fit.
+
 #### 4.2.1 File-skipping invariants
 
 The chat tools, file-explorer tree, semantic search, and `safe_path()`
@@ -361,6 +367,222 @@ it safe to run on every session start.
 If a future feature adds a third state directory (e.g. `_apollo_cache/`),
 extend the block here so users get the new entry the next time they
 open the project.
+
+#### 4.2.5 Indexing pipeline (streaming + concurrent)
+
+The naive "parse everything → build everything → embed everything →
+save" pipeline lived through Apollo's prototype phase, but on
+medium-sized projects the *sum* of those stages dominated wall-clock
+and the per-stage peak memory was 3-5× the persisted graph size. The
+indexer has since been rewritten as a streaming pipeline whose stages
+overlap whenever the dependency DAG allows. The current shape is:
+
+```
+╭──────────────╮    futures        ╭───────────────────╮
+│ ThreadPool    │  as_completed →  │ _build_file_nodes │
+│ parser pool   │                  │ (main thread)     │
+│ (per-file     │                  ╰─────────┬─────────╯
+│  parse_one)   │                            │
+╰──────────────╯                            │
+                          ╭──────────────────┤
+                          ▼                  ▼
+                  ╭──────────────╮   ╭───────────────╮
+                  │ EmbedQueue   │   │ _minimal_     │
+                  │ daemon       │   │ resolve_      │
+                  │ thread       │   │ record list   │
+                  │ (Phase 6)    │   ╰───────┬───────╯
+                  ╰──────┬───────╯           │
+                         │                   ▼
+                         │           ╭───────────────╮
+                         │           │ _resolve_     │
+                         │           │ calls (after  │
+                         │           │ all files in) │
+                         │           ╰───────┬───────╯
+                         ▼                   │
+                  ╭──────────────╮           │
+                  │ Embeddings   │           │
+                  │ written back │           │
+                  │ to nodes     │           │
+                  ╰──────┬───────╯           │
+                         ▼                   ▼
+                  ╭──────────────────────────────╮
+                  │ Phase 7 fan-out:             │
+                  │  • run_all_passes(parallel=  │
+                  │    True) — DAG-scheduled ML  │
+                  │  • SpatialMapper.compute_all │
+                  ╰──────────────┬───────────────╯
+                                 ▼
+                  ╭──────────────────────────────╮
+                  │ Phase 7 fan-out (final):     │
+                  │  • JsonStore.save (streaming │
+                  │    writer, Phase 5)          │
+                  │  • SemanticSearch rebuild    │
+                  ╰──────────────────────────────╯
+```
+
+Key contracts pinned by `tests/test_index_invariants_phase10.py`:
+
+1. **Parsed dicts are reclaimed mid-build** (Phase 1). The parser pool
+   feeds `as_completed` futures into `_build_file_nodes` and the heavy
+   per-file payload (source text, docstrings, markdown sections, code
+   blocks…) is dropped once the file's nodes are in the graph. Only a
+   tiny `_minimal_resolve_record` (rel_path + imports + per-func call
+   list) survives into the resolve step.
+2. **No per-node `source` attr** on `function` / `method` / `class` /
+   `document` / `section` / `code_block` nodes (Phase 4). One copy of
+   each file's text lives in `graph.graph["_file_text"]`; readers
+   call `graph.query.get_source(graph, nid)` to slice it on demand.
+3. **Embeddings are `float32` ndarrays in memory** (Phase 3), persisted
+   as base64 in JSON (uniform across the JSON and CouchbaseLite
+   backends). The legacy `list[float]` form is still accepted at load
+   time for back-compat with pre-Phase-3 graph files.
+4. **`JsonStore.save` does not mutate the live graph** (Phase 5). The
+   streaming writer keeps a one-attribute-dict-at-a-time defensive
+   copy so the in-place base64 encoding for embeddings never leaks
+   back to the in-RAM graph.
+5. **`EmbedQueue` pipelines with parsing** (Phase 6). As soon as a
+   file's nodes are added, eligible texts are pushed onto a background
+   daemon thread that batches and calls
+   `Embedder.embed_texts_array(...)`. Cache hits short-circuit without
+   touching the queue. Total wall-clock approaches `max(parse, embed)`
+   instead of `parse + embed`.
+6. **ML passes run in parallel** (Phase 7). `run_all_passes(graph,
+   parallel=True, max_workers=N)` schedules independent passes
+   (PageRank, Louvain, vulture, IsolationForest, UMAP→HDBSCAN,
+   KeyBERT, BERTopic) over a `ThreadPoolExecutor`. Each pass writes
+   to disjoint node-attr / graph-attr keys so no lock is needed.
+7. **Save + search-rebuild fan out** (Phase 7). After the ML stage,
+   `JsonStore.save` and `SemanticSearch` rebuild run concurrently on
+   two worker threads — the UI's status spinner shows the union
+   label `"Saving + rebuilding search"`.
+8. **Sweep mutates the input graph in place** (Phase 8).
+   `ResolveFullStrategy.run` no longer does
+   `nx.DiGraph(graph_in)`; the input *is* the output. Per-node ML
+   attrs (`embedding`, `pagerank`, `cluster_id`, …) are snapshotted
+   per dirty file and merged back on the freshly-rebuilt nodes.
+9. **Stat-mismatched rehash is parallel** (Phase 9). The
+   `read_bytes() + sha256 + md5` work for incremental-mode files
+   whose mtime/size differ from the cache runs in a
+   `ThreadPoolExecutor` (`graph.builder._parallel_rehash`).
+
+The CLI / web-UI orchestrator lives in `web.server._do_index`; the
+background sweep counterpart is `apollo.reindex_service.run_sweep`.
+
+#### 4.2.6 Indexing memory budget
+
+The per-stage peak-RSS budget the streaming pipeline above is sized
+for, expressed in *multiples of the persisted graph size G* (where G
+≈ 1.2-1.6 MB per 1k LOC for a typical Python codebase):
+
+| Stage                              | Pre-plan peak | Current peak | Notes                                                                 |
+|------------------------------------|---------------|--------------|-----------------------------------------------------------------------|
+| Parse + build                      | ~3× G         | ~1.2× G      | Phase 1 streams parser output instead of holding `parsed_files`.       |
+| Embed (full)                       | ~2× G         | ~1.3× G      | Phase 3 dtype switch (`list[float]` → `float32` ndarray) ~halves vectors. Phase 6 overlap removes a separate peak. |
+| ML passes                          | ~2× G         | ~1.5× G      | Phase 7 parallel; numpy/networkx release the GIL so no extra copies.   |
+| Save                               | ~2× G         | ~1.05× G     | Phase 5 streaming writer — no full payload materialisation in orjson.  |
+| Incremental sweep                  | ~3× G         | ~1.2× G      | Phase 8 in-place mutation — no `nx.DiGraph(graph_in)` deep copy.       |
+| Stat-mismatched rehash (100 files) | sequential    | ~3× faster   | Phase 9 thread pool over IO + GIL-releasing crypto.                    |
+
+Numbers above are the design targets. The actual per-run capture is
+the job of `scripts/bench_index.py` (which writes a JSON report per
+run under `docs/work/bench/`), and `scripts/bench_check.py` compares
+two such reports to flag regressions. The CI hook is a non-blocking
+diff against a checked-in baseline — see Phase 10 of
+[`docs/work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`](work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md).
+
+When adding a new pipeline stage, ask:
+
+1. **Does it need the full parser output?** If not, keep it on the
+   `_minimal_resolve_record` / `_file_text` side — don't reach into
+   `parsed`.
+2. **Does it write the same per-node attribute keys as an existing
+   ML pass?** If yes, do NOT add it to `_PASS_DAG` without a lock.
+3. **Does it mutate `graph.graph` keys other passes read?** If yes,
+   schedule it as a join-point rather than a parallel pass.
+4. **Does it materialise a list/dict of nodes?** Prefer iterating
+   `graph.nodes(data=True)` directly — the streaming-save writer
+   demonstrates that even orjson can be fed one attrs dict at a time.
+
+#### 4.2.7 Parallel parsing — process pool (Phase 2)
+
+The parser stage of §4.2.5 was originally a `ThreadPoolExecutor`, which
+is a poor fit for the workload: the Python AST plugin and most
+non-tree-sitter plugins are GIL-bound, so threads just added scheduling
+overhead with no speedup. Phase 2 of
+[`docs/work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`](work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md)
+swapped the parser pool for a `ProcessPoolExecutor` while preserving
+the Phase 1 streaming contract (parsed dicts are still reclaimed
+mid-build, one file at a time).
+
+**Shape.** `graph.builder._parse_build_resolve_streaming` accepts a
+`parser_pool` kwarg with three branches:
+
+- `sync` — in-process loop, no executor at all. Deterministic test
+  path; used by the unit tests that pin parse-order invariants.
+- `thread` — legacy `ThreadPoolExecutor` behaviour. Kept for
+  backward-compat and as the auto-downgrade target for any project
+  whose enabled parsers include a plugin that advertises
+  `safe_for_processes = False` (default is `True`).
+- `process` — `ProcessPoolExecutor` with
+  `initializer=_init_worker_parsers` and `chunksize=8`. Each worker
+  re-runs `apollo.plugins.discover_plugins()` once at startup so
+  tree-sitter C handles and other unpickle-able plugin state are
+  constructed locally inside the worker rather than crossing the
+  process boundary.
+
+**Pickle boundary.** Work items are tuples of *parser key* (a stable,
+picklable string returned by `_parser_key(parser)` — currently
+`type(parser).__module__`, or `None` for the parser-less stub path),
+not parser *instances*. The worker resolves the key against its own
+`{key → BaseParser}` table built by the initializer, then delegates to
+the existing `_parse_one()` so the parse contract is identical to the
+thread/sync branches. Parsed dicts are streamed back via
+`executor.map(...)` and fed straight into `_build_file_nodes` on the
+main thread — the per-file payload is dropped as soon as its nodes are
+in the graph, so the Phase 1 GC-on-each-file invariant still holds.
+
+**Pool selection.** `_resolve_parser_pool_mode(parsers, requested=None)`
+picks the mode from (in order): the explicit `parser_pool=` kwarg, the
+`APOLLO_PARSER_POOL` env var, or the default `process` (flipped from
+`thread` after the Apollo-self A/B below showed a 2.7× / 2.3× win on
+every safe-parser project). An invalid string also collapses to the
+default. If the active parser list contains any plugin with
+`safe_for_processes = False`, `process` is auto-downgraded to `thread`.
+`scripts/bench_index.py --parser-pool {thread,process,sync}` propagates
+the choice to every call site (web server, `reindex_service`,
+`watcher`) via that env var; explicit `APOLLO_PARSER_POOL=thread` is
+the escape hatch for anyone debugging a worker crash.
+
+**Cross-platform.** `_parse_one_process` and `_init_worker_parsers`
+are module-level callables in `graph.builder`, so spawn-mode re-import
+on macOS and Windows works without any plugin-side changes. The known
+spawn pitfalls (module-level side effects in `plugins/__init__.py` and
+`apollo/__init__.py`) were audited as part of Phase 2.
+
+**Measured impact** (Apollo-self, `--no-embeddings --no-ml`):
+
+| mode    | parse_and_build wall | parse peak RSS | total wall |
+|---------|----------------------|----------------|------------|
+| thread  | 8.32 s               | 250.5 MB       | 9.55 s     |
+| process | **3.06 s** (2.7×)    | 215.8 MB       | **4.16 s** (2.3×) |
+
+Large-external-corpus numbers are still pending (the chat sandbox
+can't fit a 10k+50k-LOC embed+ML run); pin those before claiming the
+RSS gate of §4.2.6.
+
+**Pitfalls when adding a new plugin:**
+
+1. If your plugin holds a non-picklable handle (raw C pointer, open
+   file, threading primitive) that cannot be reconstructed cheaply in
+   each worker, set `safe_for_processes = False` in the plugin's
+   `config.json` so the auto-downgrade in `_resolve_parser_pool_mode`
+   keeps it on the thread pool.
+2. If your plugin eagerly loads a grammar or model at import time,
+   wrap it in `functools.lru_cache` — under `process` mode the import
+   runs once *per worker*, not once per indexer.
+3. Worker crashes are silent unless `future.result()` is awaited.
+   Keep the surrounding `try/except Exception` and always log the
+   worker PID + file path on failure.
 
 ### 4.3 Storage Backend
 

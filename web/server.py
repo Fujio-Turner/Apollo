@@ -986,7 +986,42 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logger.exception("could not read project filters; proceeding without filters")
                 active_filters = None
             builder = GraphBuilder(parsers=build_parsers, filters=active_filters)
-            graph = builder.build(target)
+
+            # Phase 6 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: overlap
+            # embedding compute with parsing via an
+            # :class:`EmbedQueue`. We construct the queue *before*
+            # ``builder.build`` so the streaming-build loop can push
+            # eligible nodes onto it as their files complete; the
+            # worker thread encodes batches in the background while
+            # parsing continues. If the SentenceTransformer model
+            # isn't installed (or any other init failure), we fall
+            # back to the legacy "build then embed" sequencing so
+            # indexing still succeeds without embeddings.
+            embed_queue = None
+            prev_cache: dict = {}
+            embedder_for_queue = None
+            try:
+                from apollo.embeddings.embedder import (
+                    extract_cache_from_graph,
+                    get_shared_embedder,
+                )
+                from apollo.embeddings.embed_queue import EmbedQueue
+                try:
+                    prev_graph = store.load()
+                    prev_cache = extract_cache_from_graph(prev_graph)
+                except Exception:
+                    prev_cache = {}
+                embedder_for_queue = get_shared_embedder()
+                embed_queue = EmbedQueue(
+                    embedder_for_queue, builder.graph, prev_cache=prev_cache,
+                )
+            except Exception:
+                # sentence-transformers missing or queue init failed —
+                # build without overlapped embedding; the post-build
+                # block below logs a warning and proceeds.
+                embed_queue = None
+
+            graph = builder.build(target, embed_queue=embed_queue)
             n_nodes = graph.number_of_nodes()
             n_edges = graph.number_of_edges()
             n_files = sum(1 for _, d in graph.nodes(data=True) if d.get("type") == "file")
@@ -1001,30 +1036,46 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t1 = time.time()
             logger.info("indexing step 2/4: generating embeddings for %d nodes", n_nodes)
             try:
-                from apollo.embeddings.embedder import (
-                    extract_cache_from_graph,
-                    get_shared_embedder,
-                )
-                # Reuse the previously-active graph's vectors keyed by
-                # content hash. After ``builder.build()`` rebuilt ``graph``
-                # the local ``self.graph`` reference here is the *new*
-                # graph, but the previously loaded ``store`` still holds
-                # the old in-memory copy via the chat_service / search
-                # references. We pull from the most recently saved store
-                # to populate the cache so unchanged nodes don't pay the
-                # SentenceTransformer encode cost again.
-                prev_cache: dict = {}
-                try:
-                    prev_graph = store.load()
-                    prev_cache = extract_cache_from_graph(prev_graph)
-                except Exception:
-                    prev_cache = {}
-                emb = get_shared_embedder()
-                emb.embed_graph(graph, prev_cache=prev_cache)
-                logger.info(
-                    "embeddings generated in %.2fs (reused %d cached)",
-                    time.time() - t1, len(prev_cache),
-                )
+                if embed_queue is not None:
+                    # Phase 6 fast path: drain the background worker.
+                    # All embeddings are already attached to the graph
+                    # (cache hits + freshly-encoded batches alike).
+                    # ``close_and_join`` re-raises any exception the
+                    # worker thread caught — corrupt models / OOM /
+                    # tokenizer errors fail loudly here instead of
+                    # silently producing a half-embedded graph.
+                    merged_cache = embed_queue.close_and_join()
+                    stats = embed_queue.stats
+                    logger.info(
+                        "embeddings generated in %.2fs "
+                        "(reused %d cached, encoded %d via background queue)",
+                        time.time() - t1,
+                        stats["cache_hits"],
+                        stats["encoded"],
+                    )
+                    # ``embed_graph`` is *not* re-run — the queue
+                    # already covered every embed-eligible node Phase 4
+                    # cares about. A cheap sweep with the merged cache
+                    # would be a no-op (all hashes already cached).
+                else:
+                    # Legacy fall-back path — embedder import / queue
+                    # init failed earlier. Behaviour matches pre-Phase-6.
+                    if embedder_for_queue is None:
+                        from apollo.embeddings.embedder import (
+                            extract_cache_from_graph,
+                            get_shared_embedder,
+                        )
+                        try:
+                            prev_graph = store.load()
+                            prev_cache = extract_cache_from_graph(prev_graph)
+                        except Exception:
+                            prev_cache = {}
+                        embedder_for_queue = get_shared_embedder()
+                    embedder_for_queue.embed_graph(graph, prev_cache=prev_cache)
+                    logger.info(
+                        "embeddings generated in %.2fs (reused %d cached, fallback path)",
+                        time.time() - t1, len(prev_cache),
+                    )
             except Exception:
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
@@ -1052,14 +1103,21 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             try:
                 from apollo.ml import run_all_passes
                 t_ml = time.time()
-                logger.info("indexing: running ML passes")
+                logger.info("indexing: running ML passes (parallel)")
                 ml_embedder = None
                 try:
                     from apollo.embeddings.embedder import get_shared_embedder as _shared_emb
                     ml_embedder = _shared_emb()
                 except Exception:
                     ml_embedder = None
-                ml_summary = run_all_passes(graph, root_dir=target, embedder=ml_embedder)
+                # Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: run
+                # the seven independent ML passes concurrently. Each
+                # pass writes to its own attribute namespace so the
+                # threads can't collide on the same dict key.
+                ml_summary = run_all_passes(
+                    graph, root_dir=target, embedder=ml_embedder,
+                    parallel=True,
+                )
                 for k, v in (ml_summary or {}).items():
                     tag = "ok" if v.get("ml_available") else "skip"
                     detail = (f"computed={v.get('computed')}"
@@ -1070,31 +1128,59 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             except Exception as e:
                 logger.warning("ML passes skipped: %s", e)
 
-            _indexing_status.update(step=3, step_label="Saving to store",
-                                    detail="Embeddings done")
-            t2 = time.time()
-            logger.info("indexing step 3/4: saving graph to store")
-            store.save(graph)
-            logger.info("graph saved in %.2fs", time.time() - t2)
+            # Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: fan out
+            # ``store.save`` and the search-index rebuild. Both only
+            # *read* the in-memory graph; they don't depend on each
+            # other or mutate ``graph``, so threading them halves the
+            # wall-clock of these two stages on the typical project.
+            _indexing_status.update(
+                step=3, step_label="Saving + rebuilding search",
+                detail="Embeddings + ML done",
+            )
+            t_fan = time.time()
+            logger.info("indexing steps 3+4/4: saving + rebuilding search index (backend=%s, parallel)", backend)
 
-            q = GraphQuery(graph)
-            stats = q.stats()
+            from concurrent.futures import ThreadPoolExecutor
 
-            _indexing_status.update(step=4, step_label="Rebuilding search",
-                                    detail="Store saved")
-            t3 = time.time()
-            logger.info("indexing step 4/4: rebuilding search index (backend=%s)", backend)
-            try:
+            def _do_save():
+                t_s = time.time()
+                store.save(graph)
+                return time.time() - t_s
+
+            def _do_search():
+                t_s = time.time()
                 from apollo.embeddings.embedder import get_shared_embedder as _shared
                 if backend == "cblite":
                     from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                    search = CouchbaseLiteSemanticSearch(store, _shared())
+                    s = CouchbaseLiteSemanticSearch(store, _shared())
                 else:
                     from apollo.search.semantic import SemanticSearch
-                    search = SemanticSearch(graph, _shared())
-                logger.info("search index ready in %.2fs", time.time() - t3)
-            except Exception:
-                logger.warning("search index unavailable after %.2fs", time.time() - t3)
+                    s = SemanticSearch(graph, _shared())
+                return s, time.time() - t_s
+
+            search = None
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="apollo-fanout",
+            ) as fan:
+                save_fut = fan.submit(_do_save)
+                search_fut = fan.submit(_do_search)
+                try:
+                    save_elapsed = save_fut.result()
+                    logger.info("graph saved in %.2fs (parallel)", save_elapsed)
+                except Exception:
+                    logger.exception("graph save failed")
+                    raise
+                try:
+                    search, search_elapsed = search_fut.result()
+                    logger.info("search index ready in %.2fs (parallel)", search_elapsed)
+                except Exception:
+                    logger.warning("search index unavailable after %.2fs", time.time() - t_fan)
+                    search = None
+
+            q = GraphQuery(graph)
+            stats = q.stats()
+            logger.info("save + search-rebuild fan-out total %.2fs", time.time() - t_fan)
+            _indexing_status.update(step=4, step_label="Finalizing", detail="Saved + indexed")
 
             # Refresh ChatService's references so its tools see the new
             # project. ChatService is constructed once during create_app()
@@ -1576,7 +1662,18 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if node_id not in graph:
             raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
 
-        data = {k: v for k, v in graph.nodes[node_id].items() if k != "embedding"}
+        # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: drop the
+        # per-node ``source`` attr (it's no longer stored) and inject
+        # the file-text slice via :func:`graph.query.get_source` so
+        # the UI's node-detail view continues to receive a ``source``
+        # field with identical content to pre-Phase-4.
+        from apollo.graph.query import get_source
+
+        data = {k: v for k, v in graph.nodes[node_id].items()
+                if k not in ("embedding", "source")}
+        src = get_source(graph, node_id)
+        if src:
+            data["source"] = src
         self_path = data.get("path")
 
         edges_in = [

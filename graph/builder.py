@@ -18,7 +18,7 @@ import fnmatch
 import hashlib
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import networkx as nx
@@ -141,6 +141,200 @@ def _is_venv_dir(dirpath: str, markers: tuple[str, ...] = _VENV_MARKERS) -> bool
     return False
 
 
+def _minimal_resolve_record(parsed: dict) -> dict:
+    """Extract the small subset of a ``parsed`` dict that :func:`_resolve_calls`
+    actually consumes (``rel_path`` + ``imports`` + per-function/method
+    call lists). Used by the streaming build path so the heavy
+    ``parsed`` dicts can be dropped immediately after
+    :meth:`GraphBuilder._build_file_nodes` writes them into the graph —
+    instead of being kept in memory for the entire build the way the
+    legacy ``parsed_files`` list did.
+
+    The returned dict is intentionally shaped exactly like the slice of
+    the parsed dict that ``_resolve_calls`` reads, so the resolve loop
+    can stay unchanged.
+    """
+    return {
+        "rel_path": parsed["rel_path"],
+        # ``imports`` is the only large-ish nested list we have to keep;
+        # each entry is a small dict (module + names + alias + line) and
+        # ``_resolve_calls`` does need every one of them to build its
+        # import map. We *don't* keep ``type_checking_imports`` /
+        # ``comments`` / ``strings`` / ``documents`` / ``sections`` /
+        # ``code_blocks`` / ``links`` / ``tables`` / ``task_items`` /
+        # ``module_docstring`` / ``patterns`` / ``source`` — those were
+        # consumed by ``_build_file_nodes`` and are no longer needed.
+        "imports": parsed.get("imports") or [],
+        "functions": [
+            {"name": f["name"], "calls": f.get("calls") or []}
+            for f in (parsed.get("functions") or [])
+        ],
+        "classes": [
+            {
+                "name": c["name"],
+                "methods": [
+                    {"name": m["name"], "calls": m.get("calls") or []}
+                    for m in (c.get("methods") or [])
+                ],
+            }
+            for c in (parsed.get("classes") or [])
+        ],
+    }
+
+
+def _rehash_file_for_incremental(
+    src_file: Path,
+    rel_path: str,
+    cur_mtime: int,
+    cur_size: int,
+    prev_sha: str | None,
+) -> dict | None:
+    """Phase 9 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — read + sha256 +
+    md5 a single file whose stat differs from ``prev_hashes``.
+
+    Returns a result dict the caller composes into its
+    ``files_to_parse`` list + ``new_hashes`` map, or ``None`` on
+    OSError (vanished mid-walk / permission denied — same swallow
+    behaviour as the legacy inline block).
+
+    Returned shape::
+
+        {
+          "rel_path":      <str>,
+          "new_hash":      {"sha256", "mtime_ns", "size"},
+          "changed":       <bool>,       # False = content unchanged
+          "source_text":   <str | None>, # populated only when changed
+          "file_md5_hex":  <str | None>, # populated only when changed
+        }
+
+    Both legacy callers (``GraphBuilder.build_incremental`` and
+    ``ResolveFullStrategy.run``) used to do this work inline, in a
+    single main-thread loop. Phase 9 hoists it into a helper so a
+    ``ThreadPoolExecutor`` can spread the read+hash across IO + GIL-
+    releasing crypto, dramatically reducing wall-clock when many
+    files' stats changed at once.
+    """
+    try:
+        content = src_file.read_bytes()
+    except OSError:
+        return None
+    file_hash = hashlib.sha256(content).hexdigest()
+    new_hash = {
+        "sha256": file_hash,
+        "mtime_ns": cur_mtime,
+        "size": cur_size,
+    }
+    if file_hash == prev_sha:
+        # Content unchanged despite metadata change — no need to
+        # decode bytes / compute md5 / hold onto the source text.
+        return {
+            "rel_path": rel_path,
+            "new_hash": new_hash,
+            "changed": False,
+            "source_text": None,
+            "file_md5_hex": None,
+        }
+    file_md5_hex = hashlib.md5(content).hexdigest()
+    source_text = content.decode("utf-8", errors="replace")
+    return {
+        "rel_path": rel_path,
+        "new_hash": new_hash,
+        "changed": True,
+        "source_text": source_text,
+        "file_md5_hex": file_md5_hex,
+    }
+
+
+def _parallel_rehash(
+    jobs: list[tuple[Path, str, int, int, str | None]],
+    max_workers: int | None = None,
+) -> list[dict]:
+    """Fan out :func:`_rehash_file_for_incremental` across a
+    ``ThreadPoolExecutor``.
+
+    Each job tuple is ``(src_file, rel_path, cur_mtime, cur_size,
+    prev_sha)``. Returns a list of result dicts in submission order
+    (so callers preserving discovery order do not have to sort).
+
+    The worker cap mirrors the plan §12 recommendation
+    (``min(32, os.cpu_count() * 4)``). For small batches (≤ 8 jobs)
+    we run inline — thread-pool setup cost otherwise dominates the
+    savings on no-op incremental sweeps.
+    """
+    if not jobs:
+        return []
+    if len(jobs) <= 8:
+        # Inline path — keeps the cheap case cheap.
+        out: list[dict] = []
+        for j in jobs:
+            r = _rehash_file_for_incremental(*j)
+            if r is not None:
+                out.append(r)
+        return out
+    if max_workers is None:
+        max_workers = min(32, (os.cpu_count() or 4) * 4)
+    results: list[dict | None] = [None] * len(jobs)
+    with ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="apollo-rehash",
+    ) as ex:
+        futures = {
+            ex.submit(_rehash_file_for_incremental, *j): i
+            for i, j in enumerate(jobs)
+        }
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception:
+                results[i] = None
+    return [r for r in results if r is not None]
+
+
+def _push_embeds_to_queue(parsed: dict, rel_path: str, embed_queue) -> None:
+    """Phase 6 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — enqueue every
+    embedding-eligible node for ``parsed`` onto ``embed_queue``.
+
+    Reads source strings directly off the parser output (``functions``,
+    ``classes[].methods``, ``documents``, ``sections``) — they're still
+    in memory at this point even though Phase 4 stopped copying them
+    onto the node attrs. The queue's own enqueue is a fast no-op for
+    too-short texts and short-circuits on cache hits, so it's cheap to
+    call indiscriminately.
+
+    The ``code_block`` node type is omitted intentionally: pre-Phase-4
+    it carried ``cb["content"]`` (the un-fenced code body); post-Phase-4
+    ``get_source`` returns a slice that *includes* the ``` fence lines,
+    which the embedder downstream is fine with but for new-write
+    consistency we let the post-build ``embed_graph`` fallback handle
+    code-block embeddings via the same get_source path.
+    """
+    for f in parsed.get("functions", []) or []:
+        nid = f"func::{rel_path}::{f['name']}"
+        src = f.get("source")
+        if src:
+            embed_queue.enqueue(nid, src)
+    for c in parsed.get("classes", []) or []:
+        class_nid = f"class::{rel_path}::{c['name']}"
+        c_src = c.get("source")
+        if c_src:
+            embed_queue.enqueue(class_nid, c_src)
+        for m in c.get("methods", []) or []:
+            mnid = f"method::{rel_path}::{c['name']}::{m['name']}"
+            m_src = m.get("source")
+            if m_src:
+                embed_queue.enqueue(mnid, m_src)
+    for d in parsed.get("documents", []) or []:
+        nid = f"doc::{rel_path}"
+        d_src = d.get("content")
+        if d_src:
+            embed_queue.enqueue(nid, d_src)
+    for s in parsed.get("sections", []) or []:
+        nid = f"section::{rel_path}::L{s['line_start']}"
+        s_src = s.get("content")
+        if s_src:
+            embed_queue.enqueue(nid, s_src)
+
+
 def _parse_one(item: tuple) -> dict | None:
     """Parse a single file — top-level function for ProcessPoolExecutor.
 
@@ -177,20 +371,173 @@ def _parse_one(item: tuple) -> dict | None:
         }
 
     if parser is None:
-        return _minimal()
-    if source_text is not None:
-        parsed = parser.parse_source(source_text, str(src_file))
-    else:
-        parsed = parser.parse_file(str(src_file))
+        stub = _minimal()
+        # Phase 4: best-effort capture of the file text for the
+        # ``_file_text`` sidecar even on parser-less files (so the API's
+        # /api/node/{file_id} responses can still show the contents).
+        if source_text is None:
+            try:
+                source_text = src_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                source_text = None
+        if source_text is not None:
+            stub["_full_file_text"] = source_text
+        return stub
+    # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — capture the full
+    # file source text once per file so ``_build_file_nodes`` can stash
+    # a single copy in ``graph.graph["_file_text"]`` instead of letting
+    # every func/method/class/section/code_block carry its own slice.
+    # For the full-build path (``source_text is None``) this means
+    # routing through ``parse_source`` rather than ``parse_file`` so we
+    # don't read the bytes twice — every concrete plugin already
+    # implements ``parse_source`` (most ``parse_file``s just read +
+    # delegate to it).
+    if source_text is None:
+        try:
+            source_text = src_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return _minimal()
+    parsed = parser.parse_source(source_text, str(src_file))
     if parsed is None:
         # Plugin claimed the extension but bailed (size cap, exception,
         # empty body, …). Keep a stub so the file still gets a `file::`
         # node — losing the symbols is acceptable, losing the file is not.
-        return _minimal()
+        stub = _minimal()
+        stub["_full_file_text"] = source_text
+        return stub
     parsed["rel_path"] = rel_path
     if file_md5_hex is not None and not parsed.get("file_md5"):
         parsed["file_md5"] = file_md5_hex
+    # Phase 4 — attach the file text so ``_build_file_nodes`` can move
+    # it into ``self.graph.graph["_file_text"]``. The temporary
+    # ``_full_file_text`` key drops out of scope along with the parsed
+    # dict on the next streaming-build iteration.
+    parsed["_full_file_text"] = source_text
     return parsed
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 2 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — ProcessPoolExecutor
+# parser pool.
+#
+# Python AST parsing (the dominant cost in ``parse_and_build``) is
+# GIL-bound, so the legacy ``ThreadPoolExecutor`` only spreads I/O. To
+# actually use multiple CPU cores we run ``_parse_one`` in a process
+# pool. Parser *instances* are not portable across processes (tree-
+# sitter parsers hold C handles, etc.), so each work-item references
+# the parser by a **stable string key** (``type(parser).__module__``)
+# and the worker resolves it against a module-global table that is
+# populated once per worker via the pool's ``initializer``.
+#
+# The pool mode is selected per-call (the streaming-build method takes
+# a ``parser_pool=`` kwarg) or globally via the ``APOLLO_PARSER_POOL``
+# environment variable (values: ``process`` (default) / ``thread`` /
+# ``sync``). When ``process`` is requested but any enabled parser
+# advertises ``safe_for_processes = False`` we transparently fall back
+# to ``thread`` so plugins with unpickle-able state stay correct.
+# ─────────────────────────────────────────────────────────────────────
+
+# Populated once per worker process by ``_init_worker_parsers``. Maps
+# the parser key (``type(parser).__module__``) → fresh ``BaseParser``
+# instance built inside the worker.
+_WORKER_PARSERS: dict[str, BaseParser] | None = None
+
+
+def _parser_key(parser: BaseParser | None) -> str | None:
+    """Stable per-parser identifier safe to ship across processes.
+
+    Uses the parser class's defining module (e.g.
+    ``plugins.python3.parser``) which is deterministic across worker
+    processes because :func:`apollo.plugins.discover_plugins` walks the
+    ``plugins/`` package the same way in every interpreter. Returns
+    ``None`` for the parser-less fallback (text-only files / files
+    whose extension no plugin claims).
+    """
+    if parser is None:
+        return None
+    return type(parser).__module__
+
+
+def _init_worker_parsers() -> None:
+    """ProcessPoolExecutor initializer: re-discover plugins per worker.
+
+    Called exactly once at worker startup. Re-imports every plugin in
+    a fresh interpreter (spawn-safe) so any C handles, grammars, or
+    other unpickle-able state is constructed inside the worker rather
+    than carried across the pickle boundary.
+
+    Failures are swallowed (logged via ``discover_plugins`` itself) so
+    a single broken plugin does not poison every worker — the worker
+    table just won't contain that key and ``_parse_one_process`` will
+    fall through to the parser-less stub path.
+    """
+    global _WORKER_PARSERS
+    try:
+        from apollo.plugins import discover_plugins
+        parsers = discover_plugins()
+    except Exception:
+        parsers = []
+    _WORKER_PARSERS = {_parser_key(p): p for p in parsers if p is not None}
+
+
+def _parse_one_process(item: tuple) -> dict | None:
+    """ProcessPool variant of :func:`_parse_one`.
+
+    Work-item shape is ``(parser_key, src_file, rel_path, source_text,
+    file_md5_hex)`` — i.e. identical to the thread-pool tuple except
+    the first slot is the stable string key. The worker resolves the
+    key against ``_WORKER_PARSERS`` (populated by
+    :func:`_init_worker_parsers`) and delegates to :func:`_parse_one`.
+    """
+    parser_key, src_file, rel_path, source_text, file_md5_hex = item
+    parser: BaseParser | None = None
+    if parser_key is not None and _WORKER_PARSERS is not None:
+        parser = _WORKER_PARSERS.get(parser_key)
+    return _parse_one(
+        (parser, src_file, rel_path, source_text, file_md5_hex)
+    )
+
+
+def _resolve_parser_pool_mode(
+    parsers: list[BaseParser],
+    requested: str | None = None,
+) -> str:
+    """Pick the parser-pool mode for the current build.
+
+    Resolution order (highest precedence first):
+
+    1. Explicit ``requested`` kwarg (``"thread"``/``"process"``/``"sync"``).
+    2. ``APOLLO_PARSER_POOL`` environment variable.
+    3. Default: ``"process"`` (Phase 2 — uses multiple CPU cores;
+       auto-downgrades to ``"thread"`` if any parser opts out).
+
+    If the resolved mode is ``"process"`` but any parser opts out via
+    ``getattr(parser, "safe_for_processes", True) is False``, the mode
+    is downgraded to ``"thread"`` and a one-line note is logged. This
+    keeps plugins with C handles / unpickle-able state correct without
+    requiring the caller to know the implementation details.
+    """
+    mode = (requested
+            or os.environ.get("APOLLO_PARSER_POOL")
+            or "process").lower()
+    if mode not in ("thread", "process", "sync"):
+        mode = "process"
+    if mode == "process":
+        unsafe = [
+            type(p).__module__
+            for p in parsers
+            if getattr(p, "safe_for_processes", True) is False
+        ]
+        if unsafe:
+            # Lazy import to avoid a logger configuration cycle.
+            import logging
+            logging.getLogger(__name__).info(
+                "parser_pool=process requested but unsafe parsers "
+                "detected (%s); falling back to thread pool",
+                ", ".join(sorted(unsafe)),
+            )
+            mode = "thread"
+    return mode
 
 
 class GraphBuilder:
@@ -312,8 +659,20 @@ class GraphBuilder:
                 return False
         return True
 
-    def build(self, root_dir: str) -> nx.DiGraph:
-        """Scan a directory and build the full graph."""
+    def build(self, root_dir: str, embed_queue=None) -> nx.DiGraph:
+        """Scan a directory and build the full graph.
+
+        Phase 6 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: when
+        ``embed_queue`` is supplied (an
+        :class:`apollo.embeddings.embed_queue.EmbedQueue` instance),
+        eligible nodes are pushed onto it the moment their file's
+        ``_build_file_nodes`` call returns. The queue's background
+        worker overlaps embedding compute with the remaining parses,
+        so the total ``_do_index`` wall-clock drops from
+        ``parse + embed`` to ``max(parse, embed)``. Caller must invoke
+        ``embed_queue.close_and_join()`` to drain after ``build``
+        returns.
+        """
         root = Path(root_dir).resolve()
         if not root.is_dir():
             raise ValueError(f"Not a directory: {root}")
@@ -326,16 +685,25 @@ class GraphBuilder:
         # Build directory nodes lazily from discovered file paths
         self._build_dir_nodes_lazy(root, dir_set)
 
-        # Parse files in parallel
-        parsed_files = self._parse_files_parallel(files_to_parse)
+        # Stream parser-pool output directly into _build_file_nodes;
+        # ``_parse_build_resolve_streaming`` returns small resolve
+        # records (one per file) instead of the full parsed dicts so
+        # the per-file source text + docstrings + sections + … are
+        # freed as soon as the file's nodes are in the graph. See
+        # PLAN_INDEX_MEMORY_AND_CONCURRENCY §4 (Phase 1). When
+        # ``embed_queue`` is supplied, each file's embedding-eligible
+        # nodes are enqueued the moment they land in the graph
+        # (Phase 6).
+        resolve_records = self._parse_build_resolve_streaming(
+            files_to_parse, embed_queue=embed_queue,
+        )
 
-        # Build nodes sequentially (NetworkX is not thread-safe)
-        for parsed in parsed_files:
-            self._build_file_nodes(parsed, parsed["rel_path"])
-
-        # Phase 2: Resolve cross-file edges
-        for parsed in parsed_files:
-            self._resolve_calls(parsed)
+        # Phase 2: Resolve cross-file edges (symbol table is now
+        # fully populated because every _build_file_nodes call ran
+        # during streaming).
+        assert self._symbol_table is not None, "symbol table missing"
+        for rec in resolve_records:
+            self._resolve_calls(rec)
 
         return self.graph
 
@@ -369,6 +737,12 @@ class GraphBuilder:
         # ``self._file_stats`` instead of stat()'ing each file again.
         files_to_parse: list[tuple[BaseParser, Path, str, str | None, str | None]] = []
         discovered_stats = self._file_stats
+        # Phase 9 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — collect
+        # rehash jobs (the stat-mismatched files) in one pass, then
+        # fan them out via ``_parallel_rehash`` instead of doing the
+        # disk read + SHA256 + MD5 inline on the main thread.
+        rehash_jobs: list[tuple] = []
+        rehash_parser_map: dict[str, BaseParser] = {}
         for parser, src_file, rel_path, _src_text, _md5 in files_to_parse_all:
             cached_st = discovered_stats.get(rel_path)
             if cached_st is None:
@@ -395,42 +769,35 @@ class GraphBuilder:
                 new_hashes[rel_path] = prev
                 continue
 
-            # Metadata changed — read and hash
-            try:
-                content = src_file.read_bytes()
-            except OSError:
-                continue
-            file_hash = hashlib.sha256(content).hexdigest()
-            source_text = content.decode("utf-8", errors="replace")
-            # We already have the bytes in memory — compute the md5
-            # used by the file node here so ``_build_file_nodes`` does
-            # not re-read the same file from disk. The on-disk read
-            # was previously the dominant cost on a no-op incremental
-            # over a large project.
-            file_md5_hex = hashlib.md5(content).hexdigest()
+            # Stat differs — queue for parallel read+hash.
+            rehash_jobs.append((src_file, rel_path, cur_mtime, cur_size, prev_sha))
+            rehash_parser_map[rel_path] = parser
 
-            new_hashes[rel_path] = {
-                "sha256": file_hash,
-                "mtime_ns": cur_mtime,
-                "size": cur_size,
-            }
-
-            if file_hash == prev_sha:
+        # Phase 9: parallel disk-read + SHA256 + MD5 across the
+        # stat-mismatched files. The helper transparently falls back
+        # to an inline loop for tiny batches.
+        for rec in _parallel_rehash(rehash_jobs):
+            rel_path = rec["rel_path"]
+            new_hashes[rel_path] = rec["new_hash"]
+            if not rec["changed"]:
                 continue  # Content unchanged despite metadata change
+            files_to_parse.append((
+                rehash_parser_map[rel_path],
+                # _discover_files puts the absolute Path here; reconstruct.
+                self._root / rel_path,
+                rel_path,
+                rec["source_text"],
+                rec["file_md5_hex"],
+            ))
 
-            # Pass source_text so parser doesn't re-read from disk
-            files_to_parse.append((parser, src_file, rel_path, source_text, file_md5_hex))
-
-        # Parse changed files in parallel
-        parsed_files = self._parse_files_parallel(files_to_parse)
-
-        # Build nodes sequentially (NetworkX is not thread-safe)
-        for parsed in parsed_files:
-            self._build_file_nodes(parsed, parsed["rel_path"])
+        # Stream parse → build → resolve (Phase 1). Same memory-saving
+        # rationale as ``build()`` above: the per-file ``parsed`` dicts
+        # are freed as soon as their nodes land in the graph.
+        resolve_records = self._parse_build_resolve_streaming(files_to_parse)
 
         # Phase 2: Resolve cross-file edges
-        for parsed in parsed_files:
-            self._resolve_calls(parsed)
+        for rec in resolve_records:
+            self._resolve_calls(rec)
 
         return self.graph, new_hashes
 
@@ -575,7 +942,16 @@ class GraphBuilder:
         self,
         files: list[tuple[BaseParser, Path, str, str | None, str | None]],
     ) -> list[dict]:
-        """Parse files concurrently using a thread pool."""
+        """Parse files concurrently using a thread pool.
+
+        .. deprecated:: Phase 1 (PLAN_INDEX_MEMORY_AND_CONCURRENCY)
+           Prefer :meth:`_parse_build_resolve_streaming` for the main
+           build paths — it streams parser-pool output directly into
+           ``_build_file_nodes`` so the large ``parsed`` dicts can be
+           garbage-collected mid-build. This method is kept for callers
+           that still want a materialized list (e.g. tests, ad-hoc
+           tooling).
+        """
         if not files:
             return []
 
@@ -592,6 +968,149 @@ class GraphBuilder:
                     results.append(parsed)
         return results
 
+    def _parse_build_resolve_streaming(
+        self,
+        files: list[tuple[BaseParser, Path, str, str | None, str | None]],
+        embed_queue=None,
+        parser_pool: str | None = None,
+    ) -> list[dict]:
+        """Stream the parser pool output into ``_build_file_nodes`` and
+        return a list of *minimal resolve records*.
+
+        Phase 1 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — stops holding the
+        full ``parsed_files`` list in RAM while the graph builds.
+
+        Each future's ``parsed`` dict is consumed as soon as it
+        completes: nodes are written into ``self.graph``, then a tiny
+        :func:`_minimal_resolve_record` is extracted, and the original
+        ``parsed`` dict goes out of scope. For a 10 k-file project this
+        replaces hundreds of MB of per-file source-text dicts kept alive
+        through resolve with a few-KB-per-file resolve record (only
+        ``imports`` + ``functions[name,calls]`` +
+        ``classes[name,methods[name,calls]]``).
+
+        Phase 6: when ``embed_queue`` is supplied, eligible nodes for
+        the just-built file are pushed onto the queue right after
+        ``_build_file_nodes`` returns. We read the source strings off
+        the parser-supplied ``parsed`` dict (they're still alive at
+        this point — they're consumed by ``_build_file_nodes`` for
+        ``source_md5`` but dropped from the node attrs by Phase 4).
+        Using the parser strings directly avoids a redundant
+        file-text slice via :func:`graph.query.get_source` and keeps
+        the enqueue path on the critical streaming-build loop fast.
+
+        Phase 2: ``parser_pool`` selects the executor flavour
+        (``"thread"`` / ``"process"`` / ``"sync"``). ``None`` falls
+        back to the ``APOLLO_PARSER_POOL`` env var and finally to
+        ``"thread"`` for backward compatibility. Process-mode parses
+        on a ``ProcessPoolExecutor`` to side-step the GIL on AST-bound
+        plugins (python3, markdown, …); sync-mode runs in the caller's
+        thread (useful for deterministic test output / debugging).
+
+        Returns
+        -------
+        list[dict]
+            Resolve records (one per parsed file). The caller iterates
+            these and calls :meth:`_resolve_calls` on each.
+        """
+        if not files:
+            return []
+
+        mode = _resolve_parser_pool_mode(self._parsers, parser_pool)
+        records: list[dict] = []
+
+        # ── sync mode: no pool, no pickling overhead, simplest GC path ──
+        if mode == "sync":
+            for item in files:
+                try:
+                    parsed = _parse_one(item)
+                except Exception:
+                    continue
+                if parsed is None:
+                    continue
+                rel_path = parsed["rel_path"]
+                self._build_file_nodes(parsed, rel_path)
+                if embed_queue is not None:
+                    _push_embeds_to_queue(parsed, rel_path, embed_queue)
+                records.append(_minimal_resolve_record(parsed))
+                del parsed
+            return records
+
+        # ── process mode: per-item key swap so parser instances stay
+        # in the parent and the worker rebuilds its own copy ───────────
+        if mode == "process":
+            # Cap at len(files) so we don't spawn 16 workers for a
+            # 3-file rebuild — the spawn cost would dwarf the parse.
+            max_workers = min(len(files), os.cpu_count() or 4)
+            # Allow tests/bench to override via env without touching
+            # the call site (matches the legacy ``APOLLO_PARSER_MAX_WORKERS``).
+            try:
+                env_cap = int(os.environ.get("APOLLO_PARSER_MAX_WORKERS", "0"))
+            except ValueError:
+                env_cap = 0
+            if env_cap > 0:
+                max_workers = min(max_workers, env_cap)
+            # Swap each item's parser instance for its stable key so
+            # the work-item tuple is fully picklable.
+            keyed_items = [
+                (_parser_key(p), src, rel, src_text, md5)
+                for (p, src, rel, src_text, md5) in files
+            ]
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_init_worker_parsers,
+            ) as executor:
+                # ``chunksize`` amortizes the per-task pickling cost so
+                # tiny files don't pay full IPC overhead each.
+                for parsed in executor.map(
+                    _parse_one_process, keyed_items, chunksize=8,
+                ):
+                    if parsed is None:
+                        continue
+                    rel_path = parsed["rel_path"]
+                    self._build_file_nodes(parsed, rel_path)
+                    if embed_queue is not None:
+                        _push_embeds_to_queue(parsed, rel_path, embed_queue)
+                    records.append(_minimal_resolve_record(parsed))
+                    del parsed
+            return records
+
+        # ── thread mode (default / legacy behavior) ────────────────────
+        max_workers = min(len(files), os.cpu_count() or 4)
+        try:
+            env_cap = int(os.environ.get("APOLLO_PARSER_MAX_WORKERS", "0"))
+        except ValueError:
+            env_cap = 0
+        if env_cap > 0:
+            max_workers = min(max_workers, env_cap)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_parse_one, f) for f in files]
+            for future in as_completed(futures):
+                try:
+                    parsed = future.result()
+                except Exception:
+                    continue
+                if parsed is None:
+                    continue
+                rel_path = parsed["rel_path"]
+                # Build nodes *now*, while the parsed dict is still alive,
+                # then immediately extract the tiny resolve record. The
+                # parsed dict drops out of scope on the next loop iteration
+                # — including the per-function/class ``source`` strings,
+                # docstrings, markdown sections, code blocks, etc.
+                self._build_file_nodes(parsed, rel_path)
+                if embed_queue is not None:
+                    # Phase 6: enqueue *after* the nodes are in the
+                    # graph so the worker's
+                    # ``self.graph.nodes[nid]["embedding"] = ...``
+                    # never races against ``add_node``.
+                    _push_embeds_to_queue(parsed, rel_path, embed_queue)
+                records.append(_minimal_resolve_record(parsed))
+                # Defensive: drop our local reference too so the GC has
+                # nothing holding the dict alive at the top of the loop.
+                del parsed
+        return records
+
     def _find_parser(self, filepath: str) -> BaseParser | None:
         """Return the first parser that can handle *filepath*."""
         for parser in self._parsers:
@@ -602,6 +1121,19 @@ class GraphBuilder:
     def _build_file_nodes(self, parsed: dict, rel_path: str):
         """Create file, function, class, and import nodes from parsed data."""
         file_id = f"file::{rel_path}"
+
+        # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: stash the file's
+        # full source text in a graph-level sidecar map so we can drop
+        # the per-node ``source`` attr that otherwise duplicates the
+        # same characters across every func/method/class/section node.
+        # ``_parse_one`` attaches ``_full_file_text`` to the parsed
+        # dict; pop it here so the temporary key doesn't leak into any
+        # downstream consumer of the parsed dict (the resolve records
+        # already exclude it).
+        full_text = parsed.pop("_full_file_text", None)
+        if isinstance(full_text, str):
+            ft_map = self.graph.graph.setdefault("_file_text", {})
+            ft_map[rel_path] = full_text
 
         file_md5 = parsed.get("file_md5")
         if file_md5 is None:
@@ -631,6 +1163,9 @@ class GraphBuilder:
         for func in parsed["functions"]:
             func_id = f"func::{rel_path}::{func['name']}"
             func_md5 = hashlib.md5(func.get("source", "").encode()).hexdigest()
+            # Phase 4: no per-node ``source`` attr — readers slice from
+            # ``graph.graph["_file_text"]`` via :func:`graph.query.get_source`
+            # using the ``line_start``/``line_end`` range stored below.
             self.graph.add_node(
                 func_id,
                 type="function",
@@ -638,7 +1173,6 @@ class GraphBuilder:
                 path=rel_path,
                 line_start=func["line_start"],
                 line_end=func["line_end"],
-                source=func["source"],
                 args=func.get("args", []),
                 params=func.get("params", []),
                 return_annotation=func.get("return_annotation"),
@@ -673,6 +1207,8 @@ class GraphBuilder:
         # Classes
         for cls in parsed["classes"]:
             class_id = f"class::{rel_path}::{cls['name']}"
+            # Phase 4: see comment above on functions — source is now
+            # sliced lazily from ``_file_text``.
             self.graph.add_node(
                 class_id,
                 type="class",
@@ -680,7 +1216,6 @@ class GraphBuilder:
                 path=rel_path,
                 line_start=cls["line_start"],
                 line_end=cls["line_end"],
-                source=cls["source"],
                 bases=cls["bases"],
                 decorators=cls.get("decorators", []),
                 docstring=cls.get("docstring"),
@@ -711,7 +1246,10 @@ class GraphBuilder:
             # Methods
             for method in cls["methods"]:
                 method_id = f"method::{rel_path}::{cls['name']}::{method['name']}"
-                method_source = method.get("source", "")
+                # Phase 4: no per-node ``source`` attr — see comment on
+                # functions above. ``line_start``/``line_end`` are kept
+                # so :func:`graph.query.get_source` can slice the
+                # file-text sidecar on demand.
                 self.graph.add_node(
                     method_id,
                     type="method",
@@ -719,7 +1257,6 @@ class GraphBuilder:
                     path=rel_path,
                     line_start=method["line_start"],
                     line_end=method["line_end"],
-                    source=method_source,
                     parent_class=cls["name"],
                     args=method.get("args", []),
                     params=method.get("params", []),
@@ -839,6 +1376,8 @@ class GraphBuilder:
         # Documents (non-code files: Markdown, JSON, YAML, CSV, text)
         for doc in parsed.get("documents", []):
             doc_id = f"doc::{rel_path}"
+            # Phase 4: document content is a slice of the file-text
+            # sidecar; ``get_source`` will return it on demand.
             self.graph.add_node(
                 doc_id,
                 type="document",
@@ -847,7 +1386,6 @@ class GraphBuilder:
                 path=rel_path,
                 line_start=doc["line_start"],
                 line_end=doc["line_end"],
-                source=doc["content"],
                 frontmatter=parsed.get("frontmatter"),
                 title=parsed.get("title"),
             )
@@ -856,6 +1394,9 @@ class GraphBuilder:
         # Markdown sections (heading-based hierarchy)
         for sec in parsed.get("sections", []):
             sec_id = f"section::{rel_path}::L{sec['line_start']}"
+            # Phase 4: section content is reconstructed from the
+            # file-text sidecar on read; ``line_start``/``line_end``
+            # span the heading + body region the parser identified.
             self.graph.add_node(
                 sec_id,
                 type="section",
@@ -864,7 +1405,6 @@ class GraphBuilder:
                 level=sec["level"],
                 line_start=sec["line_start"],
                 line_end=sec["line_end"],
-                source=sec["content"],
                 parent_section=sec.get("parent_section"),
             )
             self.graph.add_edge(file_id, sec_id, type="defines")
@@ -873,6 +1413,13 @@ class GraphBuilder:
         for cb in parsed.get("code_blocks", []):
             cb_id = f"codeblock::{rel_path}::L{cb['line_start']}"
             label = f"```{cb['language']}" if cb.get("language") else "```"
+            # Phase 4: code-block content is sliced lazily from
+            # ``_file_text``. The sliced region includes the ``` fence
+            # lines, which is a small textual difference vs. the
+            # pre-Phase-4 ``cb["content"]`` (which the parser stripped);
+            # this is acceptable for embedding/keyword purposes — the
+            # ~6 extra fence chars do not meaningfully change the
+            # semantic-search behaviour.
             self.graph.add_node(
                 cb_id,
                 type="code_block",
@@ -881,7 +1428,6 @@ class GraphBuilder:
                 language=cb.get("language"),
                 line_start=cb["line_start"],
                 line_end=cb["line_end"],
-                source=cb["content"],
             )
             self.graph.add_edge(file_id, cb_id, type="defines")
 

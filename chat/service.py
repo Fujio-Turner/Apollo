@@ -417,7 +417,14 @@ class ChatService:
             if node_id not in self.graph:
                 return json.dumps({"error": f"Node not found: {node_id}"})
 
-            data = {k: v for k, v in self.graph.nodes[node_id].items() if k != "embedding"}
+            # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the
+            # per-node ``source`` attr is gone — resolve it via
+            # :func:`graph.query.get_source`, then truncate as before
+            # so we don't blow the model's context window.
+            from apollo.graph.query import get_source
+
+            data = {k: v for k, v in self.graph.nodes[node_id].items()
+                    if k not in ("embedding", "source")}
 
             edges_in = []
             for pred in self.graph.predecessors(node_id):
@@ -429,11 +436,10 @@ class ChatService:
                 edata = dict(self.graph.edges[node_id, succ])
                 edges_out.append({"target": succ, "type": edata.get("type", "")})
 
-            # Truncate source to avoid blowing context
-            source = data.get("source", "")
-            if len(source) > 2000:
-                source = source[:2000] + "\n... (truncated)"
-                data = dict(data)
+            source = get_source(self.graph, node_id)
+            if source:
+                if len(source) > 2000:
+                    source = source[:2000] + "\n... (truncated)"
                 data["source"] = source
 
             return json.dumps({"id": node_id, **data, "edges_in": edges_in, "edges_out": edges_out}, default=str)
