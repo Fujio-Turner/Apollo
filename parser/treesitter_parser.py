@@ -89,6 +89,14 @@ _EXT_MAP: dict[str, tuple[str, callable]] = {
 class TreeSitterParser(BaseParser):
     """Multi-language parser backed by tree-sitter."""
 
+    # Tree-sitter Language/Parser objects wrap C handles that cannot
+    # be safely pickled across the ProcessPoolExecutor boundary, and
+    # this parser is not registered through ``apollo.plugins.discover_plugins``
+    # so a worker subprocess cannot reconstruct it from its module key
+    # either. Opt out of the process-pool parser path; the streaming
+    # builder will transparently downgrade to the thread pool.
+    safe_for_processes = False
+
     def __init__(self) -> None:
         # lang_key → Language (cached after first load)
         self._languages: dict[str, Language | None] = {}

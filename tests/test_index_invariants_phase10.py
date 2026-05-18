@@ -88,6 +88,12 @@ class _WeakableDict(dict):
 def test_phase1_invariant_parsed_dicts_are_reclaimed(tmp_path, monkeypatch):
     _write_sample(tmp_path)
 
+    # The monkeypatch on ``_parse_one`` below only takes effect when
+    # the streaming build uses the in-process thread pool. Pin the
+    # parser-pool mode explicitly so this assertion is meaningful even
+    # when the project-default mode changes (e.g. Phase 2 process pool).
+    monkeypatch.setenv("APOLLO_PARSER_POOL", "thread")
+
     weak_refs: list[weakref.ref] = []
     real = builder_mod._parse_one
 

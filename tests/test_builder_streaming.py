@@ -157,6 +157,12 @@ def test_streaming_drops_parsed_dicts_midbuild(tmp_path, monkeypatch):
     """
     _write_sample_project(tmp_path)
 
+    # The monkeypatch on ``_parse_one`` below only takes effect when
+    # the streaming build runs in the in-process thread pool. Pin the
+    # parser-pool mode so the Phase 1 assertion stays meaningful even
+    # when the project-default mode is the Phase 2 process pool.
+    monkeypatch.setenv("APOLLO_PARSER_POOL", "thread")
+
     weak_refs: list[weakref.ref] = []
     real_parse_one = builder_mod._parse_one
     call_count = {"n": 0}
