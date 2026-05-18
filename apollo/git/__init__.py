@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Git-aware helpers for Apollo.
 
 This subpackage exists so the rest of the codebase can stay

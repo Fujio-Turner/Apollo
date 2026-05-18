@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Go 1.x plugin package."""
 from .parser import GoParser
 

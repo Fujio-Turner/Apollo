@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 2 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — parser-pool modes.
 
 Pins:

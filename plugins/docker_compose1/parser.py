@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.docker_compose1 — Docker Compose plugin for Apollo
 ===========================================================

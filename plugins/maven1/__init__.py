@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Maven plugin package for Apollo."""
 from .parser import MavenParser
 

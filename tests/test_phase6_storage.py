@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for Phase 6: Storage backend and CBL lifecycle."""
 
 import hashlib

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.pdf_pypdf — PDF plugin for Apollo (powered by ``pypdf``)
 ================================================================

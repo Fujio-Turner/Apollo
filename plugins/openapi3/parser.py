@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 OpenAPI 3 plugin for Apollo — parses OpenAPI 3.x YAML/JSON specs.
 

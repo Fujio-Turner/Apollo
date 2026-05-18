@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 JSON Schema plugin for Apollo — parses .schema.json files.
 

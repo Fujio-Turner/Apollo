@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.sql1 — SQL script plugin for Apollo
 ===========================================

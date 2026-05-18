@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """User annotations: highlights, bookmarks, notes, tags.
 
 Stored as `<project>/_apollo/annotations.json`. Simple JSON-backed

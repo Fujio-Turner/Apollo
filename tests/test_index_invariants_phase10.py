@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 10 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — invariant guards.
 
 Each phase 1-9 of the index-memory-and-concurrency plan introduced a

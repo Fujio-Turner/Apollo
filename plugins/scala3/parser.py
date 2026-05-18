@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.scala3 — Scala 3 source-file plugin for Apollo
 =======================================================

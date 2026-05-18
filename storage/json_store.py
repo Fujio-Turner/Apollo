@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 JSON storage backend — saves and loads the graph as JSON files.
 

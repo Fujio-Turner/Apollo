@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Standardized response shapes for the Apollo HTTP API (Phase 14).
 
 All API errors flow through `ErrorResponse` so clients see a stable shape:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """CLI integration tests for the new `search --expand` flags (Phase B).
 
 Drives :func:`main.cmd_search` directly rather than via subprocess so

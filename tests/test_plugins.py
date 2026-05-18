@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for the plugin discovery system in ``plugins/``."""
 from __future__ import annotations
 

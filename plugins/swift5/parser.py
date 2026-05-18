@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.swift5 — Swift source-file plugin for Apollo
 ====================================================

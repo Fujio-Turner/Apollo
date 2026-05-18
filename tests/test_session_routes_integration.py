@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Integration tests for session_routes using a real SessionManager + TestClient.
 
 NOTE: There is a route-ordering bug in apollo/projects/session_routes.py — the

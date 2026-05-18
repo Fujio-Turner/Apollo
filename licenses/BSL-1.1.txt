@@ -3,6 +3,31 @@ Business Source License 1.1
 License text copyright © 2017 MariaDB Corporation Ab, All Rights Reserved.
 "Business Source License" is a trademark of MariaDB Corporation Ab.
 
+-----------------------------------------------------------------------------
+
+Parameters
+
+Licensor:             Fujio Turner
+Licensed Work:        Apollo
+                      The Licensed Work is © 2026 Fujio Turner.
+Additional Use Grant: None.  No production use of the Licensed Work is
+                      permitted under this License.  To obtain production
+                      use, you must purchase a commercial license from the
+                      Licensor.
+Change Date:          2030-05-18
+Change License:       Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed
+Work, please contact the Licensor at: mail@fuj.io
+
+Notice
+
+The Business Source License (this document, or the "License") is not an
+Open Source license.  However, the Licensed Work will eventually be made
+available under an Open Source license, as stated in this License.
+
+-----------------------------------------------------------------------------
+
 Terms
 
 The Licensor hereby grants you the right to copy, modify, create derivative

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.c1 — C source-file plugin for Apollo
 ============================================

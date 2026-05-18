@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 TOML 1 plugin for Apollo — parses .toml files.
 

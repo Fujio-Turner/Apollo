@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Query-time chat tools — pure reads off the ML payload.
 
 Every tool returns a TOON-friendly uniform-array payload (matching the

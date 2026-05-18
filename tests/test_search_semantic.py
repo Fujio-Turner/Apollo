@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for search.semantic.SemanticSearch."""
 import networkx as nx
 import pytest

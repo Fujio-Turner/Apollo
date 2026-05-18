@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 7 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Pins:

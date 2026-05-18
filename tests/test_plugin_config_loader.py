@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for the Phase 2A loader work:
 
 * ``apollo.projects.settings.load_plugin_config()`` merges on-disk

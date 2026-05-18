@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for apollo.projects.reindex (ReindexHistory + ReindexOrchestrator)."""
 import json
 import time

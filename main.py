@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BUSL-1.1
 """
 Apollo CLI — index a directory and query the code knowledge graph.
 

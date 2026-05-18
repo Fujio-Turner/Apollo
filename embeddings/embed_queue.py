@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Background embedding worker — Phase 6 of
 PLAN_INDEX_MEMORY_AND_CONCURRENCY.
 

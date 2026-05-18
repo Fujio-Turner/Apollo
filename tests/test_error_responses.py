@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 14 — unit tests for the standardized error response shapes."""
 from __future__ import annotations
 

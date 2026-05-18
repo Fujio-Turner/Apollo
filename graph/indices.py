@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Cached, lazy reverse-indices over a NetworkX graph.
 

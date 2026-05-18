@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Graph query engine — structural queries over the knowledge graph.
 """

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 14 — tests for the response-validation middleware and ResponseValidator."""
 from __future__ import annotations
 

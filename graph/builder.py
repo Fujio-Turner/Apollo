@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Graph builder — constructs a NetworkX directed graph from parsed source files.
 

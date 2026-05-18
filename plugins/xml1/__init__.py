@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 XML 1 plugin package for Apollo.
 

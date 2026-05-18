@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Apollo ML module — index-time precomputation + query-time chat tools.
 
 See `docs/work/PLAN_ML_LIBS.md` for the design and per-phase rationale.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.typescript1 — TypeScript source-file plugin for Apollo
 ==============================================================

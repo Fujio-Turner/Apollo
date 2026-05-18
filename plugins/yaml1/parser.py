@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 YAML 1 plugin for Apollo — parses .yaml/.yml files.
 

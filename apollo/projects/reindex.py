@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Reindex orchestration and telemetry for projects."""
 from __future__ import annotations
 

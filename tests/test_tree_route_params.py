@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """§7.3 follow-up — `/api/tree` honours `depth` and `glob` query params.
 
 Resolves the known follow-up captured in

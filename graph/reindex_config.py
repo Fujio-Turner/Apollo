@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Configuration for incremental re-indexing strategies and background sweeps."""
 from __future__ import annotations
 

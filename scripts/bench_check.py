@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BUSL-1.1
 """Compare two ``bench_index`` JSON reports and flag regressions.
 
 Phase 10 of ``docs/work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`` calls for

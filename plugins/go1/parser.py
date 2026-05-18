@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.go1 — Go 1.x source-file plugin for Apollo
 ===================================================

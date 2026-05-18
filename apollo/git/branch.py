@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Branch-aware path helpers.
 
 Apollo indexes a project once per *branch* (DESIGN §4.2.3). Switching

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Compatibility shim: expose top-level packages under the ``apollo`` namespace."""
 import importlib
 import importlib.abc

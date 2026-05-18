@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 1 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Asserts that ``GraphBuilder._parse_build_resolve_streaming`` actually

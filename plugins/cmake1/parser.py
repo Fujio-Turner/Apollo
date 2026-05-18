@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.cmake1 — CMake plugin for Apollo
 =========================================

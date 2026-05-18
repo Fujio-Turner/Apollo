@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Integration tests for the `/api/search` endpoint with combined
 semantic + graph-expansion params (Phase C).
 """

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Couchbase Lite storage backend — persists the graph in a CBL database.
 

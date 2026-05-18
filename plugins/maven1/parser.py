@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.maven1 — Maven pom.xml plugin for Apollo.
 

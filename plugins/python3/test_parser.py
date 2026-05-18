@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Self-contained smoke tests for the python3 plugin.
 
 These tests live **inside the plugin folder** so removing the plugin is

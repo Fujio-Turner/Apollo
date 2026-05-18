@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Unit tests for TreeSitterParser — multi-language parser backend."""
 import pytest
 from pathlib import Path

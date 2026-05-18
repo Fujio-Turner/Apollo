@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.github_actions1 — GitHub Actions workflow plugin for Apollo.
 

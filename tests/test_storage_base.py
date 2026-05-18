@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for storage.base.GraphStore Protocol."""
 from storage.base import GraphStore
 from storage.json_store import JsonStore

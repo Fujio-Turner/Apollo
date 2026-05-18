@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Index-time ML passes — Phase 1-4 of `docs/work/PLAN_ML_LIBS.md`.
 
 Each pass writes its result onto the node payload (or onto a small

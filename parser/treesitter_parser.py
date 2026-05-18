@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Tree-sitter multi-language parser — extracts functions, classes, imports,
 and call sites from Python, JavaScript/TypeScript, Go, and Rust files.

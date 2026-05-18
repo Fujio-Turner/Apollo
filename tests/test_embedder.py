@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for embeddings.embedder.Embedder.
 
 Mocks SentenceTransformer to avoid the heavy dependency at test time.

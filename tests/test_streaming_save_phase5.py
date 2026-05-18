@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 5 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Asserts that ``JsonStore.save`` now streams the document directly to

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for the `search_graph_expanded` chat tool (Phase D).
 
 Drives :meth:`ChatService._exec_tool_impl` directly with a fake

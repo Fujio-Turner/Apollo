@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for combined semantic + graph-expansion search (Phase A).
 
 Covers ``search.expand.expand_hits`` and

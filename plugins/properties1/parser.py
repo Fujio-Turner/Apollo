@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.properties1 — Java properties files plugin for Apollo.
 

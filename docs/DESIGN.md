@@ -2876,3 +2876,116 @@ is a pure optimization gated on observed need.
 - Log queue depth and idle/max-wait flushes at INFO under the
   `apollo.reindex.queue` logger per [`guides/LOGGING.md`](../guides/LOGGING.md).
   No `print()`.
+
+---
+
+## 16. Hybrid Graph + Spatial Re-ranking
+
+> Full treatment: [`docs/HYBRID_GRAPH_SPATIAL.md`](HYBRID_GRAPH_SPATIAL.md) — white-paper-style write-up with worked examples, failure modes, the functional-programming form, and the underlying math.
+
+Apollo already produces **two independent views** of every node:
+
+| View      | Source                                      | What it answers                           |
+|-----------|---------------------------------------------|-------------------------------------------|
+| Graph     | parser-derived edges (`calls`, `imports`, …) | "what is *syntactically* connected to X?" |
+| Spatial   | [`spatial.py`](../spatial.py) → `(x, y, z, face)` | "what is *semantically/architecturally* close to X?" |
+
+Until now they have been queried in isolation. §16 formalises a single
+**consensus operator** that combines them, plus the cross-product table
+that turns disagreement between the two views into a useful signal.
+
+### 16.1 The 2×2 of agreement
+
+| Graph edge? | Spatially close? | Meaning                                                  | Use                                              |
+|-------------|------------------|----------------------------------------------------------|--------------------------------------------------|
+| yes         | yes              | strongly relevant — high-confidence answer               | top of every result set                          |
+| yes         | no               | structural-only edge — glue code, stale call, leaky abstraction | flag in `find_outliers`                  |
+| no          | yes              | hidden similarity — same topic/role, no link             | **discovery** / suggested-link surface           |
+| no          | no               | unrelated                                                | drop                                             |
+
+The "no edge, yes spatial" quadrant is the most valuable one and the
+one a pure-graph query can never surface.
+
+### 16.2 Operator — graph-first, spatial-as-re-rank
+
+Given a seed `s`, walk the graph N hops → candidate set `C`. For every
+`c ∈ C`:
+
+```
+score(s, c) =  w_g · 1/(1 + hops(s, c))                  # graph proximity
+            +  w_x · (1 − |Δx(s, c)| / 360)              # semantic agreement (x is 0–360°)
+            +  w_y · (1 − |Δy(s, c)| / 360)              # architectural-layer agreement
+            +  w_f · 𝟙[face(c) == face(s)]               # role agreement
+            +  w_z · z(c)                                # importance prior (PageRank)
+```
+
+The "3 of 5 converge, 2 are outliers" pattern falls out for free:
+outliers have low `x`/`y`/`face` agreement with the cluster centroid
+and drop to the bottom of the ranked list.
+
+### 16.3 Intent-aware weights
+
+The same operator serves opposite intents by reweighting:
+
+| Intent                    | Boost                       | Demote                | Example query                                |
+|---------------------------|-----------------------------|-----------------------|----------------------------------------------|
+| Semantic ("what does X do?") | `w_x`, `w_f`             | `w_g`                 | chat answers, "find similar"                 |
+| Structural ("who calls X?")  | `w_g`                    | `w_x`, `w_f`          | refactor impact, dependency audit            |
+| Discovery ("anything missing?") | `w_x`, `w_f`; **invert** `w_g` (penalise edges) | — | "code that should be linked but isn't"    |
+
+This becomes a `rerank: "semantic" | "structural" | "discovery" | "hybrid"`
+knob on the [JSON query DSL (§6)](#6-query-language-options).
+
+### 16.4 Where it slots in
+
+| Surface                                    | Change                                                                  |
+|--------------------------------------------|-------------------------------------------------------------------------|
+| `search_graph_by_keyphrase` / neighbour expansion | Re-rank traversal results by `score(s, c)` before truncation.    |
+| `find_outliers`                            | Promote the "graph-edge, spatially-distant" pair to first-class output. |
+| Chat retrieval                             | Use the semantic-intent weighting before sending context to Grok.       |
+| Idea Cloud / graph view                    | Optional "show hidden-similarity edges" toggle (no-edge / yes-spatial). |
+
+### 16.5 Known failure modes
+
+The full taxonomy is in the white paper, but the three that matter
+here are:
+
+1. **Embedding collapse near boilerplate.** Auto-generated code,
+   licence headers, and `__init__.py` shims all sit on the same `x`
+   coordinate; spatial agreement becomes meaningless and re-ranking
+   degenerates to graph-only.
+2. **Layered architectures with deep stacks.** `y` (call-depth)
+   compresses 8-layer hexagonal stacks into the same bucket as
+   2-layer scripts; the agreement term spuriously fires across
+   unrelated layers.
+3. **Cross-language calls the parser missed.** Spatial agreement
+   *without* a graph edge is the right discovery signal — but in a
+   polyglot repo it can also be a parser bug masquerading as
+   discovery. The white paper covers how to distinguish them.
+
+### 16.6 Implementation note
+
+Nothing in §16 requires a new store or a new index. `compute_all`
+already writes `spatial` into every node payload; the operator is a
+single function over the existing in-memory graph and can ship as a
+re-rank step inside the query engine.
+
+### 16.7 IP & patent-landscape note
+
+The white paper ([`docs/HYBRID_GRAPH_SPATIAL.md`](HYBRID_GRAPH_SPATIAL.md))
+is published under **CC BY 4.0** with an explicit defensive-publication
+notice, naming the operator `H(s, c)`, the 4-D spatial view, and the
+2 × 2 disagreement matrix as prior art on the date of first commit.
+
+The closest commercial competitor, **Sourcegraph**, holds one
+relevant U.S. patent — **US 9,753,723 B2** (Slack & Liu, 2017) —
+which covers *index construction* (the conceptual ancestor of
+LSIF/SCIP), not retrieval or re-ranking. Apollo's contribution sits
+one layer above that index and is outside the patent's scope. See
+§9.3 of the white paper for the full analysis.
+
+The reference implementation ([`spatial.py`](../spatial.py)) remains
+under the repository licence ([`licenses/BSL-1.1.txt`](../licenses/BSL-1.1.txt));
+the *idea* is intentionally open via the defensive-publication
+posture so the operator can be adopted in any code-intelligence
+stack without IP friction.

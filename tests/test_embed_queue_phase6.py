@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 6 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Pins the contract of :class:`apollo.embeddings.embed_queue.EmbedQueue`

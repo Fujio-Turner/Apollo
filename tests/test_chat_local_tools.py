@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for chat/local_tools.py — the PLAN_MORE_LOCAL_AI_FUNCTIONS tools.
 
 Covers all 14 new tools at the helper level. Each tool is independently

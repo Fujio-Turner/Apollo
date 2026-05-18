@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Integration tests for /api/annotations/* HTTP routes (Phase 11)."""
 
 import pytest

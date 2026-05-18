@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Local tool helpers for the chat agent (PLAN_MORE_LOCAL_AI_FUNCTIONS phases 1-4).
 

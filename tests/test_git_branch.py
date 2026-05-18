@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for ``apollo.git.branch`` — branch-aware path helpers.
 
 These tests intentionally avoid shelling out to ``git`` so they work

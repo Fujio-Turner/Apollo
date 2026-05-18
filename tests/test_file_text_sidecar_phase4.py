@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 4 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Asserts that the per-node ``source`` attribute is no longer written by

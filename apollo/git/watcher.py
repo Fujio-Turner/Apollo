@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Watch ``.git/HEAD`` for branch checkouts.
 
 When the user runs ``git checkout <other-branch>`` the working tree

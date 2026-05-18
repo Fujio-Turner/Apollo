@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 FastAPI web server for the code knowledge graph browser.
 """

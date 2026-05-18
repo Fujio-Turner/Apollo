@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.cpp17 — C++17 source-file plugin for Apollo
 ===================================================

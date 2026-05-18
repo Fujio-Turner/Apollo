@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 9 (PLAN_INDEX_MEMORY_AND_CONCURRENCY) regression tests.
 
 Pins the contract of :func:`graph.builder._rehash_file_for_incremental`

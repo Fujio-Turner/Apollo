@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.gitignore1 — Gitignore plugin for Apollo.
 

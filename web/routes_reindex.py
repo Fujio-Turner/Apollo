@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """FastAPI routes for reindex telemetry and control."""
 from __future__ import annotations
 

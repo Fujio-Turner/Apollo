@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 File watcher — monitors a directory for changes and triggers incremental graph updates.
 

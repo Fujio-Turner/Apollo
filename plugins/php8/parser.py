@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 r"""
 plugins.php8 — PHP 8 source-file plugin for Apollo
 ===================================================
