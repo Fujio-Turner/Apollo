@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 OpenAPI 3 plugin package for Apollo.
 

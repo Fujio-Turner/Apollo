@@ -600,7 +600,14 @@ paths:
     get:
       operationId: search
       tags: [Search]
-      summary: Full-text search over indexed symbols
+      summary: Semantic search over indexed symbols (optionally expanded along graph edges)
+      description: >
+        When `expand=none` (the default) returns the existing flat
+        `SearchResult` list — byte-identical to pre-v1.4 callers. When
+        `expand` is one of `callers / callees / neighbors / references`,
+        each seed hit is paired with up to `per_seed_cap` structural
+        neighbors via the `ExpandedSearchResult` shape. Neighbor scores
+        are computed as `seed_score / (1 + depth)`.
       parameters:
         - name: q
           in: query
@@ -616,6 +623,31 @@ paths:
           in: query
           schema:
             type: string
+        - name: expand
+          in: query
+          description: >
+            Walk the graph from each vector hit. `none` preserves the
+            flat response shape.
+          schema:
+            type: string
+            enum: [none, callers, callees, neighbors, references]
+            default: none
+        - name: depth
+          in: query
+          description: BFS depth (ignored when `expand=none`).
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: per_seed_cap
+          in: query
+          description: >
+            Max neighbors returned per seed; extras are summarized via
+            the cluster's `truncated` field.
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
       responses:
         "200":
           description: Search results
@@ -628,7 +660,16 @@ paths:
                   results:
                     type: array
                     items:
-                      $ref: "#/components/schemas/SearchResult"
+                      oneOf:
+                        - $ref: "#/components/schemas/SearchResult"
+                        - $ref: "#/components/schemas/ExpandedSearchResult"
+                  warning:
+                    type: string
+                    description: >
+                      Present when `expand` was ignored because the
+                      index has no embeddings (structural fallback).
+        "422":
+          description: Invalid `expand` or `depth` parameter.
 
   /api/search/multi:
     post:
@@ -3004,6 +3045,66 @@ components:
           type: integer
         score:
           type: number
+
+    ExpandedSearchNeighbor:
+      type: object
+      required: [id, name, type, path, edge, direction, depth, score]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        line_end:
+          type: integer
+        edge:
+          type: string
+          description: >
+            Edge label connecting this neighbor to the seed. `calls` for
+            callers / callees; the expansion kind itself
+            (`neighbors` / `references`) when the BFS spans multiple
+            edge types.
+        direction:
+          type: string
+          enum: [in, out, both]
+        depth:
+          type: integer
+          description: BFS distance from the seed (1 = direct neighbor).
+        score:
+          type: number
+          description: Decayed seed score (`seed_score / (1 + depth)`).
+
+    ExpandedSearchResult:
+      type: object
+      required: [id, name, type, path, line_start, score, neighbors]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+        path:
+          type: string
+        line_start:
+          type: integer
+        score:
+          type: number
+          description: Cosine similarity of the seed against the query.
+        neighbors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExpandedSearchNeighbor"
+        truncated:
+          type: integer
+          description: >
+            Present only when the BFS produced more neighbors than
+            `per_seed_cap`; the value is the dropped count.
 
     MultiSearchResult:
       type: object

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Project lifecycle management."""
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import hashlib
 
 from .manifest import ProjectManifest, ProjectFilters, ProjectStorage
 from .info import ProjectInfo
+from apollo.git import branched_path
 
 
 class ProjectManager:
@@ -43,17 +45,25 @@ class ProjectManager:
     
     def _resolve_cbl_path(self, manifest: ProjectManifest) -> Optional[Path]:
         """Resolve the CBL database path from manifest storage config.
-        
-        Supports both project-local and global storage modes.
+
+        Supports both project-local and global storage modes. When the
+        project root is a git checkout, the resolved path is suffixed
+        with ``__<branch>`` so each branch gets its own store (DESIGN
+        §4.2.3 — branch-keyed stores). Non-git projects keep the
+        legacy single-store path so existing installs are unaffected.
         """
         if manifest.storage.backend != "cblite":
             return None
-        
+
         if manifest.storage.location_mode == "project" and manifest.storage.db_relpath:
-            return Path(manifest.root_dir) / "_apollo" / manifest.storage.db_relpath
+            base = Path(manifest.root_dir) / "_apollo" / manifest.storage.db_relpath
+            return branched_path(base, manifest.root_dir)
         elif manifest.storage.location_mode == "global" and manifest.storage.db_name:
-            return Path.home() / ".apollo" / "cblite" / manifest.storage.db_name
-        
+            base = Path.home() / ".apollo" / "cblite" / manifest.storage.db_name
+            # Global-mode stores still belong to a project root, so they
+            # branch off the root_dir's current ref.
+            return branched_path(base, manifest.root_dir)
+
         return None
     
     def _close_existing(self) -> None:
@@ -285,11 +295,15 @@ class ProjectManager:
         if mode == "full":
             apollo_dir = self._root_dir / "_apollo"
             
-            # For JSON backend: delete graph.json and embeddings.npy
+            # For JSON backend: delete graph.json and embeddings.npy.
+            # Both files are branch-keyed (DESIGN §4.2.3) when the
+            # project lives in a git checkout, so reprocess only nukes
+            # the *active branch's* store — other branches' indexes
+            # stay intact.
             if self._manifest.storage.backend == "json":
-                graph_file = apollo_dir / "graph.json"
-                embeddings_file = apollo_dir / "embeddings.npy"
-                
+                graph_file = branched_path(apollo_dir / "graph.json", self._root_dir)
+                embeddings_file = branched_path(apollo_dir / "embeddings.npy", self._root_dir)
+
                 if graph_file.exists():
                     graph_file.unlink()
                     result["graph_deleted"] = str(graph_file)

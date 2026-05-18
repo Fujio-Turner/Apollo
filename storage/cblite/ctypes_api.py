@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Thin ctypes wrapper for the libcblite C API.
 
 Wraps only the subset needed for graph storage: database lifecycle,

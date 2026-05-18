@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 JSON storage backend — saves and loads the graph as JSON files.
 
@@ -47,12 +48,14 @@ implementations straightforward without changing the on-disk layout again.
 """
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import networkx as nx
+import numpy as np
 
 try:  # Optional fast encoder. Falls back transparently if missing.
     import orjson  # type: ignore
@@ -66,6 +69,94 @@ if TYPE_CHECKING:
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _CURRENT_VERSION = 2
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Embedding (de)serialization helpers — Phase 3 of
+# PLAN_INDEX_MEMORY_AND_CONCURRENCY.
+#
+# In-memory embeddings are now ``float32`` numpy arrays (Phase 3 of the
+# plan). To keep the on-disk JSON compact we no longer write 384 JSON
+# floats per node; instead we write a base64-encoded byte string of the
+# raw ``float32`` buffer plus its dtype + dim. For a 384-dim vector this
+# is ~520 base64 chars vs. ~7 KB of `[0.123, 0.456, ...]` JSON floats.
+#
+# Backward compatibility: a v2-shaped file that still uses the legacy
+# ``"embedding": [...]`` list form loads cleanly under the new reader —
+# the load path detects either shape and reconstructs an ndarray either
+# way.
+# ─────────────────────────────────────────────────────────────────────
+def _encode_embedding_attrs(attrs: dict) -> None:
+    """Replace ``attrs["embedding"]`` (ndarray) with base64-encoded
+    raw bytes, in-place.
+
+    Idempotent: lists are converted to ndarrays first; entries that are
+    already base64-encoded (``embedding_b64`` already present) are
+    skipped. Mutates the caller's dict — only safe if the caller passed
+    in a *copy* (which :meth:`JsonStore.save` does).
+    """
+    if "embedding_b64" in attrs:
+        # Already encoded (loaded from disk without modification).
+        return
+    emb = attrs.get("embedding")
+    if emb is None:
+        return
+    if isinstance(emb, list):
+        # Legacy in-memory path (watcher-batched) — coerce to ndarray
+        # so the on-disk format is uniform.
+        arr = np.asarray(emb, dtype=np.float32)
+    elif isinstance(emb, np.ndarray):
+        arr = emb if emb.dtype == np.float32 else emb.astype(np.float32, copy=False)
+    else:
+        # Unknown shape — leave it alone, orjson will likely fail (which
+        # is a louder, more debuggable error than silently dropping it).
+        return
+    attrs.pop("embedding", None)
+    attrs["embedding_b64"] = base64.b64encode(arr.tobytes()).decode("ascii")
+    attrs["embedding_dtype"] = str(arr.dtype)
+    attrs["embedding_dim"] = int(arr.shape[-1]) if arr.size else 0
+
+
+def _decode_embedding_attrs(attrs: dict, *, include_embeddings: bool = True) -> None:
+    """Reverse of :func:`_encode_embedding_attrs`.
+
+    Looks for ``embedding_b64`` first (new format); if absent, leaves
+    any pre-existing ``embedding`` list (legacy format) untouched
+    *unless* it's a list, in which case it's promoted to an ndarray so
+    the in-memory invariant matches what ``Embedder.embed_graph`` would
+    have written.
+
+    When ``include_embeddings`` is False both forms are stripped — keeps
+    parity with the legacy loader's ``attrs.pop("embedding", None)``.
+    """
+    if not include_embeddings:
+        attrs.pop("embedding", None)
+        attrs.pop("embedding_b64", None)
+        attrs.pop("embedding_dtype", None)
+        attrs.pop("embedding_dim", None)
+        return
+
+    if "embedding_b64" in attrs:
+        b64 = attrs.pop("embedding_b64")
+        dtype = attrs.pop("embedding_dtype", "float32")
+        # ``embedding_dim`` is informational; ndarray re-derives it from
+        # the byte buffer + dtype. Drop the bookkeeping fields.
+        attrs.pop("embedding_dim", None)
+        try:
+            raw = base64.b64decode(b64)
+            attrs["embedding"] = np.frombuffer(raw, dtype=np.dtype(dtype)).copy()
+        except Exception:
+            # Corrupt sidecar — better to drop the embedding than to
+            # crash the whole graph load. Search will fall back to
+            # ``has_embeddings() == False`` for that node.
+            pass
+        return
+
+    # Legacy format: ``embedding`` is a list. Promote in place so
+    # callers don't see mixed list/ndarray types in the same graph.
+    emb = attrs.get("embedding")
+    if isinstance(emb, list):
+        attrs["embedding"] = np.asarray(emb, dtype=np.float32)
 
 
 def _purge_index_sidecars(apollo_dir: Path) -> None:
@@ -165,6 +256,84 @@ def _write_bytes(path: Path, data: bytes) -> None:
         path.write_bytes(data)
 
 
+def _stream_save(graph: nx.DiGraph, fh) -> None:
+    """Stream a v2 JSON document to the binary file handle ``fh``.
+
+    Phase 5 of PLAN_INDEX_MEMORY_AND_CONCURRENCY. Writes the document
+    incrementally::
+
+        {"version":2,"nodes":{<id>:<attrs>,...},
+         "edges":{<src>:{<dst>:<attrs>,...},...},
+         "graph_attrs":{...}}
+
+    Per-node and per-edge ``dict(attrs)`` copies are still made (cheap —
+    one dict per node, *not* per attribute), so the embedding-encoding
+    step can mutate freely without touching the live graph. What we
+    avoid is the previous "build a 2× copy of the entire graph in
+    Python dicts, then call ``orjson.dumps`` on the whole thing" peak.
+
+    Works equally with a plain file handle or a ``gzip.GzipFile`` — both
+    expose ``.write(bytes)``.
+    """
+    fh.write(b'{"version":')
+    fh.write(_serialize(_CURRENT_VERSION))
+    fh.write(b',"nodes":{')
+
+    first = True
+    for node_id, attrs in graph.nodes(data=True):
+        # Per-node defensive copy (so embedding encoding doesn't mutate
+        # the live graph). Tiny — one node's worth of attrs.
+        attrs_copy = dict(attrs)
+        _encode_embedding_attrs(attrs_copy)
+        if not first:
+            fh.write(b",")
+        fh.write(_serialize(str(node_id)))
+        fh.write(b":")
+        fh.write(_serialize(attrs_copy))
+        first = False
+
+    fh.write(b'},"edges":{')
+
+    # Adjacency-style: {src: {dst: attrs}}. Stream grouped by source
+    # node to keep the on-disk layout identical to the legacy writer.
+    # ``graph.adj`` is NetworkX's public read-only view of the same
+    # adjacency dict ``_adj`` exposes; iterating it avoids building
+    # the intermediate (src, dst, attrs) tuples ``edges(data=True)``
+    # would yield.
+    adj = graph.adj
+    first_src = True
+    for src in graph.nodes():
+        targets = adj.get(src) or {}
+        if not targets:
+            continue
+        if not first_src:
+            fh.write(b",")
+        fh.write(_serialize(str(src)))
+        fh.write(b":{")
+        first_dst = True
+        for dst, attrs in targets.items():
+            if not first_dst:
+                fh.write(b",")
+            fh.write(_serialize(str(dst)))
+            fh.write(b":")
+            fh.write(_serialize(dict(attrs)))
+            first_dst = False
+        fh.write(b"}")
+        first_src = False
+
+    fh.write(b"}")
+
+    # Graph-level attrs (ml_clusters, ml_topics, ml_dead_code sidecars
+    # written by ml/passes.py). orjson rejects non-str dict keys, so we
+    # stringify nested int keys (cluster_id / topic_id); load() ignores
+    # the conversion since consumers iterate .values() only.
+    if graph.graph:
+        fh.write(b',"graph_attrs":')
+        fh.write(_serialize(_stringify_keys(dict(graph.graph))))
+
+    fh.write(b"}")
+
+
 class JsonStore:
     """Persist a NetworkX graph to a JSON (or gzipped JSON) file."""
 
@@ -178,37 +347,38 @@ class JsonStore:
     def save(self, graph: nx.DiGraph, filepath: str | None = None):
         """Save the graph as a v2 dict-shaped document.
 
+        Phase 5 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: streams the JSON
+        document directly to the file handle one node / edge at a time
+        instead of building a single ``nodes={...}, edges={...}`` dict
+        first and handing it to ``orjson.dumps`` whole. For a 1 GB
+        in-memory graph this drops save-time peak RAM from ~2–3 GB
+        (graph + per-attr `dict(attrs)` copies + full JSON blob) to
+        roughly graph + one-node's-worth of buffer.
+
         Always writes the current schema; readers handle both v1 and v2
         so there's no migration step for callers loading older files.
         """
         path = Path(filepath or self._filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        nodes: dict[str, dict[str, Any]] = {}
-        for node_id, attrs in graph.nodes(data=True):
-            # Copy so we don't mutate the live graph attrs dict.
-            nodes[node_id] = dict(attrs)
+        # Pick the right write sink — gzip stream for ``.gz`` paths
+        # (already a streaming sink), plain binary file otherwise.
+        if path.suffix == ".gz":
+            raw_fh = open(path, "wb")
+            fh = gzip.GzipFile(
+                filename="", mode="wb", compresslevel=6, fileobj=raw_fh, mtime=0,
+            )
+            close_outer = raw_fh
+        else:
+            fh = open(path, "wb")
+            close_outer = None
 
-        # Adjacency-style: {src: {dst: attrs}}. NetworkX's DiGraph allows at
-        # most one edge per (src, dst) so this lossless. Switching to
-        # MultiDiGraph later would need a list-valued inner dict.
-        edges: dict[str, dict[str, dict[str, Any]]] = {}
-        for src, dst, attrs in graph.edges(data=True):
-            edges.setdefault(src, {})[dst] = dict(attrs)
-
-        payload = {
-            "version": _CURRENT_VERSION,
-            "nodes": nodes,
-            "edges": edges,
-        }
-        # Graph-level attrs (e.g. ml_clusters, ml_topics, ml_dead_code
-        # sidecars written by ml/passes.py) live on `graph.graph`. Without
-        # this they get silently dropped on every save/load round-trip.
-        # orjson rejects non-str dict keys, so coerce nested int keys
-        # (cluster_id / topic_id) to strings; load() reverses this.
-        if graph.graph:
-            payload["graph_attrs"] = _stringify_keys(dict(graph.graph))
-        _write_bytes(path, _serialize(payload))
+        try:
+            _stream_save(graph, fh)
+        finally:
+            fh.close()
+            if close_outer is not None:
+                close_outer.close()
 
     def load(self, filepath: str | None = None, *, include_embeddings: bool = True) -> nx.DiGraph:
         """Load a graph from a JSON file (v1 or v2, plain or gzipped)."""
@@ -224,16 +394,17 @@ class JsonStore:
             # v2 shape — dict[node_id, attrs].
             for node_id, attrs in nodes_in.items():
                 attrs = dict(attrs)
-                if not include_embeddings:
-                    attrs.pop("embedding", None)
+                # Phase 3: decode the base64 sidecar (or promote a
+                # legacy ``embedding: [...]`` list) to an ndarray.
+                # Strips when ``include_embeddings`` is False.
+                _decode_embedding_attrs(attrs, include_embeddings=include_embeddings)
                 graph.add_node(node_id, **attrs)
         else:
             # v1 shape — list of {"id": ..., **attrs}.
             for node in nodes_in:
                 node = dict(node)
                 node_id = node.pop("id")
-                if not include_embeddings:
-                    node.pop("embedding", None)
+                _decode_embedding_attrs(node, include_embeddings=include_embeddings)
                 graph.add_node(node_id, **node)
 
         if isinstance(edges_in, dict):

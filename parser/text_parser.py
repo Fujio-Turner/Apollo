@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Non-code file parser — indexes Markdown, JSON, YAML, CSV, and plain text files.
 

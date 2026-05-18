@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Kubernetes manifest plugin package for Apollo."""
 from .parser import K8sManifestParser
 

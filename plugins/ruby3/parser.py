@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.ruby3 — Ruby source-file plugin for Apollo
 ==================================================

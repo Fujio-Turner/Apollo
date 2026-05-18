@@ -14,7 +14,7 @@ An **Obsidian-for-your-filesystem** — a browser-based tool that scans any dire
 
 Instead of manually linking notes, Apollo **automatically discovers** connections — function calls, imports, shared topics, similar content — and renders them as an interactive, explorable graph. A chat panel powered by the **Grok API** uses tool-calling to query the graph on demand and answer natural-language questions grounded in *your* code and notes.
 
-![Version](https://img.shields.io/badge/Apollo-v1.3.0-brightgreen)
+![Version](https://img.shields.io/badge/Apollo-v1.4.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green)
 ![ECharts](https://img.shields.io/badge/ECharts-5-orange)
@@ -567,8 +567,23 @@ apollo/
 
 ## License
 
-Source code in this repository is licensed under various licenses. The
-Business Source License 1.1 (BSL) is one such license. Each file indicates in
-a section at the beginning of the file the name of the license that applies to
-it. All licenses used in this repository can be found in the top-level
-licenses directory.
+Apollo is licensed under the **Business Source License 1.1 (BUSL-1.1)**
+with `Additional Use Grant: None` — meaning **no production use is
+permitted without a commercial license** from the copyright holder.
+The license converts to **Apache License 2.0** on the Change Date
+(2030-05-18) per BSL Covenant 1.
+
+- Repo-wide default: [`LICENSE`](LICENSE)
+- Full BSL text and parameters: [`licenses/BSL-1.1.txt`](licenses/BSL-1.1.txt)
+- Most source files also carry an `SPDX-License-Identifier: BUSL-1.1`
+  comment on their first non-shebang line.
+
+**Per-file overrides.** Some documentation files are released under
+different terms; where this is the case, the file carries its own
+header that takes precedence over the repo default. Currently:
+
+- [`docs/HYBRID_GRAPH_SPATIAL.md`](docs/HYBRID_GRAPH_SPATIAL.md) —
+  text, figures, and code listings are licensed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+**Commercial licensing or questions:** mail@fuj.io

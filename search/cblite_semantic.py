@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Couchbase Lite semantic search — searches embeddings stored in CBL.
 
@@ -11,6 +12,7 @@ import json
 import numpy as np
 
 from graph.query import _normalize_node_types
+from search.expand import ExpandKind, expand_hits
 
 
 def _type_clause(node_type, column: str) -> str:
@@ -53,6 +55,28 @@ class CouchbaseLiteSemanticSearch:
         if cbl.has_vector_index:
             return self._search_vector_index(cbl, query_embedding, top_k, node_type)
         return self._search_brute_force(cbl, query_embedding, top_k, node_type)
+
+    def search_expanded(
+        self,
+        query: str,
+        top_k: int = 10,
+        expand: ExpandKind = "none",
+        depth: int = 1,
+        per_seed_cap: int = 10,
+        node_type: str | list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """Combined semantic + graph-expansion search.
+
+        Rehydrates the structural graph from the CBL store (embeddings
+        are stripped to keep the load cheap — the expansion only needs
+        edges and basic node metadata) and delegates to
+        :func:`search.expand.expand_hits`.
+        """
+        seeds = self.search(query, top_k=top_k, node_type=node_type)
+        if expand == "none":
+            return [{**s, "neighbors": []} for s in seeds]
+        graph = self._store.load(include_embeddings=False)
+        return expand_hits(graph, seeds, expand, depth, per_seed_cap)
 
     def _search_vector_index(
         self, cbl, query_vec: list[float], top_k: int, node_type

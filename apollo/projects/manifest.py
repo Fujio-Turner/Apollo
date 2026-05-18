@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Project manifest data structures and persistence."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Pytest configuration and fixtures for apollo tests."""
 import json
 import os

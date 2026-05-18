@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Unit tests for TextFileParser."""
 import pytest
 

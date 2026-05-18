@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 2B — integration tests for the per-plugin config PATCH endpoint.
 
 Covers the four cases called out in

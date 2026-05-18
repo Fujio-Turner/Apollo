@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.env1 — Environment variables (.env) plugin for Apollo.
 

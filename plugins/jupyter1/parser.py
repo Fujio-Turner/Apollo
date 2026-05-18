@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.jupyter1 — Jupyter notebook plugin for Apollo.
 

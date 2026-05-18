@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Index-time ML passes — Phase 1-4 of `docs/work/PLAN_ML_LIBS.md`.
 
 Each pass writes its result onto the node payload (or onto a small
@@ -46,12 +47,20 @@ def _iter_embedded_nodes(graph: nx.DiGraph) -> list[tuple[str, list[float]]]:
     return rows
 
 
-def _node_text_for_keyphrase(data: dict) -> str:
+def _node_text_for_keyphrase(graph: nx.DiGraph, node_id: str, data: dict) -> str:
     """Best-effort text blob for KeyBERT extraction.
 
     Combines name, docstring, and a leading slice of source so we don't
     blow KeyBERT's input budget on huge functions.
+
+    Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the source slice is
+    now resolved via :func:`graph.query.get_source` against the file
+    text sidecar instead of reading a per-node ``source`` attr (which
+    no longer exists). The function falls through transparently for
+    legacy graphs that still carry the old attr.
     """
+    from apollo.graph.query import get_source
+
     parts: list[str] = []
     name = data.get("name") or ""
     if name:
@@ -59,8 +68,8 @@ def _node_text_for_keyphrase(data: dict) -> str:
     doc = data.get("docstring") or ""
     if doc:
         parts.append(str(doc)[:500])
-    src = data.get("source") or ""
-    if isinstance(src, str) and src:
+    src = get_source(graph, node_id)
+    if src:
         parts.append(src[:1500])
     return "\n".join(parts).strip()
 
@@ -233,17 +242,22 @@ def pass_keyphrases(graph: nx.DiGraph,
         logger.warning("KeyBERT init failed: %s", e)
         return {"ml_available": False, "reason": str(e)}
 
+    # Phase 4: eligibility check no longer reads ``data["source"]``
+    # (it's gone). Nodes with a non-empty name *or* docstring qualify
+    # for the first pass; the real text gating happens below where we
+    # build the KeyBERT input via ``_node_text_for_keyphrase`` and
+    # require ≥ 20 chars.
     eligible = [
         (nid, data) for nid, data in graph.nodes(data=True)
         if data.get("type") in {"function", "method", "class", "file"}
-        and (data.get("source") or data.get("docstring") or data.get("name"))
+        and (data.get("docstring") or data.get("name"))
     ]
     if max_nodes:
         eligible = eligible[:max_nodes]
 
     computed = 0
     for nid, data in eligible:
-        text = _node_text_for_keyphrase(data)
+        text = _node_text_for_keyphrase(graph, nid, data)
         if not text or len(text) < 20:
             continue
         try:
@@ -399,7 +413,9 @@ def pass_topics(graph: nx.DiGraph,
     docs = []
     for nid in ids:
         d = graph.nodes[nid]
-        text = _node_text_for_keyphrase(d)
+        # Phase 4: pass graph + node_id so _node_text_for_keyphrase
+        # can resolve the source slice via the _file_text sidecar.
+        text = _node_text_for_keyphrase(graph, nid, d)
         docs.append(text or (d.get("name") or nid))
     embeddings = np.asarray([r[1] for r in rows], dtype=np.float32)
 
@@ -498,18 +514,41 @@ def pass_dead_code(graph: nx.DiGraph, root_dir: str | None) -> dict:
 def run_all_passes(graph: nx.DiGraph,
                    root_dir: str | None = None,
                    embedder=None,
-                   include: Iterable[str] | None = None) -> dict:
+                   include: Iterable[str] | None = None,
+                   parallel: bool = False,
+                   max_workers: int = 4) -> dict:
     """Run the index-time ML pipeline.
 
     ``include`` — optional whitelist of pass names. Defaults to all.
     Names: ``layout, centrality, keyphrases, communities, outliers,
     topics, dead_code``.
+
+    Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: when ``parallel``
+    is True, the seven passes are fanned out to a
+    :class:`concurrent.futures.ThreadPoolExecutor` with at most
+    ``max_workers`` workers. Each pass writes to its own attribute
+    namespace (per-node ``pagerank`` / ``cluster_id`` / ``keyphrases``
+    / ``community_id`` / ``outlier_score`` / ``topic_id`` and per-graph
+    ``ml_clusters`` / ``ml_communities`` / ``ml_topics`` /
+    ``ml_dead_code``) so concurrent writes don't collide. NetworkX +
+    numpy release the GIL for the bulk of their internals, so threads
+    are the right pool here (no pickling cost, shared graph object).
+
+    The ``parallel=False`` default preserves byte-for-byte legacy
+    behavior — every caller that hasn't opted in still gets the
+    sequential ordering pinned by the existing tests.
     """
     summary: dict[str, dict] = {}
     wanted = set(include) if include else {
         "layout", "centrality", "keyphrases", "communities",
         "outliers", "topics", "dead_code",
     }
+
+    if parallel:
+        return _run_passes_parallel(
+            graph, root_dir, embedder, wanted, max_workers=max_workers,
+        )
+
     if "centrality" in wanted:
         summary["centrality"] = pass_centrality(graph)
     if "layout" in wanted:
@@ -524,4 +563,57 @@ def run_all_passes(graph: nx.DiGraph,
         summary["topics"] = pass_topics(graph, embedder=embedder)
     if "dead_code" in wanted:
         summary["dead_code"] = pass_dead_code(graph, root_dir)
+    return summary
+
+
+def _run_passes_parallel(
+    graph: nx.DiGraph,
+    root_dir: str | None,
+    embedder,
+    wanted: set,
+    max_workers: int = 4,
+) -> dict:
+    """Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — fanout helper.
+
+    Submits every requested pass to a single ``ThreadPoolExecutor``.
+    Passes that fail are recorded as ``{ml_available: False, reason:
+    "<exception>"}`` in the returned summary rather than propagating
+    (matches the sequential path's per-pass try/except behavior:
+    a missing UMAP / KeyBERT / vulture installation must never break
+    the whole index, regardless of orchestration mode).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    tasks: dict[str, callable] = {}
+    if "centrality" in wanted:
+        tasks["centrality"] = lambda: pass_centrality(graph)
+    if "layout" in wanted:
+        tasks["layout"] = lambda: pass_layout_clusters(graph)
+    if "keyphrases" in wanted:
+        tasks["keyphrases"] = lambda: pass_keyphrases(graph, embedder=embedder)
+    if "communities" in wanted:
+        tasks["communities"] = lambda: pass_communities(graph)
+    if "outliers" in wanted:
+        tasks["outliers"] = lambda: pass_outliers(graph)
+    if "topics" in wanted:
+        tasks["topics"] = lambda: pass_topics(graph, embedder=embedder)
+    if "dead_code" in wanted:
+        tasks["dead_code"] = lambda: pass_dead_code(graph, root_dir)
+
+    if not tasks:
+        return {}
+
+    workers = max(1, min(max_workers, len(tasks)))
+    summary: dict[str, dict] = {}
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="apollo-ml-pass",
+    ) as ex:
+        futures = {ex.submit(fn): name for name, fn in tasks.items()}
+        for fut in futures:
+            name = futures[fut]
+            try:
+                summary[name] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ML pass %s failed: %s", name, e)
+                summary[name] = {"ml_available": False, "reason": str(e)}
     return summary

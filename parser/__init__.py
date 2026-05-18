@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 from .base import BaseParser
 from .text_parser import TextFileParser
 from .treesitter_parser import TreeSitterParser

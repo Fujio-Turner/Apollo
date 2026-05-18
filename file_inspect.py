@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Read-only file & source inspection (Phase 12.3a).
 

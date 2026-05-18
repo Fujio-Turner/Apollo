@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 JSON 1 plugin for Apollo — parses .json files.
 

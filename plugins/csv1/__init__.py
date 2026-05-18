@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 CSV 1 plugin package for Apollo.
 

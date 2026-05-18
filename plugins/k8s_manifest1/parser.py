@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.k8s_manifest1 — Kubernetes manifest plugin for Apollo.
 

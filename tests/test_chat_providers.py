@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Unit tests for the multi-provider AI chat configuration.
 
 Covers:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Local tool helpers for the chat agent (PLAN_MORE_LOCAL_AI_FUNCTIONS phases 1-4).
 
@@ -38,17 +39,28 @@ def _node_payload(graph: nx.DiGraph, node_id: str,
                   include_source: bool = True,
                   include_edges: bool = True,
                   source_max_chars: int = 2000) -> dict:
-    """Build the full node-detail payload (mirrors chat.service get_node)."""
+    """Build the full node-detail payload (mirrors chat.service get_node).
+
+    Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the per-node
+    ``source`` attribute was removed; the text now lives in the
+    ``graph.graph["_file_text"]`` sidecar and is sliced by
+    :func:`graph.query.get_source` using the node's line range. We
+    inject the resolved source back into the payload here so chat /
+    web consumers continue to see a ``source`` field.
+    """
     if node_id not in graph:
         return {"id": node_id, "error": "not_found"}
-    data = {k: v for k, v in graph.nodes[node_id].items() if k != "embedding"}
-    if not include_source and "source" in data:
-        data = {k: v for k, v in data.items() if k != "source"}
-    elif include_source and "source" in data:
-        src = data.get("source") or ""
-        if isinstance(src, str) and len(src) > source_max_chars:
-            data = dict(data)
-            data["source"] = src[:source_max_chars] + "\n... (truncated)"
+    # Strip the embedding *and* any stale ``source`` attr (legacy graphs
+    # may still carry one; ``get_source`` returns the same value).
+    data = {k: v for k, v in graph.nodes[node_id].items()
+            if k not in ("embedding", "source")}
+    if include_source:
+        from apollo.graph.query import get_source
+        src = get_source(graph, node_id)
+        if src:
+            if len(src) > source_max_chars:
+                src = src[:source_max_chars] + "\n... (truncated)"
+            data["source"] = src
     out = {"id": node_id, **data}
     if include_edges:
         edges_in = []
@@ -121,12 +133,20 @@ async def abatch_get_nodes(graph: nx.DiGraph, node_ids: list[str],
             missing.append(nid)
             continue
         if attrs is not None:
-            data = {k: v for k, v in attrs.items() if k != "embedding"}
-            if not include_source and "source" in data:
-                data.pop("source", None)
-            elif include_source and isinstance(data.get("source"), str) \
-                    and len(data["source"]) > 2000:
-                data["source"] = data["source"][:2000] + "\n... (truncated)"
+            # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: strip both
+            # ``embedding`` and any stale ``source`` attr (post-Phase-4
+            # the CBL doc no longer carries one; legacy docs still
+            # might — drop them so the unified injection below is the
+            # single source of truth).
+            data = {k: v for k, v in attrs.items()
+                    if k not in ("embedding", "source")}
+            if include_source:
+                from apollo.graph.query import get_source
+                src = get_source(graph, nid)
+                if src:
+                    if len(src) > 2000:
+                        src = src[:2000] + "\n... (truncated)"
+                    data["source"] = src
             payload = {"id": nid, **data}
             if include_edges and nid in graph:
                 edges_in = [

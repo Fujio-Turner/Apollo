@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.rust1 — Rust source-file plugin for Apollo
 ==================================================

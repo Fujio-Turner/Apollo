@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Couchbase Lite storage backend — persists the graph in a CBL database.
 
@@ -19,11 +20,37 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import networkx as nx
+import numpy as np
 
 from .ctypes_api import CBL
 
 if TYPE_CHECKING:
     from apollo.graph.incremental import GraphDiff
+
+
+def _embedding_for_cbl(emb):
+    """Coerce an in-memory embedding to a JSON-encodable ``list[float]``.
+
+    CBL stores embeddings inside its JSON documents, and its
+    ``APPROX_VECTOR_DISTANCE`` index reads them as float arrays. The
+    in-memory representation post-Phase 3 is a ``float32`` ndarray, so
+    we ``.tolist()`` at save time. Lists pass through unchanged so the
+    watcher path (which still emits Python lists) keeps working.
+    """
+    if emb is None:
+        return None
+    if isinstance(emb, np.ndarray):
+        return emb.tolist()
+    return emb
+
+
+def _embedding_from_cbl(emb):
+    """Inverse of :func:`_embedding_for_cbl` — list → float32 ndarray."""
+    if emb is None:
+        return None
+    if isinstance(emb, list):
+        return np.asarray(emb, dtype=np.float32)
+    return emb
 
 
 class CouchbaseLiteStore:
@@ -55,9 +82,14 @@ class CouchbaseLiteStore:
         try:
             for node_id, attrs in graph.nodes(data=True):
                 doc = dict(attrs)
-                emb = doc.get("embedding")
-                if emb and not embedding_dim:
-                    embedding_dim = len(emb)
+                # Phase 3: in-memory embeddings are now float32 ndarrays.
+                # CBL stores embeddings as JSON list[float] (the vector
+                # index reads them that way), so coerce here.
+                emb_list = _embedding_for_cbl(doc.get("embedding"))
+                if emb_list is not None:
+                    doc["embedding"] = emb_list
+                    if not embedding_dim:
+                        embedding_dim = len(emb_list)
                 cbl.save_document_json(nodes_col, node_id, json.dumps(doc, default=str))
 
             # Bulk insert edges
@@ -106,6 +138,12 @@ class CouchbaseLiteStore:
             attrs.pop("_id", None)
             if not include_embeddings:
                 attrs.pop("embedding", None)
+            else:
+                # Phase 3: promote list[float] back to float32 ndarray so
+                # the in-memory invariant matches the embedder.
+                emb = attrs.get("embedding")
+                if emb is not None:
+                    attrs["embedding"] = _embedding_from_cbl(emb)
             graph.add_node(node_id, **attrs)
 
         # Load edges
@@ -148,6 +186,10 @@ class CouchbaseLiteStore:
                 for node_id in diff.nodes_added + diff.nodes_modified:
                     if node_id in graph.nodes:
                         attrs = dict(graph.nodes[node_id])
+                        # Phase 3: ndarray → list[float] for JSON.
+                        emb_list = _embedding_for_cbl(attrs.get("embedding"))
+                        if emb_list is not None:
+                            attrs["embedding"] = emb_list
                         cbl.save_document_json(nodes_col, node_id, json.dumps(attrs, default=str))
             
             # Remove deleted edges

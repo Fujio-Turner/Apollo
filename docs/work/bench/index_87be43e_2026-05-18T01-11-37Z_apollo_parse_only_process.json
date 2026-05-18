@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "git_sha": "87be43e",
+  "utc": "2026-05-18T01:11:37Z",
+  "root": "/Users/fujioturner/Documents/git_folders/fujio-turner/Apollo",
+  "parser_pool": "process",
+  "no_embeddings": true,
+  "no_ml": true,
+  "psutil_available": true,
+  "totals": {
+    "wall_s": 4.1634,
+    "files": 616,
+    "nodes": 6371,
+    "edges": 8681,
+    "on_disk_graph_bytes": 53872409,
+    "on_disk_graph_mb": 51.38,
+    "peak_rss_mb": 312.86
+  },
+  "stages": {
+    "parse_and_build": {
+      "wall_s": 3.0607,
+      "peak_py_mb": 135.55,
+      "peak_rss_mb": 215.8,
+      "rss_delta_mb": 198.64
+    },
+    "spatial": {
+      "wall_s": 0.8486,
+      "peak_py_mb": 109.43,
+      "peak_rss_mb": 236.75,
+      "rss_delta_mb": 20.95
+    },
+    "save": {
+      "wall_s": 0.2509,
+      "peak_py_mb": 284.9,
+      "peak_rss_mb": 312.86,
+      "rss_delta_mb": 76.11
+    },
+    "search_index": {
+      "wall_s": 0.0032,
+      "peak_py_mb": 135.61,
+      "peak_rss_mb": 312.86,
+      "rss_delta_mb": 0.0
+    }
+  },
+  "skipped": [
+    "embed (disabled via --no-embeddings)",
+    "ml (disabled via --no-ml)"
+  ]
+}

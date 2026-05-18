@@ -264,32 +264,43 @@ nodes often don't), so it's a Phase 2.5 add-on.
 
 Each phase is a single landable PR.
 
-### Phase A — Core helper + `SemanticSearch.search_expanded`
+### Phase A — Core helper + `SemanticSearch.search_expanded` ✅
 
-- [ ] Create `search/expand.py` with `expand_hits` (uses `GraphQuery`).
-- [ ] Add `SemanticSearch.search_expanded` in `search/semantic.py`.
-- [ ] Add `CouchbaseLiteSemanticSearch.search_expanded` in
-      `search/cblite_semantic.py` (delegates to the same helper).
-- [ ] Unit tests in `tests/test_semantic_expand.py`:
-  - flat behavior when `expand="none"` matches `search()`.
-  - callers/callees on a 3-node fixture return the right neighbors
-    with the expected edge `direction`.
-  - `per_seed_cap` truncates and reports `+N more` count in a `truncated`
-    field on the seed.
-  - depth=2 traversal returns depth-2 nodes with decayed score.
-  - depth ≤ 0 raises `ValueError` (defensive).
+- [x] Create `search/expand.py` with `expand_hits` (uses `GraphQuery`).
+- [x] Add `SemanticSearch.search_expanded` in `search/semantic.py`.
+- [x] Add `CouchbaseLiteSemanticSearch.search_expanded` in
+      `search/cblite_semantic.py` (delegates to the same helper;
+      rehydrates the graph from the store with `include_embeddings=False`
+      to keep the expansion load cheap).
+- [x] Unit tests in `tests/test_semantic_expand.py`:
+  - [x] flat behavior when `expand="none"` matches `search()`.
+  - [x] callers/callees on a 3-node fixture return the right neighbors
+        with the expected edge `direction`.
+  - [x] `per_seed_cap` truncates and reports the dropped count in a
+        `truncated` field on the seed.
+  - [x] depth=2 traversal returns depth-2 nodes with decayed score.
+  - [x] depth ≤ 0 raises `ValueError` (defensive).
+  - [x] `neighbors` / `references` walk both directions.
+  - [x] Perf budget: top=10, depth=1, cap=10 on a 10k-node fixture
+        completes well inside the documented budget.
 
 **Done when:** unit tests pass; no caller is wired up yet.
+**Status:** 11/11 new tests passing; existing `test_search_semantic.py`
+and `test_graph_query.py` suites unchanged (29/29).
 
-### Phase B — CLI
+### Phase B — CLI ✅
 
-- [ ] Add `--expand` / `--depth` / `--per-seed-cap` args in `main.py`.
-- [ ] Branch `cmd_search` on `args.expand`: flat path unchanged,
+- [x] Add `--expand` / `--depth` / `--per-seed-cap` args in `main.py`.
+- [x] Branch `cmd_search` on `args.expand`: flat path unchanged,
       expanded path delegates to `search_expanded` and renders the
-      two-level list.
-- [ ] Update CLI help text and the `search` example in
+      two-level list (with `←`/`→`/`↔` arrows + a `… +N more`
+      truncation indicator).
+- [x] Update CLI help text and the `search` example in
       [`docs/DESIGN.md §4.5`](../DESIGN.md#combined-queries) to point
-      at the real flags.
+      at the real flags. §4.5 now also documents the response shape
+      and the ranking decay.
+- [x] One-time `logger.warning` when `--expand` is used against an
+      index with no embeddings (structural-fallback path).
 
 **Done when:**
 
@@ -299,50 +310,86 @@ python main.py search "email" --top 3 --expand callers --depth 1
 
 prints seeds with indented callers; flat `search "email"` still works
 identically to today.
+**Status:** new `tests/test_cli_search_expanded.py` covers both
+behaviors (2/2 passing) by driving `cmd_search` directly with a JSON
+store + a fake embedder.
 
-### Phase C — HTTP
+### Phase C — HTTP ✅
 
-- [ ] Add the three new query params to `/api/search` in `web/server.py`.
-- [ ] Validate `expand` against the enum (reject 422 on bad value).
-- [ ] Update [`docs/openapi.yaml`](../openapi.yaml) per
-      [`guides/API_OPENAPI.md`](../../guides/API_OPENAPI.md) (add the
-      params + the new response variant).
-- [ ] Cross-link from [`docs/API.md`](../API.md) (one row in the table).
-- [ ] Integration test under `tests/test_web_search_expanded.py`
-      hitting the endpoint with both shapes.
+- [x] Add the three new query params to `/api/search` in `web/server.py`.
+- [x] Validate `expand` against the enum (422 on bad value; 422 on
+      `depth<=0` while expanding).
+- [x] Update [`docs/openapi.yaml`](../openapi.yaml) per
+      [`guides/API_OPENAPI.md`](../../guides/API_OPENAPI.md) — added
+      the three params, the `ExpandedSearchResult` /
+      `ExpandedSearchNeighbor` schemas, and a `oneOf` on the response
+      items so flat callers stay valid.
+- [x] Cross-link from [`docs/API.md`](../API.md) — `/api/search` now
+      documents both shapes with worked examples.
+- [x] Integration test under `tests/test_web_search_expanded.py`
+      hitting the endpoint with both shapes plus the validation
+      branches.
+- [x] Structural-fallback path emits a `logger.warning` and a
+      `"warning"` field in the response when `expand` is requested
+      without embeddings.
 
 **Done when:** `GET /api/search?q=email` is byte-identical to today;
 `GET /api/search?q=email&expand=callers&depth=1` returns the clustered
 shape.
+**Status:** 5/5 new HTTP tests passing; the
+`test_explicit_expand_none_is_byte_identical` test pins the
+no-regression contract.
 
-### Phase D — Chat tool
+### Phase D — Chat tool ✅
 
-- [ ] Register `search_graph_expanded` in `ai/chat_request.json` and
-      every `chat_request_v*.json` that's still referenced.
-- [ ] Dispatch in `chat/service.py::_exec_tool_impl`.
-- [ ] Add one cheat-sheet line under GRAPH/RELATIONSHIPS.
-- [ ] Mention the tool in the §3.5 cheat sheet for `search_graph` so
-      the LLM is steered away from the `search_graph` + N
-      `get_neighbors` anti-pattern.
-- [ ] Add an entry in [`docs/work/PLAN_LLM_ROUND_REDUCTION.md`](PLAN_LLM_ROUND_REDUCTION.md)
+- [x] Register `search_graph_expanded` in `ai/chat_request.json`.
+      Snapshot `chat_request_v10.json` taken first per the
+      `ai/CHANGELOG.md` convention; older `chat_request_v{1..9}.json`
+      files are pinned historical snapshots and intentionally left
+      alone (the loader at `chat/service.py:97` always reads the live
+      `chat_request.json`).
+- [x] Dispatch in `chat/service.py::_exec_tool_impl` —
+      delegates to `self.search.search_expanded(...)` and surfaces a
+      `warning` payload when no embeddings are indexed.
+- [x] Added one cheat-sheet line under GRAPH/RELATIONSHIPS:
+      *"Find X and what depends on / calls it → `search_graph_expanded`
+       (ONE call instead of `search_graph` + N `get_neighbors`)"*.
+- [x] Added an anti-pattern bullet flagging the
+      `search_graph` + N `get_neighbors` fan-out as wasteful.
+- [x] Added a "shipped" row to
+      [`docs/work/PLAN_LLM_ROUND_REDUCTION.md`](PLAN_LLM_ROUND_REDUCTION.md)
       tracking the round saved.
+- [x] CHANGELOG entry for v10 in [`ai/CHANGELOG.md`](../../ai/CHANGELOG.md).
 
 **Done when:** A representative "find email-related code and its
 callers" prompt resolves in one tool round end-to-end against a
 small fixture.
+**Status:** `tests/test_chat_search_graph_expanded.py` exercises the
+dispatch (4/4 passing), the JSON catalog still parses cleanly, and
+the test fixture confirms a single `search_graph_expanded` call
+returns the seed + its caller in one round.
 
-### Phase E — Docs / housekeeping
+### Phase E — Docs / housekeeping ✅
 
-- [ ] Tick the Phase 2 checkbox in [`docs/DESIGN.md`](../DESIGN.md#phase-2--semantic-search).
-- [ ] Expand [`docs/DESIGN.md §4.5`](../DESIGN.md#combined-queries) with
-      the response shape and ranking note from §3 above.
-- [ ] Add a one-line entry to [`RELEASE_NOTES.md`](../../RELEASE_NOTES.md).
-- [ ] Update `docs/work/PHASE_*_SUMMARY.md` if a phase summary exists
-      that covers Phase 2 follow-ups (otherwise skip — this doesn't
-      warrant a new summary file on its own).
+- [x] Tick the Phase 2 checkbox in
+      [`docs/DESIGN.md`](../DESIGN.md#phase-2--semantic-search) — the
+      tick now links the helper, the wrapper method, the CLI flag,
+      the HTTP query param, and the chat tool so future readers can
+      jump to every surface from one place.
+- [x] Expanded [`docs/DESIGN.md §4.5`](../DESIGN.md#combined-queries)
+      with the CLI flag table, the JSON response shape, and the
+      ranking-decay note.
+- [x] Added an "Unreleased" entry at the top of
+      [`RELEASE_NOTES.md`](../../RELEASE_NOTES.md) documenting the
+      new helper, CLI flags, HTTP params, and chat tool.
+- [x] No `PHASE_*_SUMMARY.md` warrants an update — Phase 2 was already
+      summarized; this finishes the one outstanding box and is tracked
+      adequately via DESIGN.md + RELEASE_NOTES.
 
 **Done when:** `git grep "Combined search: vector"` shows the checkbox
 ticked and nothing else stale.
+**Status:** verified — only the (now-ticked) DESIGN.md entry and this
+plan reference the phrase.
 
 ---
 

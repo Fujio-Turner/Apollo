@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Semantic error codes used by the Apollo HTTP API (Phase 14).
 
 Clients can route errors by `error.code` rather than fragile string matches

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 AI Chat service — Grok API with internal tool-calling for graph queries.
 
@@ -417,7 +418,14 @@ class ChatService:
             if node_id not in self.graph:
                 return json.dumps({"error": f"Node not found: {node_id}"})
 
-            data = {k: v for k, v in self.graph.nodes[node_id].items() if k != "embedding"}
+            # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the
+            # per-node ``source`` attr is gone — resolve it via
+            # :func:`graph.query.get_source`, then truncate as before
+            # so we don't blow the model's context window.
+            from apollo.graph.query import get_source
+
+            data = {k: v for k, v in self.graph.nodes[node_id].items()
+                    if k not in ("embedding", "source")}
 
             edges_in = []
             for pred in self.graph.predecessors(node_id):
@@ -429,17 +437,74 @@ class ChatService:
                 edata = dict(self.graph.edges[node_id, succ])
                 edges_out.append({"target": succ, "type": edata.get("type", "")})
 
-            # Truncate source to avoid blowing context
-            source = data.get("source", "")
-            if len(source) > 2000:
-                source = source[:2000] + "\n... (truncated)"
-                data = dict(data)
+            source = get_source(self.graph, node_id)
+            if source:
+                if len(source) > 2000:
+                    source = source[:2000] + "\n... (truncated)"
                 data["source"] = source
 
             return json.dumps({"id": node_id, **data, "edges_in": edges_in, "edges_out": edges_out}, default=str)
 
         elif name == "get_stats":
             return json.dumps(q.stats(), default=str)
+
+        elif name == "search_graph_expanded":
+            # Combined: semantic search + graph expansion in one round.
+            # Replaces the search_graph → N parallel get_neighbors fan-out
+            # for "find X and its callers / callees / refs" questions.
+            query_text = args.get("query", "")
+            top = int(args.get("top", 5) or 5)
+            type_filter = args.get("type")
+            expand = args.get("expand", "callers") or "callers"
+            depth = int(args.get("depth", 1) or 1)
+            per_seed_cap = int(args.get("per_seed_cap", 5) or 5)
+
+            if not (
+                self.search
+                and hasattr(self.search, "has_embeddings")
+                and self.search.has_embeddings()
+                and hasattr(self.search, "search_expanded")
+            ):
+                return json.dumps({
+                    "results": [],
+                    "warning": (
+                        "search_graph_expanded requires a semantic index; "
+                        "no embeddings found. Try search_graph + get_neighbors "
+                        "or re-run `apollo index` without --no-embeddings."
+                    ),
+                })
+
+            rows = self.search.search_expanded(
+                query_text, top_k=top, expand=expand, depth=depth,
+                per_seed_cap=per_seed_cap, node_type=type_filter,
+            )
+            trimmed = []
+            for seed in rows:
+                neighbors = [
+                    {
+                        "id": n.get("id"),
+                        "name": n.get("name"),
+                        "type": n.get("type"),
+                        "path": n.get("path"),
+                        "line_start": n.get("line_start"),
+                        "edge": n.get("edge"),
+                        "direction": n.get("direction"),
+                        "depth": n.get("depth"),
+                    }
+                    for n in seed.get("neighbors", [])
+                ]
+                cluster = {
+                    "id": seed.get("id"),
+                    "name": seed.get("name"),
+                    "type": seed.get("type"),
+                    "path": seed.get("path"),
+                    "line_start": seed.get("line_start"),
+                    "neighbors": neighbors,
+                }
+                if "truncated" in seed:
+                    cluster["truncated"] = seed["truncated"]
+                trimmed.append(cluster)
+            return json.dumps({"results": trimmed, "expand": expand, "depth": depth}, default=str)
 
         elif name == "search_graph_multi":
             queries = args.get("queries") or []

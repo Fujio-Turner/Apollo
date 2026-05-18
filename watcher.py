@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 File watcher — monitors a directory for changes and triggers incremental graph updates.
 
@@ -250,6 +251,12 @@ class FileWatcher:
                     removed_nodes.append(nid)
             self._path_index.pop(rel_path, None)
             self._file_hashes.pop(rel_path, None)
+            # Phase 4: drop the deleted file's text from the sidecar
+            # too, otherwise ``_file_text`` would grow unboundedly
+            # across watcher sessions.
+            ft = self.graph.graph.get("_file_text")
+            if isinstance(ft, dict):
+                ft.pop(rel_path, None)
             logger.info("Removed nodes for deleted file: %s", rel_path)
 
         # Handle changed/new files — re-parse and update graph.
@@ -282,6 +289,22 @@ class FileWatcher:
                 continue
 
             parsed["rel_path"] = rel_path
+
+            # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: attach the
+            # file's full source text so ``_build_file_nodes`` can
+            # populate ``graph.graph["_file_text"][rel_path]`` — the
+            # sidecar the rest of the system (embedder, API, search)
+            # now slices for per-node ``source``. Watcher doesn't use
+            # the streaming parse path, so we read here.
+            try:
+                parsed["_full_file_text"] = (
+                    self.root / rel_path
+                ).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                # File vanished between hash + re-parse; skip the
+                # sidecar update. ``get_source`` falls back to a
+                # legacy ``source`` attr or empty string.
+                pass
 
             # Rebuild nodes for this file using a temporary builder
             temp_builder = GraphBuilder(parsers=self.parsers)
@@ -326,8 +349,14 @@ class FileWatcher:
 
             # Collect embed candidates instead of embedding inline.
             if self.embedder:
+                # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the
+                # per-node ``source`` attr no longer exists; resolve
+                # the embedding text via the ``_file_text`` sidecar.
+                # ``get_source`` returns the legacy attr on older
+                # graphs, so watcher behavior is unchanged either way.
+                from apollo.graph.query import get_source
                 for nid in new_for_file:
-                    source = self.graph.nodes[nid].get("source")
+                    source = get_source(self.graph, nid)
                     if source and len(source.strip()) >= 40:
                         embed_node_ids.append(nid)
                         embed_texts.append(source)

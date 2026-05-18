@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Background reindex service for periodic graph freshness.
 
@@ -228,32 +229,17 @@ class ReindexService:
                 result.stats.files_skipped,
             )
 
-            # Carry over per-node ML attrs (and embeddings) for nodes
-            # that survived the resolve so we don't lose precomputed
-            # work the parser doesn't re-emit. Restrict to a known
-            # whitelist so we never re-attach stale source/parser fields.
-            _PRESERVED_NODE_ATTRS = (
-                "embedding", "pagerank", "betweenness",
-                "in_degree", "out_degree",
-                "cluster_id", "umap_xy", "community_id",
-                "keyphrases", "topic_id",
-                "outlier_score", "outlier_reason",
-            )
+            # Phase 8 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: the
+            # ``_PRESERVED_NODE_ATTRS`` carry-over loop that used to
+            # live here is gone — ``ResolveFullStrategy.run`` now
+            # mutates ``graph_in`` in place and snapshots / re-attaches
+            # the ML attrs itself during the per-file remove + re-add.
+            # Same applies to the per-graph ``ml_clusters`` /
+            # ``ml_topics`` / ``ml_dead_code`` sidecars: in-place
+            # mutation keeps them on ``graph_in`` for free (the
+            # strategy never wipes ``graph.graph`` at all). What was a
+            # multi-MB attribute-copy loop is now a no-op.
             graph_out = result.graph_out
-            for nid in graph_out.nodes():
-                if nid not in graph_in:
-                    continue
-                src = graph_in.nodes[nid]
-                dst = graph_out.nodes[nid]
-                for k in _PRESERVED_NODE_ATTRS:
-                    if k in src and k not in dst:
-                        dst[k] = src[k]
-
-            # Carry over graph-level ML sidecars (ml_clusters,
-            # ml_topics, ml_dead_code) the same way.
-            for k in ("ml_clusters", "ml_topics", "ml_dead_code"):
-                if k in graph_in.graph and k not in graph_out.graph:
-                    graph_out.graph[k] = graph_in.graph[k]
 
             # Save results
             self.store.save(graph_out)

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.makefile1 — Makefile plugin for Apollo
 ===============================================

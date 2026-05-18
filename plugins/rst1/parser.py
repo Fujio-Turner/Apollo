@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.rst1 — reStructuredText plugin for Apollo
 =================================================

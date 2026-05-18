@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Unit tests for spatial module."""
 import pytest
 

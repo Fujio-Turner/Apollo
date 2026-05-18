@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """HTTP API routes for session management."""
 
 from fastapi import APIRouter, HTTPException, Query, Depends

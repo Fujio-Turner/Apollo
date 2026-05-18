@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.rmarkdown1 — R Markdown plugin for Apollo.
 

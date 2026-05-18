@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Graph query engine — structural queries over the knowledge graph.
 """
@@ -7,6 +8,83 @@ from collections import deque
 from typing import Optional
 
 import networkx as nx
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY — source-text helper.
+#
+# Before Phase 4, every function / method / class / document / section
+# / code_block node carried its own ``source`` string attribute.
+# For a typical code file that means the same characters are duplicated
+# 3–5× across nodes (class source contains all method sources, which
+# contain func sources, etc.) — the single biggest memory hog on a
+# medium-sized project.
+#
+# Phase 4 stores one copy of every indexed file's full source text in
+# the graph-level sidecar ``graph.graph["_file_text"]`` and drops the
+# per-node ``source`` attr. Readers call :func:`get_source` to slice
+# the file text on demand using the node's ``line_start`` / ``line_end``
+# (which the parsers were already populating).
+#
+# Backward compat: a legacy graph loaded from disk that still has
+# per-node ``source`` attrs falls through the legacy branch — the
+# helper returns ``data["source"]`` unchanged. So this change is safe
+# to deploy against existing ``graph.json`` files.
+# ─────────────────────────────────────────────────────────────────────
+def get_source(graph: nx.DiGraph, node_id: str) -> str:
+    """Return the source text for ``node_id`` (Phase 4).
+
+    Resolution order:
+
+    1. If ``graph.nodes[node_id]`` carries a legacy ``source`` string
+       attribute, return it verbatim (back-compat for graphs persisted
+       before Phase 4 added the file-text sidecar).
+    2. Otherwise look up ``graph.graph["_file_text"][data["path"]]``
+       and slice it by ``data["line_start"]`` / ``data["line_end"]``
+       (1-indexed, inclusive — matches the parser output).
+    3. If neither is available, return an empty string. Callers should
+       treat the result the way they treated the old empty/missing
+       ``source`` attribute (skip embedding, skip keyword extraction,
+       …) — no exception is raised.
+
+    The function never mutates the graph or the node attrs; it only
+    reads. It is safe to call concurrently.
+    """
+    if node_id not in graph.nodes:
+        return ""
+    data = graph.nodes[node_id]
+    legacy = data.get("source")
+    if isinstance(legacy, str):
+        return legacy
+    path = data.get("path")
+    if not path:
+        return ""
+    file_text_map = graph.graph.get("_file_text") or {}
+    text = file_text_map.get(path)
+    if not isinstance(text, str) or not text:
+        return ""
+    ls = data.get("line_start")
+    le = data.get("line_end")
+    if ls is None or le is None:
+        # Caller asked for a sub-range that doesn't exist — return the
+        # whole file rather than nothing so the worst case is "too much
+        # context" instead of "no context".
+        return text
+    try:
+        ls_i = max(1, int(ls))
+        le_i = int(le)
+    except (TypeError, ValueError):
+        return text
+    if le_i < ls_i:
+        return ""
+    # ``splitlines(keepends=False)`` would lose the trailing newline
+    # discrimination some callers (e.g. embedding text comparison)
+    # care about. ``str.split("\n")`` is faithful to the source bytes.
+    lines = text.split("\n")
+    # Clamp end to file size — the parser may have reported a
+    # line_end one past EOF for files without a trailing newline.
+    le_i = min(len(lines), le_i)
+    return "\n".join(lines[ls_i - 1:le_i])
 
 
 def _normalize_node_types(

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Storage backend protocol — defines the interface all storage backends must implement.
 """

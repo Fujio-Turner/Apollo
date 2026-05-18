@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.javascript1 — JavaScript / ECMAScript plugin for Apollo
 ================================================================

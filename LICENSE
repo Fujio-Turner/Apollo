@@ -1,0 +1,54 @@
+Apollo
+Copyright © 2026 Fujio Turner. All rights reserved.
+
+------------------------------------------------------------------------------
+
+DEFAULT LICENSE FOR THIS REPOSITORY
+
+Unless an individual file declares a different license in its own header,
+every file in this repository is licensed under the
+
+    Business Source License 1.1 (BUSL-1.1)
+
+with the following parameters:
+
+    Licensor:             Fujio Turner
+    Licensed Work:        Apollo
+    Additional Use Grant: None.  No production use of the Licensed Work
+                          is permitted without a commercial license from
+                          the Licensor.
+    Change Date:          2030-05-18
+    Change License:       Apache License, Version 2.0
+    Contact:              mail@fuj.io
+
+The full text of the Business Source License 1.1, with the parameters
+above, lives at:
+
+    licenses/BSL-1.1.txt
+
+------------------------------------------------------------------------------
+
+PER-FILE LICENSE OVERRIDES
+
+Where a file carries its own license header, that header takes precedence
+over this default.  Known overrides at the time of this writing:
+
+    docs/HYBRID_GRAPH_SPATIAL.md
+        Text, figures, and code listings:
+        Creative Commons Attribution 4.0 International (CC BY 4.0)
+        https://creativecommons.org/licenses/by/4.0/
+
+------------------------------------------------------------------------------
+
+THIRD-PARTY COMPONENTS
+
+This repository may include third-party software in vendored, packaged,
+or generated form (for example, content under venv/, node_modules/,
+htmlcov/, or storage_binary/).  Such third-party software is licensed by
+its respective copyright holders under its own terms; this file does not
+re-license it.
+
+------------------------------------------------------------------------------
+
+For commercial licensing of Apollo, or any question about this license,
+contact: mail@fuj.io

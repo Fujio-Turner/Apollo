@@ -16,6 +16,7 @@ tailwind.config = {
 };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts-gl@2/dist/echarts-gl.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts-wordcloud@2/dist/echarts-wordcloud.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <!-- highlight.js theme. Default to GitHub LIGHT to match the default
@@ -36,7 +37,7 @@ tailwind.config = {
 <nav class="nav-sidebar bg-base-200 border-r border-base-300 flex flex-col" id="nav-sidebar">
   <div class="nav-header">
     <div class="nav-logo-icon bg-primary text-primary-content cursor-pointer" onclick="toggleNav()">AP</div>
-    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer · <span id="app-version">v1.3.0</span></div></div>
+    <div class="nav-logo-text flex-1">Apollo<div class="nav-logo-sub">File Explorer · <span id="app-version">v1.4.0</span></div></div>
     <button type="button" class="btn btn-ghost btn-square btn-sm nav-collapse-btn" onclick="toggleNav()" aria-label="Collapse sidebar">
       <svg id="nav-collapse-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" /></svg>
     </button>
@@ -141,12 +142,12 @@ tailwind.config = {
       <div class="split-right flex-1" id="split-right">
         <div class="vsplit-pane flex-1">
           <div class="vsplit-top" id="vsplit-top">
-            <!-- Graph variant tabs — dev mode only (?dev=true). Lets us A/B
-                 test the current force-directed graph (Graph 1) against the
-                 stable-layout ECharts variant (Graph 2). -->
-            <div id="graph-variant-tabs" class="graph-variant-tabs hidden bg-base-200/85 border border-base-300" role="tablist">
+            <!-- Graph variant tabs. Lets the user toggle between the
+                 force-directed graph (Graph 1) and the 3D scatter view
+                 (Graph 2 — see issue #15). -->
+            <div id="graph-variant-tabs" class="graph-variant-tabs bg-base-200/85 border border-base-300" role="tablist">
               <button type="button" class="btn btn-ghost btn-xs graph-variant-tab active" data-graph-variant="1" onclick="switchGraphVariant('1')">Graph 1</button>
-              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab" data-graph-variant="2" onclick="switchGraphVariant('2')">Graph 2</button>
+              <button type="button" class="btn btn-ghost btn-xs graph-variant-tab" data-graph-variant="2" onclick="switchGraphVariant('2')">Graph 2 (3D)</button>
             </div>
             <div id="graph-chart"></div>
             <div id="graph-chart-2" class="hidden"></div>

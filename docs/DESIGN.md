@@ -173,6 +173,12 @@ Cross-file resolution is the hardest part. Strategy:
 - Build a global symbol table: `{qualified_name: node_id}`.
 - When a call like `mailer.emails()` is found, look up `mailer` in imports → resolve to `src/utils/mailer.py` → find `emails` in that file's symbols.
 
+The "for each file, run the parser…" step is no longer a sequential
+fold over a single materialised list — it is a streaming pipeline that
+overlaps parsing, graph construction, embedding, and resolve. See
+§4.2.5 below for the pipeline shape and §4.2.6 for the memory budget
+that shape was designed to fit.
+
 #### 4.2.1 File-skipping invariants
 
 The chat tools, file-explorer tree, semantic search, and `safe_path()`
@@ -214,7 +220,54 @@ plugin you expect? Is the file under a `_CORE_SKIP_DIRS` entry or a
 plugin's `ignore_dirs`? Almost every "indexing bug" report turns out to
 be one of those three.
 
-#### 4.2.2 Project-switch invariants
+#### 4.2.3 Branch-keyed stores (git checkouts)
+
+When the project root is a git checkout, the per-project store path is
+suffixed with the current branch so each branch maintains an
+independent index. Without this, switching branches (`git checkout
+other`) would silently leave the watcher and chat answering against
+the *previous* branch's tree — files that exist on one branch but not
+the other would either show as missing (false negatives) or as
+phantom orphans (false positives).
+
+The on-disk layout looks like:
+
+```
+_apollo/
+├── graph__main.json
+├── graph__issue__17.json
+├── cblite/
+│   ├── apollo_<md5>__main.cblite2
+│   └── apollo_<md5>__feature-x.cblite2
+```
+
+Rules:
+
+1. **`apollo.git.branched_path()` is the single source of truth.** All
+   store path resolution — `web.server._resolve_project_store_location`,
+   `ProjectManager._resolve_cbl_path`, and the JSON path in
+   `ProjectManager.reprocess` — funnels through it. Non-git folders
+   pass through unchanged so the legacy single-store layout still
+   works for non-versioned projects.
+2. **Branch name sanitisation must be reversible-enough for humans.**
+   `/` collapses to `__` (so `issue/17` becomes `issue__17`); other
+   unsafe filename characters collapse to `_`. Detached HEAD picks a
+   per-SHA suffix (`detached_<short>`) so each detached state gets a
+   distinct store.
+3. **`BranchWatcher` triggers swaps automatically.** Started/stopped
+   by `_swap_to_project_store`; on a `git checkout` it re-reads
+   `.git/HEAD` and calls back into the same swap helper. The fast
+   path inside `_swap_to_project_store` (same-location detection)
+   makes repeat / no-op events cheap. Worktrees are supported via
+   the `.git`-file gitdir indirection that `apollo.git.head_watch_path`
+   resolves.
+4. **`reprocess` is per-branch.** A "full" reprocess only deletes the
+   active branch's graph/cblite — other branches' indexes survive.
+   This matches the user's mental model ("I'm reindexing this
+   branch") and avoids destroying expensive work the first time
+   someone clicks "Reprocess" after switching branches.
+
+#### 4.2.4 Project-switch invariants
 
 The web server is long-lived: a single process serves multiple projects
 as the user clicks "Open Folder". `ChatService`, on the other hand, is
@@ -314,6 +367,222 @@ it safe to run on every session start.
 If a future feature adds a third state directory (e.g. `_apollo_cache/`),
 extend the block here so users get the new entry the next time they
 open the project.
+
+#### 4.2.5 Indexing pipeline (streaming + concurrent)
+
+The naive "parse everything → build everything → embed everything →
+save" pipeline lived through Apollo's prototype phase, but on
+medium-sized projects the *sum* of those stages dominated wall-clock
+and the per-stage peak memory was 3-5× the persisted graph size. The
+indexer has since been rewritten as a streaming pipeline whose stages
+overlap whenever the dependency DAG allows. The current shape is:
+
+```
+╭──────────────╮    futures        ╭───────────────────╮
+│ ThreadPool    │  as_completed →  │ _build_file_nodes │
+│ parser pool   │                  │ (main thread)     │
+│ (per-file     │                  ╰─────────┬─────────╯
+│  parse_one)   │                            │
+╰──────────────╯                            │
+                          ╭──────────────────┤
+                          ▼                  ▼
+                  ╭──────────────╮   ╭───────────────╮
+                  │ EmbedQueue   │   │ _minimal_     │
+                  │ daemon       │   │ resolve_      │
+                  │ thread       │   │ record list   │
+                  │ (Phase 6)    │   ╰───────┬───────╯
+                  ╰──────┬───────╯           │
+                         │                   ▼
+                         │           ╭───────────────╮
+                         │           │ _resolve_     │
+                         │           │ calls (after  │
+                         │           │ all files in) │
+                         │           ╰───────┬───────╯
+                         ▼                   │
+                  ╭──────────────╮           │
+                  │ Embeddings   │           │
+                  │ written back │           │
+                  │ to nodes     │           │
+                  ╰──────┬───────╯           │
+                         ▼                   ▼
+                  ╭──────────────────────────────╮
+                  │ Phase 7 fan-out:             │
+                  │  • run_all_passes(parallel=  │
+                  │    True) — DAG-scheduled ML  │
+                  │  • SpatialMapper.compute_all │
+                  ╰──────────────┬───────────────╯
+                                 ▼
+                  ╭──────────────────────────────╮
+                  │ Phase 7 fan-out (final):     │
+                  │  • JsonStore.save (streaming │
+                  │    writer, Phase 5)          │
+                  │  • SemanticSearch rebuild    │
+                  ╰──────────────────────────────╯
+```
+
+Key contracts pinned by `tests/test_index_invariants_phase10.py`:
+
+1. **Parsed dicts are reclaimed mid-build** (Phase 1). The parser pool
+   feeds `as_completed` futures into `_build_file_nodes` and the heavy
+   per-file payload (source text, docstrings, markdown sections, code
+   blocks…) is dropped once the file's nodes are in the graph. Only a
+   tiny `_minimal_resolve_record` (rel_path + imports + per-func call
+   list) survives into the resolve step.
+2. **No per-node `source` attr** on `function` / `method` / `class` /
+   `document` / `section` / `code_block` nodes (Phase 4). One copy of
+   each file's text lives in `graph.graph["_file_text"]`; readers
+   call `graph.query.get_source(graph, nid)` to slice it on demand.
+3. **Embeddings are `float32` ndarrays in memory** (Phase 3), persisted
+   as base64 in JSON (uniform across the JSON and CouchbaseLite
+   backends). The legacy `list[float]` form is still accepted at load
+   time for back-compat with pre-Phase-3 graph files.
+4. **`JsonStore.save` does not mutate the live graph** (Phase 5). The
+   streaming writer keeps a one-attribute-dict-at-a-time defensive
+   copy so the in-place base64 encoding for embeddings never leaks
+   back to the in-RAM graph.
+5. **`EmbedQueue` pipelines with parsing** (Phase 6). As soon as a
+   file's nodes are added, eligible texts are pushed onto a background
+   daemon thread that batches and calls
+   `Embedder.embed_texts_array(...)`. Cache hits short-circuit without
+   touching the queue. Total wall-clock approaches `max(parse, embed)`
+   instead of `parse + embed`.
+6. **ML passes run in parallel** (Phase 7). `run_all_passes(graph,
+   parallel=True, max_workers=N)` schedules independent passes
+   (PageRank, Louvain, vulture, IsolationForest, UMAP→HDBSCAN,
+   KeyBERT, BERTopic) over a `ThreadPoolExecutor`. Each pass writes
+   to disjoint node-attr / graph-attr keys so no lock is needed.
+7. **Save + search-rebuild fan out** (Phase 7). After the ML stage,
+   `JsonStore.save` and `SemanticSearch` rebuild run concurrently on
+   two worker threads — the UI's status spinner shows the union
+   label `"Saving + rebuilding search"`.
+8. **Sweep mutates the input graph in place** (Phase 8).
+   `ResolveFullStrategy.run` no longer does
+   `nx.DiGraph(graph_in)`; the input *is* the output. Per-node ML
+   attrs (`embedding`, `pagerank`, `cluster_id`, …) are snapshotted
+   per dirty file and merged back on the freshly-rebuilt nodes.
+9. **Stat-mismatched rehash is parallel** (Phase 9). The
+   `read_bytes() + sha256 + md5` work for incremental-mode files
+   whose mtime/size differ from the cache runs in a
+   `ThreadPoolExecutor` (`graph.builder._parallel_rehash`).
+
+The CLI / web-UI orchestrator lives in `web.server._do_index`; the
+background sweep counterpart is `apollo.reindex_service.run_sweep`.
+
+#### 4.2.6 Indexing memory budget
+
+The per-stage peak-RSS budget the streaming pipeline above is sized
+for, expressed in *multiples of the persisted graph size G* (where G
+≈ 1.2-1.6 MB per 1k LOC for a typical Python codebase):
+
+| Stage                              | Pre-plan peak | Current peak | Notes                                                                 |
+|------------------------------------|---------------|--------------|-----------------------------------------------------------------------|
+| Parse + build                      | ~3× G         | ~1.2× G      | Phase 1 streams parser output instead of holding `parsed_files`.       |
+| Embed (full)                       | ~2× G         | ~1.3× G      | Phase 3 dtype switch (`list[float]` → `float32` ndarray) ~halves vectors. Phase 6 overlap removes a separate peak. |
+| ML passes                          | ~2× G         | ~1.5× G      | Phase 7 parallel; numpy/networkx release the GIL so no extra copies.   |
+| Save                               | ~2× G         | ~1.05× G     | Phase 5 streaming writer — no full payload materialisation in orjson.  |
+| Incremental sweep                  | ~3× G         | ~1.2× G      | Phase 8 in-place mutation — no `nx.DiGraph(graph_in)` deep copy.       |
+| Stat-mismatched rehash (100 files) | sequential    | ~3× faster   | Phase 9 thread pool over IO + GIL-releasing crypto.                    |
+
+Numbers above are the design targets. The actual per-run capture is
+the job of `scripts/bench_index.py` (which writes a JSON report per
+run under `docs/work/bench/`), and `scripts/bench_check.py` compares
+two such reports to flag regressions. The CI hook is a non-blocking
+diff against a checked-in baseline — see Phase 10 of
+[`docs/work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`](work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md).
+
+When adding a new pipeline stage, ask:
+
+1. **Does it need the full parser output?** If not, keep it on the
+   `_minimal_resolve_record` / `_file_text` side — don't reach into
+   `parsed`.
+2. **Does it write the same per-node attribute keys as an existing
+   ML pass?** If yes, do NOT add it to `_PASS_DAG` without a lock.
+3. **Does it mutate `graph.graph` keys other passes read?** If yes,
+   schedule it as a join-point rather than a parallel pass.
+4. **Does it materialise a list/dict of nodes?** Prefer iterating
+   `graph.nodes(data=True)` directly — the streaming-save writer
+   demonstrates that even orjson can be fed one attrs dict at a time.
+
+#### 4.2.7 Parallel parsing — process pool (Phase 2)
+
+The parser stage of §4.2.5 was originally a `ThreadPoolExecutor`, which
+is a poor fit for the workload: the Python AST plugin and most
+non-tree-sitter plugins are GIL-bound, so threads just added scheduling
+overhead with no speedup. Phase 2 of
+[`docs/work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md`](work/PLAN_INDEX_MEMORY_AND_CONCURRENCY.md)
+swapped the parser pool for a `ProcessPoolExecutor` while preserving
+the Phase 1 streaming contract (parsed dicts are still reclaimed
+mid-build, one file at a time).
+
+**Shape.** `graph.builder._parse_build_resolve_streaming` accepts a
+`parser_pool` kwarg with three branches:
+
+- `sync` — in-process loop, no executor at all. Deterministic test
+  path; used by the unit tests that pin parse-order invariants.
+- `thread` — legacy `ThreadPoolExecutor` behaviour. Kept for
+  backward-compat and as the auto-downgrade target for any project
+  whose enabled parsers include a plugin that advertises
+  `safe_for_processes = False` (default is `True`).
+- `process` — `ProcessPoolExecutor` with
+  `initializer=_init_worker_parsers` and `chunksize=8`. Each worker
+  re-runs `apollo.plugins.discover_plugins()` once at startup so
+  tree-sitter C handles and other unpickle-able plugin state are
+  constructed locally inside the worker rather than crossing the
+  process boundary.
+
+**Pickle boundary.** Work items are tuples of *parser key* (a stable,
+picklable string returned by `_parser_key(parser)` — currently
+`type(parser).__module__`, or `None` for the parser-less stub path),
+not parser *instances*. The worker resolves the key against its own
+`{key → BaseParser}` table built by the initializer, then delegates to
+the existing `_parse_one()` so the parse contract is identical to the
+thread/sync branches. Parsed dicts are streamed back via
+`executor.map(...)` and fed straight into `_build_file_nodes` on the
+main thread — the per-file payload is dropped as soon as its nodes are
+in the graph, so the Phase 1 GC-on-each-file invariant still holds.
+
+**Pool selection.** `_resolve_parser_pool_mode(parsers, requested=None)`
+picks the mode from (in order): the explicit `parser_pool=` kwarg, the
+`APOLLO_PARSER_POOL` env var, or the default `process` (flipped from
+`thread` after the Apollo-self A/B below showed a 2.7× / 2.3× win on
+every safe-parser project). An invalid string also collapses to the
+default. If the active parser list contains any plugin with
+`safe_for_processes = False`, `process` is auto-downgraded to `thread`.
+`scripts/bench_index.py --parser-pool {thread,process,sync}` propagates
+the choice to every call site (web server, `reindex_service`,
+`watcher`) via that env var; explicit `APOLLO_PARSER_POOL=thread` is
+the escape hatch for anyone debugging a worker crash.
+
+**Cross-platform.** `_parse_one_process` and `_init_worker_parsers`
+are module-level callables in `graph.builder`, so spawn-mode re-import
+on macOS and Windows works without any plugin-side changes. The known
+spawn pitfalls (module-level side effects in `plugins/__init__.py` and
+`apollo/__init__.py`) were audited as part of Phase 2.
+
+**Measured impact** (Apollo-self, `--no-embeddings --no-ml`):
+
+| mode    | parse_and_build wall | parse peak RSS | total wall |
+|---------|----------------------|----------------|------------|
+| thread  | 8.32 s               | 250.5 MB       | 9.55 s     |
+| process | **3.06 s** (2.7×)    | 215.8 MB       | **4.16 s** (2.3×) |
+
+Large-external-corpus numbers are still pending (the chat sandbox
+can't fit a 10k+50k-LOC embed+ML run); pin those before claiming the
+RSS gate of §4.2.6.
+
+**Pitfalls when adding a new plugin:**
+
+1. If your plugin holds a non-picklable handle (raw C pointer, open
+   file, threading primitive) that cannot be reconstructed cheaply in
+   each worker, set `safe_for_processes = False` in the plugin's
+   `config.json` so the auto-downgrade in `_resolve_parser_pool_mode`
+   keeps it on the thread pool.
+2. If your plugin eagerly loads a grammar or model at import time,
+   wrap it in `functools.lru_cache` — under `process` mode the import
+   runs once *per worker*, not once per indexer.
+3. Worker crashes are silent unless `future.result()` is awaited.
+   Keep the surrounding `try/except Exception` and always log the
+   worker PID + file path on failure.
 
 ### 4.3 Storage Backend
 
@@ -486,12 +755,58 @@ Implementation: Embed the query → ANN search in the vector index → return to
 
 #### Combined Queries
 
-The most powerful mode — vector search to find candidates, then graph traversal to expand context:
+The most powerful mode — vector search to find candidates, then graph
+traversal to expand context in one round. Implemented by
+[`search/expand.py`](../search/expand.py) on top of
+[`search/semantic.py`](../search/semantic.py)
+(`SemanticSearch.search_expanded`) and the matching CBL-backed sibling
+in [`search/cblite_semantic.py`](../search/cblite_semantic.py).
 
 ```
 # Find email-related code and show their callers
-> search "email" --top 5 --expand callers
+> search "email" --top 5 --expand callers --depth 1
 ```
+
+CLI flags (additive — flat `search "email"` is byte-identical to today):
+
+| Flag              | Default | Notes                                                    |
+|-------------------|---------|----------------------------------------------------------|
+| `--expand KIND`   | `none`  | One of `none / callers / callees / neighbors / references` |
+| `--depth N`       | `1`     | BFS depth; ignored when `--expand=none`                  |
+| `--per-seed-cap N`| `10`    | Cap on neighbors per seed (`… +N more` summary printed when truncated) |
+
+Response shape (`--expand≠none`) — each cluster is a seed hit plus its
+structural neighborhood, ranked together:
+
+```jsonc
+[
+  {
+    "id": "func::mailer.py::send_email",
+    "score": 0.81,                      // cosine
+    "name": "send_email",
+    "type": "function",
+    "path": "mailer.py",
+    "line_start": 42,
+    "neighbors": [
+      {
+        "id": "func::user.py::notify",
+        "name": "notify", "type": "function",
+        "path": "user.py", "line_start": 17,
+        "edge": "calls", "direction": "in", "depth": 1,
+        "score": 0.405                  // seed_score / (1 + depth)
+      }
+      // … up to per_seed_cap
+    ],
+    "truncated": 12                     // only when neighbors were capped
+  }
+]
+```
+
+Neighbor ranking uses `seed_score / (1 + depth)` — a deliberate
+language-agnostic decay that keeps the merged list sortable by a single
+numeric key without paying for re-embedding every neighbor. See
+[`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md §3.6`](work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md#36-ranking-notes)
+for the rationale and the Phase-2.5 path to per-neighbor re-scoring.
 
 ### 4.6 ML Pipeline (PLAN_ML_LIBS)
 
@@ -1500,7 +1815,7 @@ Semantic search (embeddings) and AI chat come after the structural index is soli
 - [x] Embed node source text with `sentence-transformers`
 - [x] Brute-force cosine similarity search (in-memory)
 - [x] CLI: `search <text> --top k`
-- [ ] Combined search: vector results + graph expansion
+- [x] Combined search: vector results + graph expansion ([`search/expand.py`](../search/expand.py), [`SemanticSearch.search_expanded`](../search/semantic.py), CLI `--expand`, HTTP `/api/search?expand=…`, chat `search_graph_expanded`; see [`docs/work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md`](work/PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md))
 
 ### Phase 3 — Browser UI
 - [x] FastAPI backend with REST API endpoints
@@ -2561,3 +2876,116 @@ is a pure optimization gated on observed need.
 - Log queue depth and idle/max-wait flushes at INFO under the
   `apollo.reindex.queue` logger per [`guides/LOGGING.md`](../guides/LOGGING.md).
   No `print()`.
+
+---
+
+## 16. Hybrid Graph + Spatial Re-ranking
+
+> Full treatment: [`docs/HYBRID_GRAPH_SPATIAL.md`](HYBRID_GRAPH_SPATIAL.md) — white-paper-style write-up with worked examples, failure modes, the functional-programming form, and the underlying math.
+
+Apollo already produces **two independent views** of every node:
+
+| View      | Source                                      | What it answers                           |
+|-----------|---------------------------------------------|-------------------------------------------|
+| Graph     | parser-derived edges (`calls`, `imports`, …) | "what is *syntactically* connected to X?" |
+| Spatial   | [`spatial.py`](../spatial.py) → `(x, y, z, face)` | "what is *semantically/architecturally* close to X?" |
+
+Until now they have been queried in isolation. §16 formalises a single
+**consensus operator** that combines them, plus the cross-product table
+that turns disagreement between the two views into a useful signal.
+
+### 16.1 The 2×2 of agreement
+
+| Graph edge? | Spatially close? | Meaning                                                  | Use                                              |
+|-------------|------------------|----------------------------------------------------------|--------------------------------------------------|
+| yes         | yes              | strongly relevant — high-confidence answer               | top of every result set                          |
+| yes         | no               | structural-only edge — glue code, stale call, leaky abstraction | flag in `find_outliers`                  |
+| no          | yes              | hidden similarity — same topic/role, no link             | **discovery** / suggested-link surface           |
+| no          | no               | unrelated                                                | drop                                             |
+
+The "no edge, yes spatial" quadrant is the most valuable one and the
+one a pure-graph query can never surface.
+
+### 16.2 Operator — graph-first, spatial-as-re-rank
+
+Given a seed `s`, walk the graph N hops → candidate set `C`. For every
+`c ∈ C`:
+
+```
+score(s, c) =  w_g · 1/(1 + hops(s, c))                  # graph proximity
+            +  w_x · (1 − |Δx(s, c)| / 360)              # semantic agreement (x is 0–360°)
+            +  w_y · (1 − |Δy(s, c)| / 360)              # architectural-layer agreement
+            +  w_f · 𝟙[face(c) == face(s)]               # role agreement
+            +  w_z · z(c)                                # importance prior (PageRank)
+```
+
+The "3 of 5 converge, 2 are outliers" pattern falls out for free:
+outliers have low `x`/`y`/`face` agreement with the cluster centroid
+and drop to the bottom of the ranked list.
+
+### 16.3 Intent-aware weights
+
+The same operator serves opposite intents by reweighting:
+
+| Intent                    | Boost                       | Demote                | Example query                                |
+|---------------------------|-----------------------------|-----------------------|----------------------------------------------|
+| Semantic ("what does X do?") | `w_x`, `w_f`             | `w_g`                 | chat answers, "find similar"                 |
+| Structural ("who calls X?")  | `w_g`                    | `w_x`, `w_f`          | refactor impact, dependency audit            |
+| Discovery ("anything missing?") | `w_x`, `w_f`; **invert** `w_g` (penalise edges) | — | "code that should be linked but isn't"    |
+
+This becomes a `rerank: "semantic" | "structural" | "discovery" | "hybrid"`
+knob on the [JSON query DSL (§6)](#6-query-language-options).
+
+### 16.4 Where it slots in
+
+| Surface                                    | Change                                                                  |
+|--------------------------------------------|-------------------------------------------------------------------------|
+| `search_graph_by_keyphrase` / neighbour expansion | Re-rank traversal results by `score(s, c)` before truncation.    |
+| `find_outliers`                            | Promote the "graph-edge, spatially-distant" pair to first-class output. |
+| Chat retrieval                             | Use the semantic-intent weighting before sending context to Grok.       |
+| Idea Cloud / graph view                    | Optional "show hidden-similarity edges" toggle (no-edge / yes-spatial). |
+
+### 16.5 Known failure modes
+
+The full taxonomy is in the white paper, but the three that matter
+here are:
+
+1. **Embedding collapse near boilerplate.** Auto-generated code,
+   licence headers, and `__init__.py` shims all sit on the same `x`
+   coordinate; spatial agreement becomes meaningless and re-ranking
+   degenerates to graph-only.
+2. **Layered architectures with deep stacks.** `y` (call-depth)
+   compresses 8-layer hexagonal stacks into the same bucket as
+   2-layer scripts; the agreement term spuriously fires across
+   unrelated layers.
+3. **Cross-language calls the parser missed.** Spatial agreement
+   *without* a graph edge is the right discovery signal — but in a
+   polyglot repo it can also be a parser bug masquerading as
+   discovery. The white paper covers how to distinguish them.
+
+### 16.6 Implementation note
+
+Nothing in §16 requires a new store or a new index. `compute_all`
+already writes `spatial` into every node payload; the operator is a
+single function over the existing in-memory graph and can ship as a
+re-rank step inside the query engine.
+
+### 16.7 IP & patent-landscape note
+
+The white paper ([`docs/HYBRID_GRAPH_SPATIAL.md`](HYBRID_GRAPH_SPATIAL.md))
+is published under **CC BY 4.0** with an explicit defensive-publication
+notice, naming the operator `H(s, c)`, the 4-D spatial view, and the
+2 × 2 disagreement matrix as prior art on the date of first commit.
+
+The closest commercial competitor, **Sourcegraph**, holds one
+relevant U.S. patent — **US 9,753,723 B2** (Slack & Liu, 2017) —
+which covers *index construction* (the conceptual ancestor of
+LSIF/SCIP), not retrieval or re-ranking. Apollo's contribution sits
+one layer above that index and is outside the patent's scope. See
+§9.3 of the white paper for the full analysis.
+
+The reference implementation ([`spatial.py`](../spatial.py)) remains
+under the repository licence ([`licenses/BSL-1.1.txt`](../licenses/BSL-1.1.txt));
+the *idea* is intentionally open via the defensive-publication
+posture so the operator can be adopted in any code-intelligence
+stack without IP friction.

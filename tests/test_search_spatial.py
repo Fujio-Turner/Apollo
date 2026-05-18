@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for search.spatial.SpatialSearch."""
 import networkx as nx
 import pytest

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Apollo API utilities — standardized request/response shapes (Phase 14)."""
 from .error_codes import ErrorCode
 from .responses import (

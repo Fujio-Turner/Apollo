@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.gradle1 — Gradle build script plugin for Apollo.
 

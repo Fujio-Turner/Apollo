@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 13 — integration tests for the /api/file/* and /api/project/search HTTP endpoints."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.java17 — Java 17 source-file plugin for Apollo
 =======================================================

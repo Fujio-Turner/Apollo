@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.terraform1 — Terraform plugin for Apollo.
 

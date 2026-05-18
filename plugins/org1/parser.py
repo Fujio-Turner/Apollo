@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.org1 — Org mode plugin for Apollo
 =========================================

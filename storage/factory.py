@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 Storage backend factory — creates the right store based on backend name.
 """

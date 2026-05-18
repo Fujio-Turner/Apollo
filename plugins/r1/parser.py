@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.r1 — R language source-file plugin for Apollo
 ======================================================

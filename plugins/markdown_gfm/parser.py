@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.markdown_gfm — GitHub Flavored Markdown plugin for Apollo
 =================================================================

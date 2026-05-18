@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Integration tests for TreeSitterParser with GraphBuilder."""
 import pytest
 from pathlib import Path

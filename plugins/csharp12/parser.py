@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.csharp12 — C# 12 source-file plugin for Apollo
 ======================================================

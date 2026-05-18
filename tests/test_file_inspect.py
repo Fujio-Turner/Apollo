@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Phase 13 — unit tests for the read-only file & source inspection module."""
 from __future__ import annotations
 

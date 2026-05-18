@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.node20 — Node.js 20 source-file plugin for Apollo
 ==========================================================

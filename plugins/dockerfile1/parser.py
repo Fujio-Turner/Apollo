@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.dockerfile1 — Dockerfile plugin for Apollo
 ==================================================

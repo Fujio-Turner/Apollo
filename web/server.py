@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 FastAPI web server for the code knowledge graph browser.
 """
@@ -24,6 +25,8 @@ import threading
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from apollo.graph.query import GraphQuery
+from apollo.git import branched_path, current_branch
+from apollo.git.watcher import BranchWatcher
 from apollo.logging_config import apply_settings as apply_logging_settings, configure_logging
 from apollo.projects import ProjectManager, register_project_routes
 from apollo.reindex_service import ReindexService, ReindexConfig
@@ -372,20 +375,68 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
     from pathlib import Path as _Path
 
     def _resolve_project_store_location(project_path, project_backend: str) -> str:
-        """Return the per-project store path for the given project root."""
+        """Return the per-project store path for the given project root.
+
+        For projects inside a git checkout, the path is suffixed with
+        ``__<branch>`` (DESIGN §4.2.3 — branch-keyed stores) so each
+        branch maintains its own index. Non-git folders fall through
+        to the legacy single-store layout.
+        """
         apollo_dir = _Path(project_path) / "_apollo"
         if project_backend == "cblite":
             # Reuse ProjectManager's hashing convention so the path matches
             # what the manifest expects (and what reprocess()/leave() act on).
             db_hash = project_manager._compute_db_hash(project_path)
-            return str(apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2")
-        return str(apollo_dir / "graph.json")
+            base = apollo_dir / "cblite" / f"apollo_{db_hash}.cblite2"
+        else:
+            base = apollo_dir / "graph.json"
+        return str(branched_path(base, project_path))
 
     @app.get("/api/active-store")
     def get_active_store():
         """Diagnostic: report the currently-active store location/backend."""
         loc = getattr(store, "_filepath", None) or getattr(store, "_db_path", None)
         return {"backend": backend, "location": loc, "root_dir": root_dir}
+
+    # ── Git branch awareness ──────────────────────────────────────────
+    # When the user runs ``git checkout <other-branch>``, the working
+    # tree changes under us. Per the branch-keyed store rule (DESIGN
+    # §4.2.3) each branch maintains its own _apollo/ store; a
+    # ``BranchWatcher`` watches ``.git/HEAD`` and swaps the active
+    # store to that branch's index as soon as a checkout happens.
+    # The watcher is per-project and is (re)bound by
+    # ``_swap_to_project_store`` whenever the user opens a different
+    # folder.
+    _branch_watcher: Optional[BranchWatcher] = None
+
+    def _on_branch_change(new_branch: str) -> None:
+        """Callback fired from the BranchWatcher thread on git checkout.
+
+        Re-runs the same per-project store swap with the new branch's
+        path. We rely on _swap_to_project_store's existing fast-path
+        (it no-ops when the resolved location hasn't changed) for any
+        spurious wake-ups.
+        """
+        current_root = root_dir
+        if not current_root:
+            return
+        try:
+            _swap_to_project_store(current_root)
+        except Exception:
+            logger.exception("failed to swap store after branch change to %s", new_branch)
+
+    @app.get("/api/git/branch")
+    def get_git_branch():
+        """Return the active project's branch (or null for non-git folders).
+
+        Surface for the UI to render a small "branch: <name>" badge so
+        it's obvious which branch's index is currently being queried.
+        """
+        return {
+            "root_dir": root_dir,
+            "branch": current_branch(root_dir) if root_dir else None,
+            "watcher_running": bool(_branch_watcher and _branch_watcher.running),
+        }
 
     def _swap_to_project_store(project_path) -> None:
         """Close the active store and reopen the per-project store for
@@ -394,8 +445,13 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         new project. Called from ``/api/projects/open`` and the startup
         auto-open path so opening an already-indexed project no longer
         leaves the chat answering against the previous project's data.
+
+        Also (re)binds the ``BranchWatcher`` to the new project so a
+        ``git checkout`` after the swap still triggers an automatic
+        store swap to the right branch's index.
         """
         nonlocal store, graph, q, search, chat_service, root_dir, backend, reindex_service
+        nonlocal _branch_watcher
 
         from apollo.storage import open_store as _open_store
         from apollo.graph.query import GraphQuery as _GraphQuery
@@ -499,9 +555,28 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             logger.exception("failed to rebind reindex service after project swap")
 
         logger.info(
-            "swapped active store: backend=%s location=%s nodes=%d",
+            "swapped active store: backend=%s location=%s nodes=%d branch=%s",
             backend, new_location, graph.number_of_nodes(),
+            current_branch(root_dir),
         )
+
+        # (Re)start the branch watcher. We tear down any existing
+        # watcher first so it isn't pointed at the previous project's
+        # .git directory. A non-git project simply gets a watcher that
+        # never starts an observer (BranchWatcher.start is a no-op
+        # when HEAD can't be located).
+        if _branch_watcher is not None:
+            try:
+                _branch_watcher.stop()
+            except Exception:
+                logger.exception("failed to stop previous BranchWatcher")
+            _branch_watcher = None
+        try:
+            _branch_watcher = BranchWatcher(root_dir, _on_branch_change)
+            _branch_watcher.start()
+        except Exception:
+            logger.exception("failed to start BranchWatcher for %s", root_dir)
+            _branch_watcher = None
 
     # Auto-open the project on startup so project-scoped features
     # (annotations, etc.) work without forcing the user to re-open the
@@ -719,6 +794,18 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 import logging
                 logging.warning(f"Failed to start reindex service: {e}")
 
+    @app.on_event("shutdown")
+    async def _stop_branch_watcher():
+        """Stop the BranchWatcher (if any) so its observer thread joins
+        cleanly on server shutdown — otherwise watchdog will keep the
+        process from exiting until its 5s timeout fires.
+        """
+        if _branch_watcher is not None:
+            try:
+                _branch_watcher.stop()
+            except Exception:
+                logger.exception("failed to stop BranchWatcher on shutdown")
+
     # If a project was successfully auto-opened on startup, swap to its
     # per-project store now (after graph/q/search/chat_service/reindex
     # have all been initialized so the nonlocals in _swap_to_project_store
@@ -900,7 +987,42 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 logger.exception("could not read project filters; proceeding without filters")
                 active_filters = None
             builder = GraphBuilder(parsers=build_parsers, filters=active_filters)
-            graph = builder.build(target)
+
+            # Phase 6 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: overlap
+            # embedding compute with parsing via an
+            # :class:`EmbedQueue`. We construct the queue *before*
+            # ``builder.build`` so the streaming-build loop can push
+            # eligible nodes onto it as their files complete; the
+            # worker thread encodes batches in the background while
+            # parsing continues. If the SentenceTransformer model
+            # isn't installed (or any other init failure), we fall
+            # back to the legacy "build then embed" sequencing so
+            # indexing still succeeds without embeddings.
+            embed_queue = None
+            prev_cache: dict = {}
+            embedder_for_queue = None
+            try:
+                from apollo.embeddings.embedder import (
+                    extract_cache_from_graph,
+                    get_shared_embedder,
+                )
+                from apollo.embeddings.embed_queue import EmbedQueue
+                try:
+                    prev_graph = store.load()
+                    prev_cache = extract_cache_from_graph(prev_graph)
+                except Exception:
+                    prev_cache = {}
+                embedder_for_queue = get_shared_embedder()
+                embed_queue = EmbedQueue(
+                    embedder_for_queue, builder.graph, prev_cache=prev_cache,
+                )
+            except Exception:
+                # sentence-transformers missing or queue init failed —
+                # build without overlapped embedding; the post-build
+                # block below logs a warning and proceeds.
+                embed_queue = None
+
+            graph = builder.build(target, embed_queue=embed_queue)
             n_nodes = graph.number_of_nodes()
             n_edges = graph.number_of_edges()
             n_files = sum(1 for _, d in graph.nodes(data=True) if d.get("type") == "file")
@@ -915,30 +1037,46 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             t1 = time.time()
             logger.info("indexing step 2/4: generating embeddings for %d nodes", n_nodes)
             try:
-                from apollo.embeddings.embedder import (
-                    extract_cache_from_graph,
-                    get_shared_embedder,
-                )
-                # Reuse the previously-active graph's vectors keyed by
-                # content hash. After ``builder.build()`` rebuilt ``graph``
-                # the local ``self.graph`` reference here is the *new*
-                # graph, but the previously loaded ``store`` still holds
-                # the old in-memory copy via the chat_service / search
-                # references. We pull from the most recently saved store
-                # to populate the cache so unchanged nodes don't pay the
-                # SentenceTransformer encode cost again.
-                prev_cache: dict = {}
-                try:
-                    prev_graph = store.load()
-                    prev_cache = extract_cache_from_graph(prev_graph)
-                except Exception:
-                    prev_cache = {}
-                emb = get_shared_embedder()
-                emb.embed_graph(graph, prev_cache=prev_cache)
-                logger.info(
-                    "embeddings generated in %.2fs (reused %d cached)",
-                    time.time() - t1, len(prev_cache),
-                )
+                if embed_queue is not None:
+                    # Phase 6 fast path: drain the background worker.
+                    # All embeddings are already attached to the graph
+                    # (cache hits + freshly-encoded batches alike).
+                    # ``close_and_join`` re-raises any exception the
+                    # worker thread caught — corrupt models / OOM /
+                    # tokenizer errors fail loudly here instead of
+                    # silently producing a half-embedded graph.
+                    merged_cache = embed_queue.close_and_join()
+                    stats = embed_queue.stats
+                    logger.info(
+                        "embeddings generated in %.2fs "
+                        "(reused %d cached, encoded %d via background queue)",
+                        time.time() - t1,
+                        stats["cache_hits"],
+                        stats["encoded"],
+                    )
+                    # ``embed_graph`` is *not* re-run — the queue
+                    # already covered every embed-eligible node Phase 4
+                    # cares about. A cheap sweep with the merged cache
+                    # would be a no-op (all hashes already cached).
+                else:
+                    # Legacy fall-back path — embedder import / queue
+                    # init failed earlier. Behaviour matches pre-Phase-6.
+                    if embedder_for_queue is None:
+                        from apollo.embeddings.embedder import (
+                            extract_cache_from_graph,
+                            get_shared_embedder,
+                        )
+                        try:
+                            prev_graph = store.load()
+                            prev_cache = extract_cache_from_graph(prev_graph)
+                        except Exception:
+                            prev_cache = {}
+                        embedder_for_queue = get_shared_embedder()
+                    embedder_for_queue.embed_graph(graph, prev_cache=prev_cache)
+                    logger.info(
+                        "embeddings generated in %.2fs (reused %d cached, fallback path)",
+                        time.time() - t1, len(prev_cache),
+                    )
             except Exception:
                 logger.warning("embeddings skipped after %.2fs (sentence-transformers unavailable?)",
                                time.time() - t1)
@@ -966,14 +1104,21 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             try:
                 from apollo.ml import run_all_passes
                 t_ml = time.time()
-                logger.info("indexing: running ML passes")
+                logger.info("indexing: running ML passes (parallel)")
                 ml_embedder = None
                 try:
                     from apollo.embeddings.embedder import get_shared_embedder as _shared_emb
                     ml_embedder = _shared_emb()
                 except Exception:
                     ml_embedder = None
-                ml_summary = run_all_passes(graph, root_dir=target, embedder=ml_embedder)
+                # Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: run
+                # the seven independent ML passes concurrently. Each
+                # pass writes to its own attribute namespace so the
+                # threads can't collide on the same dict key.
+                ml_summary = run_all_passes(
+                    graph, root_dir=target, embedder=ml_embedder,
+                    parallel=True,
+                )
                 for k, v in (ml_summary or {}).items():
                     tag = "ok" if v.get("ml_available") else "skip"
                     detail = (f"computed={v.get('computed')}"
@@ -984,31 +1129,59 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             except Exception as e:
                 logger.warning("ML passes skipped: %s", e)
 
-            _indexing_status.update(step=3, step_label="Saving to store",
-                                    detail="Embeddings done")
-            t2 = time.time()
-            logger.info("indexing step 3/4: saving graph to store")
-            store.save(graph)
-            logger.info("graph saved in %.2fs", time.time() - t2)
+            # Phase 7 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: fan out
+            # ``store.save`` and the search-index rebuild. Both only
+            # *read* the in-memory graph; they don't depend on each
+            # other or mutate ``graph``, so threading them halves the
+            # wall-clock of these two stages on the typical project.
+            _indexing_status.update(
+                step=3, step_label="Saving + rebuilding search",
+                detail="Embeddings + ML done",
+            )
+            t_fan = time.time()
+            logger.info("indexing steps 3+4/4: saving + rebuilding search index (backend=%s, parallel)", backend)
 
-            q = GraphQuery(graph)
-            stats = q.stats()
+            from concurrent.futures import ThreadPoolExecutor
 
-            _indexing_status.update(step=4, step_label="Rebuilding search",
-                                    detail="Store saved")
-            t3 = time.time()
-            logger.info("indexing step 4/4: rebuilding search index (backend=%s)", backend)
-            try:
+            def _do_save():
+                t_s = time.time()
+                store.save(graph)
+                return time.time() - t_s
+
+            def _do_search():
+                t_s = time.time()
                 from apollo.embeddings.embedder import get_shared_embedder as _shared
                 if backend == "cblite":
                     from apollo.search.cblite_semantic import CouchbaseLiteSemanticSearch
-                    search = CouchbaseLiteSemanticSearch(store, _shared())
+                    s = CouchbaseLiteSemanticSearch(store, _shared())
                 else:
                     from apollo.search.semantic import SemanticSearch
-                    search = SemanticSearch(graph, _shared())
-                logger.info("search index ready in %.2fs", time.time() - t3)
-            except Exception:
-                logger.warning("search index unavailable after %.2fs", time.time() - t3)
+                    s = SemanticSearch(graph, _shared())
+                return s, time.time() - t_s
+
+            search = None
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="apollo-fanout",
+            ) as fan:
+                save_fut = fan.submit(_do_save)
+                search_fut = fan.submit(_do_search)
+                try:
+                    save_elapsed = save_fut.result()
+                    logger.info("graph saved in %.2fs (parallel)", save_elapsed)
+                except Exception:
+                    logger.exception("graph save failed")
+                    raise
+                try:
+                    search, search_elapsed = search_fut.result()
+                    logger.info("search index ready in %.2fs (parallel)", search_elapsed)
+                except Exception:
+                    logger.warning("search index unavailable after %.2fs", time.time() - t_fan)
+                    search = None
+
+            q = GraphQuery(graph)
+            stats = q.stats()
+            logger.info("save + search-rebuild fan-out total %.2fs", time.time() - t_fan)
+            _indexing_status.update(step=4, step_label="Finalizing", detail="Saved + indexed")
 
             # Refresh ChatService's references so its tools see the new
             # project. ChatService is constructed once during create_app()
@@ -1234,14 +1407,53 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
             "edges_truncated": total_edges > len(edges_out),
         }
 
+    _EXPAND_KINDS = {"none", "callers", "callees", "neighbors", "references"}
+
     @app.get("/api/search")
     def search_nodes(
         q_text: str = Query(..., alias="q"),
         top: int = Query(10),
         type_filter: Optional[str] = Query(None, alias="type"),
+        expand: str = Query("none"),
+        depth: int = Query(1),
+        per_seed_cap: int = Query(10),
     ):
+        # Validate the enum here rather than via FastAPI's Literal type so
+        # we can return the standard 422 with a clear `detail`. Keeping
+        # the param a `str` also means a missing `expand=` defaults
+        # gracefully without breaking existing clients.
+        if expand not in _EXPAND_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"expand must be one of {sorted(_EXPAND_KINDS)}",
+            )
+        if expand != "none" and depth <= 0:
+            raise HTTPException(
+                status_code=422, detail="depth must be >= 1 when expand != 'none'",
+            )
+
         if search is not None and hasattr(search, "has_embeddings") and search.has_embeddings():
-            results = search.search(q_text, top_k=top, node_type=type_filter)
+            if expand == "none":
+                results = search.search(q_text, top_k=top, node_type=type_filter)
+                return {
+                    "results": [
+                        {
+                            "id": r.get("id"),
+                            "name": r.get("name"),
+                            "type": r.get("type"),
+                            "path": r.get("path"),
+                            "line_start": r.get("line_start"),
+                            "score": r.get("score"),
+                        }
+                        for r in results
+                    ]
+                }
+
+            # Combined: vector search + structural expansion.
+            results = search.search_expanded(
+                q_text, top_k=top, expand=expand, depth=depth,
+                per_seed_cap=per_seed_cap, node_type=type_filter,
+            )
             return {
                 "results": [
                     {
@@ -1251,13 +1463,29 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                         "path": r.get("path"),
                         "line_start": r.get("line_start"),
                         "score": r.get("score"),
+                        "neighbors": r.get("neighbors", []),
+                        **({"truncated": r["truncated"]} if "truncated" in r else {}),
                     }
                     for r in results
                 ]
             }
 
+        # Structural fallback: no embeddings indexed. Combined search is
+        # meaningless without vector scores; surface the warning in the
+        # response and return the flat shape callers expect.
+        warning = None
+        if expand != "none":
+            logger.warning(
+                "/api/search: expand=%s requested but no embeddings indexed; "
+                "returning flat text-match results.", expand,
+            )
+            warning = (
+                f"expand={expand!r} ignored: no embeddings indexed. "
+                "Re-run `apollo index` without --no-embeddings to enable."
+            )
+
         found = q.find(q_text, node_type=type_filter)
-        return {
+        payload = {
             "results": [
                 {
                     "id": r.get("id"),
@@ -1270,6 +1498,9 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
                 for r in found[:top]
             ]
         }
+        if warning is not None:
+            payload["warning"] = warning
+        return payload
 
     # ── Path resolution shared by /api/node and /api/node/.../connections ──
     # Resolve a graph-stored relative path against (in order):
@@ -1432,7 +1663,18 @@ def create_app(store, backend: str = "json", root_dir: str | None = None, parser
         if node_id not in graph:
             raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
 
-        data = {k: v for k, v in graph.nodes[node_id].items() if k != "embedding"}
+        # Phase 4 of PLAN_INDEX_MEMORY_AND_CONCURRENCY: drop the
+        # per-node ``source`` attr (it's no longer stored) and inject
+        # the file-text slice via :func:`graph.query.get_source` so
+        # the UI's node-detail view continues to receive a ``source``
+        # field with identical content to pre-Phase-4.
+        from apollo.graph.query import get_source
+
+        data = {k: v for k, v in graph.nodes[node_id].items()
+                if k not in ("embedding", "source")}
+        src = get_source(graph, node_id)
+        if src:
+            data["source"] = src
         self_path = data.get("path")
 
         edges_in = [

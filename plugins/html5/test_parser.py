@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Smoke tests for the html5 plugin."""
 from __future__ import annotations
 

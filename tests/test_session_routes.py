@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Integration tests for session routes (Phase 15)."""
 
 import pytest

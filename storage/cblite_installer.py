@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Download / install / activate libcblite shared-library binaries.
 
 The Web UI's *Settings → Storage* tab calls into this module to let the

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.kotlin2 — Kotlin source-file plugin for Apollo
 ======================================================

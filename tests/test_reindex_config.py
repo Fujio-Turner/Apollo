@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for graph.reindex_config.ReindexConfig."""
 import pytest
 

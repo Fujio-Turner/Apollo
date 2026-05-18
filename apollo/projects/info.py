@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """ProjectInfo data structure for API responses."""
 
 from __future__ import annotations

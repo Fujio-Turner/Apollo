@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.powershell7 — PowerShell 7 script plugin for Apollo
 ===========================================================

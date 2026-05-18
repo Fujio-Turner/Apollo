@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for the per-plugin ignore-set composition in ``GraphBuilder``.
 
 Phase 2A wired each plugin's ``config.json["ignore_dirs"]`` into the

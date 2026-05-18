@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Self-contained smoke tests for the csharp12 plugin."""
 from __future__ import annotations
 

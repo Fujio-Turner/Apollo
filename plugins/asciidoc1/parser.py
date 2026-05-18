@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.asciidoc1 — AsciiDoc plugin for Apollo
 ==============================================

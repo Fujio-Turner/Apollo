@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Global settings management for Apollo."""
 
 from __future__ import annotations

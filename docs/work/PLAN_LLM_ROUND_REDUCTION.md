@@ -74,6 +74,7 @@ Cross-checked against [`file_inspect.py`](../../file_inspect.py),
 | `batch_file_sections` (multi-range fetch)           | `chat/local_tools.py:86`                  |
 | MAX_FILE_SEARCH_MATCHES / MAX_PROJECT_SNIPPET_BYTES caps | `file_inspect.py`                    |
 | AI trace panel + per-step bytes/dt                  | `web/static/app.js`, `chat/service.py`    |
+| `search_graph_expanded` — semantic search + 1-hop graph expansion in ONE round (replaces `search_graph` + N parallel `get_neighbors` for "find X and its callers/callees" questions). Saves 1 round per impact-radius question. | `chat/service.py::_exec_tool_impl`, `search/expand.py`, [`PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md`](./PLAN_COMBINED_SEMANTIC_GRAPH_SEARCH.md) |
 
 What is **not** there yet:
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.shell1 — Shell/Bash script plugin for Apollo
 =======================================================

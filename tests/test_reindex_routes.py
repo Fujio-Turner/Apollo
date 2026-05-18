@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for web.routes_reindex FastAPI endpoints."""
 import time
 

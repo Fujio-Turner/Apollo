@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """FastAPI routes for project management (/api/projects/*)."""
 
 from __future__ import annotations

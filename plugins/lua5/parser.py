@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """
 plugins.lua5 — Lua 5 source-file plugin for Apollo
 ===================================================
