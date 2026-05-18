@@ -77,14 +77,40 @@ pytest tests/ -v --tb=short --cov=apollo --cov-report=term-missing
 
 * * *
 
-## 6. Run linters (if using ruff/black)
+## 6. Run linters & license-header check (required)
+
+These are the same gates CI runs on every push / PR
+(see `.github/workflows/ci.yml`). Run them locally **before**
+pushing the release branch so a red CI run never blocks the tag.
 
 ```bash
-ruff check . --select=E9,F63,F7,F82
-ruff format --check .
+# 6a. Ruff — errors-only ruleset (must pass, blocks CI)
+ruff check . \
+  --select E9,F63,F7,F82 \
+  --exclude venv --exclude .venv --exclude env \
+  --exclude __pycache__ --exclude .pytest_cache --exclude htmlcov \
+  --exclude target --exclude _dev_only --exclude build \
+  --exclude dist --exclude .apollo --exclude .graph_search
+
+# 6b. BSL-1.1 license headers on every first-party .py (must pass, blocks CI)
+python3 scripts/check_license_headers.py
+
+# 6c. (Optional, informational) full ruff report — style/unused-imports/etc.
+#     Not gated by CI yet; use to track cleanup progress.
+ruff check . \
+  --exclude venv --exclude .venv --exclude env \
+  --exclude __pycache__ --exclude .pytest_cache --exclude htmlcov \
+  --exclude target --exclude _dev_only --exclude build \
+  --exclude dist --exclude .apollo --exclude .graph_search \
+  --statistics
+
+# 6d. (Optional) format drift — `ruff format --check .` currently flags
+#     ~260 files; reformatting is a separate cleanup task, not part of
+#     the release gate.
 ```
 
-Fix any issues before continuing.
+**Fix any 6a or 6b failures before continuing.** If `ruff` isn't installed:
+`pip install ruff`.
 
 * * *
 
@@ -108,7 +134,8 @@ docker compose down
 - [ ] `RELEASE_NOTES.md` has new section at the top
 - [ ] All HTML/JS files checked for stale version strings
 - [ ] `pytest` passes (all green)
-- [ ] `ruff` passes (if applicable)
+- [ ] `ruff check . --select E9,F63,F7,F82 …` passes (step 6a)
+- [ ] `python3 scripts/check_license_headers.py` passes (step 6b)
 - [ ] Docker image builds cleanly (if applicable)
 - [ ] Startup logs show correct version
 - [ ] No unrelated / uncommitted changes in the worktree
